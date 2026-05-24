@@ -17,7 +17,7 @@ from app.repositories.in_memory_inventory_repository import (
 )
 from app.repositories.in_memory_order_repository import InMemoryOrderRepository
 from app.schemas.workflow import WorkflowRunRequest
-from app.services.agent_service import AgentService
+from app.agents.runtime.agent_service import AgentService
 from app.services.fulfillment_plan_service import FulfillmentPlanService
 from app.services.inventory_analysis_service import InventoryAnalysisService
 from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
@@ -69,7 +69,7 @@ class ComparisonExecutor:
             substitute_service=substitute_service,
         )
 
-        from app.agent.tools import (
+        from app.agents.tools.factory import (
             make_fulfillment_plan_tool,
             make_substitute_tool,
             make_warehouse_tool,

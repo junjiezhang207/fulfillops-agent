@@ -13,7 +13,7 @@
 
 学习重点：
 1. 路由层负责限流、输入安全、模型选择、HTTP 异常映射。
-2. Agent 的具体运行、记忆、工具包装、反思质量门都在 ``AgentService`` 和 ``app/agent``。
+2. Agent 的具体运行、记忆、工具包装、反思质量门都在 ``AgentService`` 和 ``app/agents``。
 3. 没配 LLM 时不能让应用启动失败，而是在调用 Agent 接口时返回 503。
 4. 同一 ``session_id`` 会共享短期上下文，适合多轮追问。
 
@@ -27,10 +27,10 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from app.agent.evaluation.langfuse_tracer import create_langfuse_tracer
-from app.agent.guardrails import InputGuardrails
-from app.agent.tool_cache import GLOBAL_SCOPE, get_tool_cache
-from app.agent.tools import (
+from app.agents.quality.evaluation.langfuse_tracer import create_langfuse_tracer
+from app.agents.tools.guardrails import InputGuardrails
+from app.agents.tools.cache import GLOBAL_SCOPE, get_tool_cache
+from app.agents.tools.factory import (
     make_fulfillment_plan_tool,
     make_substitute_tool,
     make_warehouse_tool,
@@ -45,8 +45,8 @@ from app.core.service_registry import (
 from app.graph.llm_adapter import LLMFactory
 from app.schemas.agent import AgentChatRequest, AgentChatResponse, PlanExecuteRequest, PlanExecuteResponse
 from app.schemas.common import ApiResponse
-from app.services.agent_service import AgentNotAvailableError, AgentService
-from app.services.plan_execute_service import PlanExecuteService
+from app.agents.runtime.agent_service import AgentNotAvailableError, AgentService
+from app.agents.runtime.plan_execute_service import PlanExecuteService
 from app.services.fulfillment_plan_service import FulfillmentPlanService
 from app.services.substitute_sku_service import SubstituteSkuService
 from app.services.warehouse_service import WarehouseService

@@ -32,13 +32,13 @@ Workflow 的输出更结构化，适合展示“为什么这么判断”。
 
 | 文件 | 职责 |
 | --- | --- |
-| `app/agent/agent.py` | ReAct Agent 主编排 |
-| `app/services/agent_service.py` | Agent API 服务封装 |
-| `app/agent/tools.py` | Agent 可调用工具 |
-| `app/agent/tool_wrapper.py` | 工具统一包装、错误处理、观测 |
-| `app/agent/guardrails.py` | Prompt Injection 和敏感信息防护 |
-| `app/agent/context_manager.py` | 上下文压缩和历史消息管理 |
-| `app/agent/checkpointer.py` | Agent 状态检查点 |
+| `app/agents/orchestration/react_agent.py` | ReAct Agent 主编排 |
+| `app/agents/runtime/agent_service.py` | Agent API 服务封装 |
+| `app/agents/tools/factory.py` | Agent 可调用工具 |
+| `app/agents/tools/wrapper.py` | 工具统一包装、错误处理、观测 |
+| `app/agents/tools/guardrails.py` | Prompt Injection 和敏感信息防护 |
+| `app/agents/runtime/context_manager.py` | 上下文压缩和历史消息管理 |
+| `app/agents/runtime/checkpointer.py` | Agent 状态检查点 |
 
 Agent 可以调用订单、库存、知识库、履约建议等工具。
 

@@ -154,7 +154,7 @@ def metrics_endpoint() -> Response:
     """
     # 同步更新工具缓存命中率（Gauge 需要手动刷新）
     try:
-        from app.agent.tool_cache import get_tool_cache
+        from app.agents.tools.cache import get_tool_cache
 
         # 注意这里访问了 prometheus_client 的内部 _value，是为了把缓存对象里的累计统计
         # 同步到 Counter。更严格的生产写法可以在缓存命中/未命中发生时直接 inc()。

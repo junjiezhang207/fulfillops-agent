@@ -50,8 +50,8 @@
 
 1. `app/main.py`
 2. `app/api/routes/agent.py`
-3. `app/services/agent_service.py`
-4. `app/agent/agent.py`
+3. `app/agents/runtime/agent_service.py`
+4. `app/agents/orchestration/react_agent.py`
 5. `app/rag/knowledge_retrieval_service.py`
 6. `app/rag/rag_query_planner.py`
 7. `app/rag/reranker.py`

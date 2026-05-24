@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.schemas.workflow import WorkflowRunRequest
-from app.services.agent_service import AgentService
+from app.agents.runtime.agent_service import AgentService
 from app.services.client_cache_service import ResponseCacheService
 from app.services.intent_classifier import (
     IntentClassificationResult,
@@ -25,7 +25,7 @@ from app.services.intent_classifier import (
     get_classifier,
 )
 from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.multi_agent_service import MultiAgentService
+from app.agents.runtime.multi_agent_service import MultiAgentService
 from app.services.session_memory_service import (
     SessionContext,
     SessionMemoryService,

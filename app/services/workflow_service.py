@@ -180,7 +180,7 @@ class WorkflowService:
         没有 LLM 也没关系，finalize 节点会走规则模板 fallback。
         """
         from app.core.config import get_settings
-        from app.agent.checkpointer import create_checkpointer
+        from app.agents.runtime.checkpointer import create_checkpointer
         from app.memory import create_long_term_memory_store
 
         settings = get_settings()

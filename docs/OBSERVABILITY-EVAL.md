@@ -15,11 +15,11 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `app/agent/evaluation/langfuse_tracer.py` | Langfuse Trace 和评分上报 |
+| `app/agents/quality/evaluation/langfuse_tracer.py` | Langfuse Trace 和评分上报 |
 | `app/core/logging.py` | 结构化日志和 trace_id |
 | `app/api/routes/metrics.py` | Prometheus `/metrics` 指标 |
-| `app/agent/evaluation/ragas_evaluator.py` | RAG 相关评测 |
-| `app/agent/evaluation/golden_dataset.py` | Golden Dataset 样例 |
+| `app/agents/quality/evaluation/ragas_evaluator.py` | RAG 相关评测 |
+| `app/agents/quality/evaluation/golden_dataset.py` | Golden Dataset 样例 |
 | `tests/` | 单元测试 |
 
 ## 3. Langfuse 适合看什么
