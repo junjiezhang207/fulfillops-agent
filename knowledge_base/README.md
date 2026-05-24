@@ -24,7 +24,7 @@ RAG 检索：查询 customer_tiers.md → VIP 合并政策章节
 回答：VIP 客户要求无延迟交期，合并会导致延迟，违反承诺
 ```
 
-**相关代码：** [business_rule_engine.py](../app/services/business_rule_engine.py)
+**相关代码：** [business_rule_engine.py](../app/domain/rules/business_rule_engine.py)
 
 ---
 
@@ -45,7 +45,7 @@ RAG 检索：fulfillment_strategies.md → 方案对比章节
       平衡方案性价比最高（比快速便宜 40%，只慢 2 天）
 ```
 
-**相关代码：** [fulfillment_options_generator.py](../app/services/fulfillment_options_generator.py)
+**相关代码：** [fulfillment_options_generator.py](../app/domain/fulfillment/options_generator.py)
 
 ---
 
@@ -78,7 +78,7 @@ RAG 检索：risk_assessment.md → urgent_high_value 章节
       ✓ 指派专人监控
 ```
 
-**相关代码：** [business_rule_engine.py](../app/services/business_rule_engine.py)
+**相关代码：** [business_rule_engine.py](../app/domain/rules/business_rule_engine.py)
 
 ---
 
@@ -168,7 +168,7 @@ RAG 检索：shipping_partners.md → 物流商对比章节
       顺丰加价 $300，但防止 $800 的风险，值得
 ```
 
-**相关代码：** [fulfillment_options_generator.py](../app/services/fulfillment_options_generator.py)
+**相关代码：** [fulfillment_options_generator.py](../app/domain/fulfillment/options_generator.py)
 
 ---
 
@@ -209,7 +209,7 @@ RAG 检索：market_conditions.md → Q1 淡季章节
       ✓ 建立客户关系（为后续服务）
 ```
 
-**相关代码：** [advanced_hybrid_service.py](../app/services/advanced_hybrid_service.py)
+**相关代码：** [advanced_hybrid_service.py](../app/application/routing/advanced_hybrid_service.py)
 
 ---
 
