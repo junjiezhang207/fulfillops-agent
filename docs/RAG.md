@@ -24,12 +24,12 @@ RAG 负责把企业知识接入履约决策，避免模型只凭参数记忆回�
 
 | 文件 | 职责 |
 | --- | --- |
-| `app/services/knowledge_retrieval_service.py` | RAG 主服务，负责索引、召回、融合、重排和结果组装 |
-| `app/services/rag_query_planner.py` | 意图识别、查询扩展、过滤条件生成 |
-| `app/services/rag_answer_builder.py` | 根据命中文档生成摘要答案 |
-| `app/services/reranker.py` | Reranker 接入和候选文档精排 |
+| `app/rag/knowledge_retrieval_service.py` | RAG 主服务，负责索引、召回、融合、重排和结果组装 |
+| `app/rag/rag_query_planner.py` | 意图识别、查询扩展、过滤条件生成 |
+| `app/rag/rag_answer_builder.py` | 根据命中文档生成摘要答案 |
+| `app/rag/reranker.py` | Reranker 接入和候选文档精排 |
 | `app/repositories/knowledge_repository.py` | 知识库文档读取和管理 |
-| `app/repositories/vector_store_factory.py` | Milvus / 本地向量库创建 |
+| `app/rag/vector_store_factory.py` | Milvus / 本地向量库创建 |
 | `app/graph/embed_adapter.py` | Embedding 模型适配 |
 | `app/schemas/knowledge.py` | RAG 请求和响应模型 |
 

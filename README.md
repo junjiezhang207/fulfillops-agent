@@ -401,6 +401,7 @@ multiship-agent/
 │   │   ├── workflow_service.py     # Workflow 外观（SSE + 超时 + 幂等）
 │   │   ├── model_gateway.py        # Chat / Embedding / Reranker 模型网关
 │   │   ├── hybrid_service.py       # 智能路由
+│   ├── rag/                        # RAG 能力模块（检索规划、召回、重排、答案组装）
 │   │   ├── knowledge_retrieval_service.py  # RAG 主服务（意图、混合召回、重排、摘要）
 │   │   ├── rag_query_planner.py    # RAG 意图识别 + query 扩展
 │   │   ├── rag_answer_builder.py   # RAG 答案摘要生成

@@ -52,11 +52,11 @@
 2. `app/api/routes/agent.py`
 3. `app/services/agent_service.py`
 4. `app/agent/agent.py`
-5. `app/services/knowledge_retrieval_service.py`
-6. `app/services/rag_query_planner.py`
-7. `app/services/reranker.py`
+5. `app/rag/knowledge_retrieval_service.py`
+6. `app/rag/rag_query_planner.py`
+7. `app/rag/reranker.py`
 8. `app/services/model_gateway.py`
-9. `app/repositories/vector_store_factory.py`
+9. `app/rag/vector_store_factory.py`
 10. `frontend/`
 
 先掌握主链路，再看细节实现。
