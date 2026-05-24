@@ -39,14 +39,14 @@ from app.core.service_registry import (
     get_knowledge_retrieval_service,
     get_order_analysis_service,
 )
-from app.graph.llm_adapter import LLMFactory
+from app.infrastructure.llm.chat_adapter import LLMFactory
 from app.schemas.advanced_order import AdvancedOrderDetails, Location, WarehouseInfo
 from app.schemas.common import ApiResponse
 from app.schemas.workflow import WorkflowRunRequest
 from app.agents.runtime.agent_service import AgentService
 from app.services.advanced_hybrid_service import AdvancedHybridService
 from app.agents.runtime.multi_agent_service import MultiAgentService
-from app.graph.parallel_workflow import (
+from app.workflows.fulfillment.parallel_graph import (
     build_parallel_workflow,
     create_parallel_workflow_nodes,
 )

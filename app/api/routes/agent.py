@@ -42,7 +42,7 @@ from app.core.service_registry import (
     get_knowledge_retrieval_service,
     get_order_analysis_service,
 )
-from app.graph.llm_adapter import LLMFactory
+from app.infrastructure.llm.chat_adapter import LLMFactory
 from app.schemas.agent import AgentChatRequest, AgentChatResponse, PlanExecuteRequest, PlanExecuteResponse
 from app.schemas.common import ApiResponse
 from app.agents.runtime.agent_service import AgentNotAvailableError, AgentService

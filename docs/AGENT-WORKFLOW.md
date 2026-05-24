@@ -17,7 +17,7 @@ Workflow 和 Agent 不是重复功能，而是解决不同问题。
 
 | 文件 | 职责 |
 | --- | --- |
-| `app/graph/` | LangGraph 节点、状态和 Workflow 编排 |
+| `app/workflows/fulfillment/` | LangGraph 节点、状态和履约 Workflow 编排 |
 | `app/services/workflow_service.py` | Workflow 应用服务入口 |
 | `app/services/order_analysis_service.py` | 订单分析 |
 | `app/services/inventory_analysis_service.py` | 库存分析 |

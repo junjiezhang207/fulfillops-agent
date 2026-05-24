@@ -8,7 +8,7 @@ from app.comparison.framework import (
     PathType,
 )
 from app.core.config import get_settings
-from app.graph.llm_adapter import LLMFactory
+from app.infrastructure.llm.chat_adapter import LLMFactory
 from app.repositories.file_system_knowledge_repository import (
     FileSystemKnowledgeRepository,
 )

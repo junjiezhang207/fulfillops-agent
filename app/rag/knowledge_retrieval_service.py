@@ -53,7 +53,7 @@ from llama_index.core.vector_stores.types import (
 from llama_index.retrievers.bm25 import BM25Retriever
 
 from app.core.config import get_settings
-from app.graph.embed_adapter import create_embed_model
+from app.infrastructure.llm.embedding_adapter import create_embed_model
 from app.repositories.knowledge_repository import KnowledgeRepository
 from app.rag.vector_store_factory import create_vector_store
 from app.schemas.knowledge import (

@@ -6,7 +6,7 @@
   - ``run_with_timeout``：带超时保护的调用。
   - ``run_stream`` / ``resume``：支持 Human-in-the-Loop 中断和恢复。
 
-图本身在 ``app.graph.workflow.build_workflow`` 中定义；这里负责给 API 层提供
+图本身在 ``app.workflows.fulfillment.graph.build_workflow`` 中定义；这里负责给 API 层提供
 稳定、好用的运行接口。
 """
 
@@ -22,9 +22,9 @@ from typing import AsyncIterator
 from langchain_core.language_models import BaseChatModel
 from langgraph.types import Command
 
-from app.graph.llm_adapter import LLMFactory
-from app.graph.nodes import WorkflowNodes
-from app.graph.workflow import build_workflow
+from app.infrastructure.llm.chat_adapter import LLMFactory
+from app.workflows.fulfillment.nodes import WorkflowNodes
+from app.workflows.fulfillment.graph import build_workflow
 from app.schemas.workflow import (
     ApprovalAuditEntry,
     ApprovalRequest,
@@ -201,7 +201,7 @@ class WorkflowService:
         # 长期记忆使用向量后端时，需要 embedding 模型；这里懒加载，减少启动压力。
         long_term_backend = settings.long_term_memory_backend.strip().lower()
         if long_term_backend in {"mysql_milvus", "mysql+milvus", "mysql", "milvus"}:
-            from app.graph.embed_adapter import create_lazy_embed_model
+            from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
 
             memory_embed_model = create_lazy_embed_model(settings)
         # build_workflow 会把节点、短期 checkpointer、长期 store 编译成 LangGraph。

@@ -98,7 +98,7 @@ class PlanExecuteService:
         # 长期记忆如果使用向量后端，需要 embedding 模型把记忆文本转向量。
         long_term_backend = settings.long_term_memory_backend.strip().lower()
         if long_term_backend in {"mysql_milvus", "mysql+milvus", "mysql", "milvus"}:
-            from app.graph.embed_adapter import create_lazy_embed_model
+            from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
 
             memory_embed_model = create_lazy_embed_model(settings)
         # store 是 LangGraph Store，用于跨会话长期记忆。

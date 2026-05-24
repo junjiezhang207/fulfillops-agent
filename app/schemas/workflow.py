@@ -14,7 +14,7 @@
 
 from pydantic import BaseModel, Field
 
-from app.graph.trace import ErrorEvent, TraceEvent
+from app.workflows.fulfillment.trace import ErrorEvent, TraceEvent
 from app.schemas.inventory import InventoryAnalysisResult
 from app.schemas.knowledge import KnowledgeRetrieveResult
 from app.schemas.orders import OrderAnalysisResult

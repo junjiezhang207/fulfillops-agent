@@ -33,7 +33,8 @@ Repository / Vector Store / 企业数据
 | `app/api/` | FastAPI 路由，负责请求入口和响应模型 |
 | `app/services/` | 业务服务层，放订单分析、库存分析、RAG、Agent 服务 |
 | `app/agents/` | Agent 编排、运行时、工具、安全防护、质量评测与可观测 |
-| `app/graph/` | LangGraph Workflow、Embedding 适配器、图状态 |
+| `app/workflows/` | 履约 Workflow、状态、节点、路由、风险判断和 Trace |
+| `app/infrastructure/llm/` | ChatModel 与 Embedding 基础设施适配 |
 | `app/repositories/` | 企业数据、知识库、向量库访问 |
 | `app/memory/` | 短期记忆、长期记忆、检查点 |
 | `config/` | 模型网关、运行时配置 |

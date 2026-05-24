@@ -17,7 +17,7 @@ from app.repositories.enterprise_data_repository import EnterpriseDataRepository
 from app.repositories.file_system_knowledge_repository import FileSystemKnowledgeRepository
 from app.repositories.in_memory_inventory_repository import InMemoryInventoryRepository
 from app.repositories.in_memory_order_repository import InMemoryOrderRepository
-from app.graph.llm_adapter import LLMFactory
+from app.infrastructure.llm.chat_adapter import LLMFactory
 from app.services.inventory_analysis_service import InventoryAnalysisService
 from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.services.order_analysis_service import OrderAnalysisService

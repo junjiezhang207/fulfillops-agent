@@ -243,7 +243,7 @@ class AgentService:
         memory_embed_model = None
         long_term_backend = settings.long_term_memory_backend.strip().lower()
         if long_term_backend in {"mysql_milvus", "mysql+milvus", "mysql", "milvus"}:
-            from app.graph.embed_adapter import create_lazy_embed_model
+            from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
 
             memory_embed_model = create_lazy_embed_model(settings)
         self._memory_store = create_long_term_memory_store(
