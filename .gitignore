@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables (contains API keys)
+.env
+
+# Local assistant/editor state
+.claude/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Runtime data generated locally
+storage/
+
+# Local server logs
+backend-*.out
+backend-*.err
+backend-*.log
+frontend-vite-*.out
+frontend-vite-*.err

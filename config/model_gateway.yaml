@@ -1,0 +1,249 @@
+# 后端模型网关配置。
+#
+# 企业级原则：
+# - 前端只拿 model id / strategy，不接触 API Key。
+# - API Key 只通过环境变量注入，配置文件只写 env 名称。
+# - model_type 区分 chat / embedding / reranker。
+# - tier / deployment 用于表达企业真实模型分层：强模型、小模型、本地开源模型。
+# - use_cases 用于区分 Agent、Workflow、RAG 改写、向量化、精排、评测等场景。
+
+default_model_id: deepseek-v4-pro
+
+# 按任务分配默认模型：
+# - agent / plan_execute / judge：需要推理和可靠性，优先强模型。
+# - workflow_finalize：只是把结构化结果整理成话术，可用中等模型。
+# - rag_rewrite / rag_compress / structured_extract：短文本改写、压缩、抽取，适合小模型或本地开源模型。
+default_models:
+  agent: deepseek-v4-pro
+  workflow: deepseek-v4-pro
+  plan_execute: deepseek-v4-pro
+  supervisor: deepseek-v4-pro
+  judge: deepseek-v4-pro
+  workflow_finalize: deepseek-v4-flash
+  structured_extract: deepseek-v4-flash
+  rag_rewrite: deepseek-v4-flash
+  rag_compress: deepseek-v4-flash
+  embedding: aliyun-text-embedding-v4
+  reranker: aliyun-qwen3-rerank
+
+models:
+  - id: deepseek-v4-pro
+    display_name: DeepSeek V4 Pro
+    model_type: chat
+    provider: openai_compatible
+    model: deepseek-v4-pro
+    base_url: https://api.deepseek.com/v1
+    extra_body:
+      thinking:
+        type: disabled
+    streaming: true
+    # 成本计算使用“美元 / 100 万 token”。
+    # 这里填写 DeepSeek 官方价目表；如果厂商或合同价变化，要同步更新配置。
+    # deepseek-v4-pro 当前官方折扣价有效期到 2026-05-31 15:59 UTC。
+    input_price_per_1m_tokens: 0.435
+    output_price_per_1m_tokens: 0.87
+    input_cache_hit_price_per_1m_tokens: 0.003625
+    input_cache_miss_price_per_1m_tokens: 0.435
+    api_key_env: LLM_API_KEY
+    enabled: true
+    priority: 5
+    tier: strong
+    deployment: cloud
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "judge"]
+
+  - id: deepseek-v4-flash
+    display_name: DeepSeek V4 Flash
+    model_type: chat
+    provider: openai_compatible
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/v1
+    extra_body:
+      thinking:
+        type: disabled
+    streaming: true
+    input_price_per_1m_tokens: 0.14
+    output_price_per_1m_tokens: 0.28
+    input_cache_hit_price_per_1m_tokens: 0.0028
+    input_cache_miss_price_per_1m_tokens: 0.14
+    api_key_env: LLM_API_KEY
+    enabled: true
+    priority: 6
+    tier: small
+    deployment: cloud
+    use_cases: ["workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress"]
+
+  - id: deepseek-chat
+    display_name: DeepSeek Chat
+    model_type: chat
+    provider: openai_compatible
+    model: deepseek-chat
+    base_url: https://api.deepseek.com/v1
+    api_key_env: LLM_API_KEY
+    input_price_per_1m_tokens: 0.14
+    output_price_per_1m_tokens: 0.28
+    input_cache_hit_price_per_1m_tokens: 0.0028
+    input_cache_miss_price_per_1m_tokens: 0.14
+    enabled: false
+    priority: 10
+    tier: strong
+    deployment: cloud
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress", "judge"]
+
+  # 轻量云模型示例：适合 RAG query 改写、片段压缩、结构化抽取。
+  # 开通通义后，把 enabled 改成 true，并把 default_models.rag_rewrite / rag_compress 指到 qwen-turbo。
+  - id: qwen-turbo
+    display_name: Qwen Turbo
+    model_type: chat
+    provider: openai_compatible
+    model: qwen-turbo
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: QWEN_API_KEY
+    enabled: false
+    priority: 5
+    tier: small
+    deployment: cloud
+    use_cases: ["rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
+
+  # 本地开源小模型示例：vLLM / Ollama / LM Studio 都可以提供 OpenAI-compatible 接口。
+  # 例如本地启动 http://localhost:8003/v1 后，将 enabled 改成 true，
+  # 再把 default_models.rag_rewrite / structured_extract 指到 local-qwen-small。
+  - id: local-qwen-small
+    display_name: Local Qwen Small
+    model_type: chat
+    provider: openai_compatible
+    model: qwen2.5:7b-instruct
+    base_url: http://localhost:8003/v1
+    api_key_env: LOCAL_LLM_API_KEY
+    requires_api_key: false
+    enabled: false
+    priority: 1
+    tier: small
+    deployment: local
+    use_cases: ["rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
+
+  - id: qwen-max
+    display_name: Qwen Max
+    model_type: chat
+    provider: openai_compatible
+    model: qwen-max
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: QWEN_API_KEY
+    enabled: false
+    priority: 20
+    tier: strong
+    deployment: cloud
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "workflow_finalize"]
+
+  - id: kimi-chat
+    display_name: Moonshot Kimi
+    model_type: chat
+    provider: openai_compatible
+    model: moonshot-v1-8k
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: KIMI_API_KEY
+    enabled: false
+    priority: 30
+    tier: standard
+    deployment: cloud
+    use_cases: ["agent", "workflow", "plan_execute", "workflow_finalize"]
+
+  - id: claude-sonnet
+    display_name: Claude Sonnet
+    model_type: chat
+    provider: anthropic
+    model: claude-3-5-sonnet-20241022
+    api_key_env: ANTHROPIC_API_KEY
+    enabled: false
+    priority: 40
+    tier: strong
+    deployment: cloud
+    use_cases: ["agent", "supervisor", "judge"]
+
+  # 本地开源 Embedding：适合中文 RAG，默认启用，不需要 API Key。
+  - id: bge-small-zh
+    display_name: BGE Small ZH
+    model_type: embedding
+    provider: huggingface
+    model: BAAI/bge-small-zh-v1.5
+    requires_api_key: false
+    enabled: true
+    priority: 10
+    tier: small
+    deployment: local
+    dimension: 512
+    use_cases: ["embedding"]
+
+  # 云端 Embedding：适合生产托管或跨语言语义检索；启用时需要 OPENAI_API_KEY。
+  - id: openai-embedding-small
+    display_name: OpenAI text-embedding-3-small
+    model_type: embedding
+    provider: openai
+    model: text-embedding-3-small
+    api_key_env: OPENAI_API_KEY
+    enabled: false
+    priority: 20
+    tier: small
+    deployment: cloud
+    dimension: 1536
+    use_cases: ["embedding"]
+
+  # 阿里云百炼 Embedding：走 OpenAI 兼容接口，适合企业云端托管。
+  # 当前项目使用 text-embedding-v4 的 1024 维配置。
+  # 注意：MILVUS_DIM / LONG_TERM_MEMORY_VECTOR_DIMENSION 必须和这里保持一致。
+  - id: aliyun-text-embedding-v4
+    display_name: Aliyun text-embedding-v4
+    model_type: embedding
+    provider: openai_compatible
+    model: text-embedding-v4
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    enabled: true
+    priority: 15
+    tier: standard
+    deployment: cloud
+    dimension: 1024
+    use_cases: ["embedding"]
+
+  # 本地开源 Reranker：更适合企业内网部署，第一次调用时懒加载模型。
+  - id: bge-reranker-base
+    display_name: BGE Reranker Base
+    model_type: reranker
+    provider: sentence_transformers
+    model: BAAI/bge-reranker-base
+    requires_api_key: false
+    enabled: true
+    priority: 10
+    tier: standard
+    deployment: local
+    top_k: 5
+    use_cases: ["reranker"]
+
+  # 阿里云百炼 Reranker：用于 RAG 二次精排，走 OpenAI-compatible /reranks 接口。
+  - id: aliyun-qwen3-rerank
+    display_name: Aliyun Qwen3 Rerank
+    model_type: reranker
+    provider: dashscope
+    model: qwen3-rerank
+    base_url: https://dashscope.aliyuncs.com/compatible-api/v1/reranks
+    api_key_env: DASHSCOPE_API_KEY
+    enabled: true
+    priority: 15
+    tier: standard
+    deployment: cloud
+    top_k: 5
+    use_cases: ["reranker"]
+
+  # 云端 Reranker：适合不想维护本地精排模型的部署；启用时需要 JINA_API_KEY。
+  - id: jina-reranker-v2
+    display_name: Jina Reranker v2 Multilingual
+    model_type: reranker
+    provider: jina
+    model: jina-reranker-v2-base-multilingual
+    base_url: https://api.jina.ai/v1/rerank
+    api_key_env: JINA_API_KEY
+    enabled: false
+    priority: 20
+    tier: standard
+    deployment: cloud
+    top_k: 5
+    use_cases: ["reranker"]

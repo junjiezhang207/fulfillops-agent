@@ -1,0 +1,62 @@
+"""FastAPI 应用入口。
+
+学习笔记：
+- create_app() 读取配置、初始化日志，并注册所有路由。
+- TraceIdMiddleware 会给请求日志附加 trace_id。
+- Uvicorn 会从这个文件加载全局 app 对象。
+"""
+
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from app.api.router import router as api_router
+from app.core.config import get_settings
+from app.core.logging import TraceIdMiddleware, setup_logging
+
+
+def create_app() -> FastAPI:
+    """创建 FastAPI 应用实例。
+
+    设计说明：
+    1. 使用工厂函数而不是直接在全局创建应用，便于后续测试和扩展。
+    2. 应用初始化时统一完成配置读取、日志初始化、路由注册。
+    3. TraceIdMiddleware 注入全链路 trace_id，让日志自动携带请求标识。
+    """
+
+    settings = get_settings()
+    setup_logging(settings.log_level)
+
+    app = FastAPI(
+        title=settings.app_name,
+        version=settings.app_version,
+        debug=settings.debug,
+    )
+    cors_origins = [
+        origin.strip()
+        for origin in settings.frontend_cors_origins.split(",")
+        if origin.strip()
+    ]
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    # 全链路 trace_id：从 X-Trace-Id 请求头读取或自动生成，并注入所有日志。
+    app.add_middleware(TraceIdMiddleware)
+    app.add_middleware(TraceIdMiddleware)
+    app.include_router(api_router, prefix=settings.api_v1_prefix)
+
+    frontend_dist = Path("frontend") / "dist"
+    if frontend_dist.exists():
+        app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
+
+    return app
+
+
+app = create_app()
