@@ -8,7 +8,7 @@ Layer 2 — ToolOutputSanitizer（间接注入，工具输出净化）
 
 import pytest
 
-from app.agent.guardrails import InputGuardrails, ToolOutputSanitizer
+from app.agents.tools.guardrails import InputGuardrails, ToolOutputSanitizer
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,6 +1,6 @@
 import httpx
 
-from app.graph.embed_adapter import OpenAICompatibleEmbedding
+from app.infrastructure.llm.embedding_adapter import OpenAICompatibleEmbedding
 
 
 def test_openai_compatible_embedding_posts_to_embeddings_endpoint(monkeypatch):

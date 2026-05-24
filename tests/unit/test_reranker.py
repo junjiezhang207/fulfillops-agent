@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import httpx
 
-from app.services.reranker import DashScopeReranker, create_reranker
+from app.rag.reranker import DashScopeReranker, create_reranker
 
 
 def test_dashscope_reranker_uses_openai_compatible_reranks_api(monkeypatch):

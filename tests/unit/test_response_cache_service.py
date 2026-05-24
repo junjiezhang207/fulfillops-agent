@@ -1,4 +1,4 @@
-from app.services.client_cache_service import (
+from app.application.cache.client_cache_service import (
     ClientCacheService,
     ResponseCacheService,
     get_client_cache,

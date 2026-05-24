@@ -11,8 +11,8 @@ from app.schemas.advanced_order import (
     ShippingMethod,
     WarehouseInfo,
 )
-from app.services.advanced_hybrid_service import AdvancedHybridService
-from app.services.business_rule_engine import BusinessRuleEngine, RuleImpactAnalysis
+from app.application.routing.advanced_hybrid_service import AdvancedHybridService
+from app.domain.rules.business_rule_engine import BusinessRuleEngine, RuleImpactAnalysis
 
 
 def _order(**overrides) -> AdvancedOrderDetails:

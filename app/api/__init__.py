@@ -1,16 +1,11 @@
-"""API 层包。
+"""API boundary package.
 
-文件作用摘要：
-这个包专门放 FastAPI 的 HTTP 边界代码。你可以把 ``app/api`` 理解成“前端/外部系统
-进入后端的门面层”，它负责接收请求、做轻量校验、调用 service 层，然后把结果包装成
-统一的 ``ApiResponse`` 返回。
+This package only owns FastAPI HTTP boundary code: request parameters, status
+codes, response models, and route wiring.
 
-学习时先记住三层边界：
-1. ``app/api``：只处理 HTTP、状态码、参数和响应结构，不写复杂业务规则。
-2. ``app/services``：写业务编排，例如订单分析、库存判断、RAG 检索、Agent 调度。
-3. ``app/repositories``：负责数据来源，例如内存数据、文件、MySQL、Milvus 等。
-
-面试官可能问：为什么要单独有 API 层？
-回答：HTTP 协议细节和业务逻辑分开后，业务服务可以被 API、测试、脚本、Agent 工具
-复用；同时路由层可以统一处理状态码、限流、输入安全和响应格式。
+Current backend layering:
+1. ``app/api``: HTTP entrypoints.
+2. ``app/application``: use-case orchestration such as Hybrid Routing and Workflow facade.
+3. ``app/domain``: deterministic OMS/WMS business rules and fulfillment logic.
+4. ``app/repositories`` / ``app/infrastructure``: data sources and external adapters.
 """

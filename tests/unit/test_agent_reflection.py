@@ -1,6 +1,6 @@
 import json
 
-from app.agent.agent import ToolObservation, _reflect_on_answer
+from app.agents.orchestration.react_agent import ToolObservation, _reflect_on_answer
 
 
 def _obs(tool_name: str, data: dict, summary: str) -> ToolObservation:

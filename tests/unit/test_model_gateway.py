@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.services.model_gateway import ModelGateway
+from app.infrastructure.llm.model_gateway import ModelGateway
 
 
 def test_model_gateway_lists_public_model_metadata_without_secret(tmp_path, monkeypatch):

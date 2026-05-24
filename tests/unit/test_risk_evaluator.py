@@ -6,7 +6,7 @@
 
 import pytest
 
-from app.graph.risk_evaluator import RiskAssessment, RiskEvaluator, RiskLevel
+from app.workflows.fulfillment.risk_evaluator import RiskAssessment, RiskEvaluator, RiskLevel
 
 
 @pytest.fixture

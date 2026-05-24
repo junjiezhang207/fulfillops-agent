@@ -13,10 +13,10 @@ from types import SimpleNamespace
 from llama_index.core.schema import NodeWithScore, TextNode
 
 from app.schemas.knowledge import QueryIntent, QueryIntentType
-from app.services.knowledge_retrieval_service import BusinessMetadataEnricher, KnowledgeRetrievalService
-from app.services.rag_answer_builder import RAGAnswerBuilder
-from app.services.rag_query_planner import RAGQueryPlanner, RetrievalInputs
-from app.services.reranker import RankedPassage
+from app.rag.knowledge_retrieval_service import BusinessMetadataEnricher, KnowledgeRetrievalService
+from app.rag.rag_answer_builder import RAGAnswerBuilder
+from app.rag.rag_query_planner import RAGQueryPlanner, RetrievalInputs
+from app.rag.reranker import RankedPassage
 
 
 def _node(chunk_id: str, category: str, score: float, text: str | None = None) -> NodeWithScore:

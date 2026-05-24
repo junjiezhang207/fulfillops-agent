@@ -1,4 +1,4 @@
-from app.agent.evaluation.langfuse_tracer import score_after_run
+from app.agents.quality.evaluation.langfuse_tracer import score_after_run
 
 
 class FakeTracer:

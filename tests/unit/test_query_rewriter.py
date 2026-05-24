@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.query_rewriter import QueryRewriter
+from app.rag.query_rewriter import QueryRewriter
 
 
 class _SyncChain:

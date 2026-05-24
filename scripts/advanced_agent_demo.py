@@ -13,19 +13,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.core.config import get_settings
-from app.graph.llm_adapter import LLMFactory
+from app.infrastructure.llm.chat_adapter import LLMFactory
 from app.repositories.file_system_knowledge_repository import FileSystemKnowledgeRepository
 from app.repositories.in_memory_inventory_repository import InMemoryInventoryRepository
 from app.repositories.in_memory_order_repository import InMemoryOrderRepository
-from app.services.fulfillment_plan_service import FulfillmentPlanService
-from app.services.inventory_analysis_service import InventoryAnalysisService
-from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.multi_agent_service import MultiAgentService
-from app.services.order_analysis_service import OrderAnalysisService
-from app.services.substitute_sku_service import SubstituteSkuService
-from app.services.warehouse_service import WarehouseService
-from app.graph.parallel_workflow import create_parallel_workflow_nodes, build_parallel_workflow
-from app.agent.agent import _reflect_on_answer
+from app.domain.fulfillment.plan_service import FulfillmentPlanService
+from app.domain.inventory.analysis import InventoryAnalysisService
+from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
+from app.agents.runtime.multi_agent_service import MultiAgentService
+from app.domain.orders.analysis import OrderAnalysisService
+from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+from app.domain.inventory.warehouse_service import WarehouseService
+from app.workflows.fulfillment.parallel_graph import create_parallel_workflow_nodes, build_parallel_workflow
+from app.agents.orchestration.react_agent import _reflect_on_answer
 
 
 def setup_services():
@@ -264,13 +264,13 @@ def main():
     print("=" * 70)
     print()
     print("新增文件清单：")
-    print("  app/graph/parallel_workflow.py  — 并行工作流")
-    print("  app/agent/multi_agent.py        — 多 Agent 编排")
-    print("  app/services/multi_agent_service.py — 多 Agent 服务")
+    print("  app/workflows/fulfillment/parallel_graph.py  — 并行工作流")
+    print("  app/agents/orchestration/multi_agent.py        — 多 Agent 编排")
+    print("  app/agents/runtime/multi_agent_service.py — 多 Agent 服务")
     print()
     print("修改文件清单：")
-    print("  app/graph/state.py              — 新增 warehouse_search_result 字段")
-    print("  app/agent/agent.py              — 新增自反思循环（ReflectiveAgentRunner）")
+    print("  app/workflows/fulfillment/state.py              — 新增 warehouse_search_result 字段")
+    print("  app/agents/orchestration/react_agent.py              — 新增自反思循环（ReflectiveAgentRunner）")
     print("  app/api/routes/hybrid.py        — 新增 /parallel/run 和 /multi-agent/run 端点")
     print()
 

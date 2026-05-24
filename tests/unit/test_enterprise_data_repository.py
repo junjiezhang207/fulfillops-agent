@@ -10,8 +10,8 @@ from app.repositories.in_memory_order_repository import InMemoryOrderRepository
 from app.schemas.enterprise_data import EnterpriseDataSourceCreate
 from app.schemas.inventory import InventoryRecord
 from app.schemas.orders import OrderItem, OrderRecord
-from app.services.inventory_analysis_service import InventoryAnalysisService
-from app.services.order_analysis_service import OrderAnalysisService
+from app.domain.inventory.analysis import InventoryAnalysisService
+from app.domain.orders.analysis import OrderAnalysisService
 
 
 def _order(order_id: str = "SO-ENT-001", sku_id: str = "SKU-ENT-001") -> OrderRecord:

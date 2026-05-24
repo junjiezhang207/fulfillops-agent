@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.agent.tools import (
+from app.agents.tools.factory import (
     make_fulfillment_plan_tool,
     make_inventory_tool,
     make_knowledge_tool,

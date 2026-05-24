@@ -1,6 +1,6 @@
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from app.agent.context_manager import ContextWindowConfig, ContextWindowManager, TrimResult
+from app.agents.runtime.context_manager import ContextWindowConfig, ContextWindowManager, TrimResult
 
 
 class _CountingLLM:
@@ -69,7 +69,7 @@ def test_context_window_fallback_keeps_minimum_tail_when_langchain_trim_fails(mo
     def _raise(*args, **kwargs):
         raise ValueError("bad message shape")
 
-    monkeypatch.setattr("app.agent.context_manager.trim_messages", _raise)
+    monkeypatch.setattr("app.agents.runtime.context_manager.trim_messages", _raise)
     trimmed, result = manager.trim(messages)
 
     assert trimmed == messages[-3:]

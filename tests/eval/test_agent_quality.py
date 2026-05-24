@@ -23,7 +23,7 @@
 
 import pytest
 
-from app.agent.evaluation.golden_dataset import GOLDEN_DATASET, GoldenCase
+from app.agents.quality.evaluation.golden_dataset import GOLDEN_DATASET, GoldenCase
 
 pytestmark = pytest.mark.slow
 

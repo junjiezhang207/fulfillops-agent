@@ -1,4 +1,4 @@
-from app.services.agent_service import AgentService
+from app.agents.runtime.agent_service import AgentService
 
 
 def test_memory_candidates_ignore_low_value_chitchat():

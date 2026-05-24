@@ -4,16 +4,16 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.tools import StructuredTool
 
-from app.agent.multi_agent import MultiAgentOrchestrator
-from app.agent.parallel_tools import ParallelToolRunner, make_parallel_query_tool
-from app.agent.tool_wrapper import wrap_tool_with_resilience
+from app.agents.orchestration.multi_agent import MultiAgentOrchestrator
+from app.agents.orchestration.parallel_tools import ParallelToolRunner, make_parallel_query_tool
+from app.agents.tools.wrapper import wrap_tool_with_resilience
 from app.repositories.in_memory_inventory_repository import InMemoryInventoryRepository
 from app.repositories.in_memory_order_repository import InMemoryOrderRepository
-from app.services.fulfillment_plan_service import FulfillmentPlanService
-from app.services.inventory_analysis_service import InventoryAnalysisService
-from app.services.order_analysis_service import OrderAnalysisService
-from app.services.substitute_sku_service import SubstituteSkuService
-from app.services.warehouse_service import WarehouseService
+from app.domain.fulfillment.plan_service import FulfillmentPlanService
+from app.domain.inventory.analysis import InventoryAnalysisService
+from app.domain.orders.analysis import OrderAnalysisService
+from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+from app.domain.inventory.warehouse_service import WarehouseService
 
 
 def _async_only_tool(name: str = "async_only") -> StructuredTool:

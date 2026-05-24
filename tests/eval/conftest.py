@@ -13,12 +13,12 @@ import pytest
 from app.repositories.file_system_knowledge_repository import FileSystemKnowledgeRepository
 from app.repositories.in_memory_inventory_repository import InMemoryInventoryRepository
 from app.repositories.in_memory_order_repository import InMemoryOrderRepository
-from app.services.fulfillment_plan_service import FulfillmentPlanService
-from app.services.inventory_analysis_service import InventoryAnalysisService
-from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.order_analysis_service import OrderAnalysisService
-from app.services.substitute_sku_service import SubstituteSkuService
-from app.services.warehouse_service import WarehouseService
+from app.domain.fulfillment.plan_service import FulfillmentPlanService
+from app.domain.inventory.analysis import InventoryAnalysisService
+from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
+from app.domain.orders.analysis import OrderAnalysisService
+from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+from app.domain.inventory.warehouse_service import WarehouseService
 
 
 def _build_services():
@@ -58,14 +58,14 @@ def agent_service_with_llm():
 
     若未配置，自动 skip 当前测试。
     """
-    from app.agent.tools import (
+    from app.agents.tools.factory import (
         make_fulfillment_plan_tool,
         make_substitute_tool,
         make_warehouse_tool,
     )
     from app.core.config import get_settings
-    from app.graph.llm_adapter import LLMFactory
-    from app.services.agent_service import AgentNotAvailableError, AgentService
+    from app.infrastructure.llm.chat_adapter import LLMFactory
+    from app.agents.runtime.agent_service import AgentNotAvailableError, AgentService
 
     settings = get_settings()
     chat_model = LLMFactory.create_chat_model(settings)

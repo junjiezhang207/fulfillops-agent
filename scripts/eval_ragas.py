@@ -37,7 +37,7 @@ def _build_eval_records() -> list[dict]:
     生产中替换为：从 Langfuse 导出历史 trace → 解析 question/answer/contexts。
     当前阶段使用 golden_dataset 中的问题 + mock 答案演示流程。
     """
-    from app.agent.evaluation.golden_dataset import GOLDEN_DATASET
+    from app.agents.quality.evaluation.golden_dataset import GOLDEN_DATASET
 
     records = []
     for case in GOLDEN_DATASET:
@@ -65,9 +65,9 @@ def _build_eval_records() -> list[dict]:
 # ── 主评测流程 ────────────────────────────────────────────────────────────────
 
 def run_eval(limit: int | None = None, output_dir: str = "storage/eval_results") -> dict:
-    from app.agent.evaluation.ragas_evaluator import RagasEvaluator
+    from app.agents.quality.evaluation.ragas_evaluator import RagasEvaluator
     from app.core.config import get_settings
-    from app.graph.llm_adapter import LLMFactory
+    from app.infrastructure.llm.chat_adapter import LLMFactory
 
     settings = get_settings()
     llm = LLMFactory.create_chat_model(settings, use_case="judge")  # 评测优先使用 judge 模型

@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.agent.context_manager import ContextWindowConfig, ContextWindowManager, estimate_tokens
-from app.agent.tool_wrapper import CircuitBreaker, CircuitState, wrap_tool_with_resilience
+from app.agents.runtime.context_manager import ContextWindowConfig, ContextWindowManager, estimate_tokens
+from app.agents.tools.wrapper import CircuitBreaker, CircuitState, wrap_tool_with_resilience
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 
@@ -243,11 +243,11 @@ def main():
     print("=" * 70)
     print()
     print("新增文件：")
-    print("  app/agent/tool_wrapper.py      — 工具重试 + 超时 + 熔断器")
-    print("  app/agent/context_manager.py   — Token 上限管理")
+    print("  app/agents/tools/wrapper.py      — 工具重试 + 超时 + 熔断器")
+    print("  app/agents/runtime/context_manager.py   — Token 上限管理")
     print()
     print("重写文件：")
-    print("  app/services/agent_service.py  — 集成以上三项 + 新增 stream_chat()")
+    print("  app/agents/runtime/agent_service.py  — 集成以上三项 + 新增 stream_chat()")
     print()
 
 

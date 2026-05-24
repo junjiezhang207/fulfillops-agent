@@ -14,10 +14,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.graph.nodes import WorkflowNodes
-from app.graph.state import GraphState
-from app.graph.trace import TraceEvent, ErrorEvent
-from app.services.order_analysis_service import OrderNotFoundError
+from app.workflows.fulfillment.nodes import WorkflowNodes
+from app.workflows.fulfillment.state import GraphState
+from app.workflows.fulfillment.trace import TraceEvent, ErrorEvent
+from app.domain.orders.analysis import OrderNotFoundError
 from langgraph.types import Command
 
 
