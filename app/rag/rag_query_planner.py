@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from app.schemas.inventory import InventoryAnalysisResult
 from app.schemas.knowledge import QueryIntent, QueryIntentType
-from app.services.inventory_analysis_service import InventoryAnalysisService
+from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.query_rewriter import QueryRewriter
 
 

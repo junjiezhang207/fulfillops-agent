@@ -33,7 +33,7 @@ from app.core.service_registry import (
 )
 from app.schemas.common import ApiResponse
 from app.schemas.workflow import WorkflowRunRequest
-from app.services.order_analysis_service import OrderNotFoundError
+from app.domain.orders.analysis import OrderNotFoundError
 from app.services.workflow_service import WorkflowService, WorkflowTimeoutError
 
 router = APIRouter(prefix="/workflow")

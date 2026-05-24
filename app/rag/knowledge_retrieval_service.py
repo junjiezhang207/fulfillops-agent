@@ -64,7 +64,7 @@ from app.schemas.knowledge import (
     QueryIntent,
     QueryIntentType,
 )
-from app.services.inventory_analysis_service import InventoryAnalysisService
+from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.query_rewriter import QueryRewriter
 from app.rag.rag_answer_builder import RAGAnswerBuilder
 from app.rag.rag_query_planner import RAGQueryPlanner, RetrievalInputs

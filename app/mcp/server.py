@@ -55,9 +55,9 @@ from app.core.service_registry import (
     get_knowledge_retrieval_service,
     get_order_analysis_service,
 )
-from app.services.warehouse_service import WarehouseService
-from app.services.substitute_sku_service import SubstituteSkuService
-from app.services.fulfillment_plan_service import FulfillmentPlanService
+from app.domain.inventory.warehouse_service import WarehouseService
+from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.mcp.runtime import run_mcp_server
 
 # ============================================================================

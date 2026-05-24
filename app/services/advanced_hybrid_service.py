@@ -11,12 +11,12 @@ from typing import Optional
 import time
 
 from app.schemas.advanced_order import AdvancedOrderDetails, WarehouseInfo
-from app.services.business_rule_engine import (
+from app.domain.rules.business_rule_engine import (
     BusinessRuleEngine,
     DynamicPricingEngine,
     RuleImpactAnalysis,
 )
-from app.services.fulfillment_options_generator import (
+from app.domain.fulfillment.options_generator import (
     FulfillmentOption,
     FulfillmentOptionsGenerator,
 )

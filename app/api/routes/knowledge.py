@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, status
 from app.core.service_registry import get_knowledge_retrieval_service
 from app.schemas.common import ApiResponse
 from app.schemas.knowledge import KnowledgeRetrieveRequest
-from app.services.order_analysis_service import (
+from app.domain.orders.analysis import (
     OrderNotFoundError,
 )
 

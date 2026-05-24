@@ -50,9 +50,9 @@ from app.schemas.agent import (
     ReflectionInfo,
     ToolCallDetail,
 )
-from app.services.inventory_analysis_service import InventoryAnalysisService
+from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.order_analysis_service import OrderAnalysisService
+from app.domain.orders.analysis import OrderAnalysisService
 
 
 CATALOG_TOOL_NAMES = {"find_substitute_sku"}

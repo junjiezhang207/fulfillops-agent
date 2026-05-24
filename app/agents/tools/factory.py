@@ -31,14 +31,14 @@ from typing import TYPE_CHECKING, Callable
 
 from langchain_core.tools import StructuredTool, ToolException
 
-from app.services.inventory_analysis_service import InventoryAnalysisService
+from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.order_analysis_service import OrderAnalysisService
+from app.domain.orders.analysis import OrderAnalysisService
 
 if TYPE_CHECKING:
-    from app.services.fulfillment_plan_service import FulfillmentPlanService
-    from app.services.substitute_sku_service import SubstituteSkuService
-    from app.services.warehouse_service import WarehouseService
+    from app.domain.fulfillment.plan_service import FulfillmentPlanService
+    from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+    from app.domain.inventory.warehouse_service import WarehouseService
 
 
 # 面试官可能问：为什么工具返回 JSON 字符串，而不是直接返回 dict？

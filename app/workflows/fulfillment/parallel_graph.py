@@ -42,9 +42,9 @@ from langchain_core.language_models import BaseChatModel
 from app.workflows.fulfillment.nodes import WorkflowNodes
 from app.workflows.fulfillment.state import GraphState
 from app.workflows.fulfillment.trace import ErrorEvent, build_trace_event
-from app.services.inventory_analysis_service import InventoryAnalysisService
+from app.domain.inventory.analysis import InventoryAnalysisService
 from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.order_analysis_service import OrderAnalysisService
+from app.domain.orders.analysis import OrderAnalysisService
 
 
 class ParallelWorkflowNodes(WorkflowNodes):

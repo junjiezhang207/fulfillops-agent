@@ -19,10 +19,10 @@ Workflow 和 Agent 不是重复功能，而是解决不同问题。
 | --- | --- |
 | `app/workflows/fulfillment/` | LangGraph 节点、状态和履约 Workflow 编排 |
 | `app/services/workflow_service.py` | Workflow 应用服务入口 |
-| `app/services/order_analysis_service.py` | 订单分析 |
-| `app/services/inventory_analysis_service.py` | 库存分析 |
-| `app/services/fulfillment_plan_service.py` | 履约方案生成 |
-| `app/services/business_rule_engine.py` | 业务规则引擎 |
+| `app/domain/orders/analysis.py` | 订单分析 |
+| `app/domain/inventory/analysis.py` | 库存分析 |
+| `app/domain/fulfillment/plan_service.py` | 履约方案生成 |
+| `app/domain/rules/business_rule_engine.py` | 业务规则引擎 |
 
 Workflow 的输出更结构化，适合展示“为什么这么判断”。
 

@@ -51,13 +51,13 @@ from app.workflows.fulfillment.parallel_graph import (
     create_parallel_workflow_nodes,
 )
 from app.services.client_cache_service import get_response_cache
-from app.services.fulfillment_plan_service import FulfillmentPlanService
+from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.services.hybrid_service import HybridService
 from app.services.session_memory_service import (
     get_session_service,
 )
-from app.services.substitute_sku_service import SubstituteSkuService
-from app.services.warehouse_service import WarehouseService
+from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+from app.domain.inventory.warehouse_service import WarehouseService
 from app.services.workflow_service import WorkflowService
 
 router = APIRouter(prefix="/hybrid")

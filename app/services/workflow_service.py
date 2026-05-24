@@ -32,9 +32,9 @@ from app.schemas.workflow import (
     WorkflowRunRequest,
     WorkflowRunResult,
 )
-from app.services.inventory_analysis_service import InventoryAnalysisService
+from app.domain.inventory.analysis import InventoryAnalysisService
 from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.order_analysis_service import OrderAnalysisService
+from app.domain.orders.analysis import OrderAnalysisService
 
 
 class WorkflowTimeoutError(Exception):

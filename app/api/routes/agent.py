@@ -47,9 +47,9 @@ from app.schemas.agent import AgentChatRequest, AgentChatResponse, PlanExecuteRe
 from app.schemas.common import ApiResponse
 from app.agents.runtime.agent_service import AgentNotAvailableError, AgentService
 from app.agents.runtime.plan_execute_service import PlanExecuteService
-from app.services.fulfillment_plan_service import FulfillmentPlanService
-from app.services.substitute_sku_service import SubstituteSkuService
-from app.services.warehouse_service import WarehouseService
+from app.domain.fulfillment.plan_service import FulfillmentPlanService
+from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+from app.domain.inventory.warehouse_service import WarehouseService
 
 router = APIRouter(prefix="/agent")
 logger = logging.getLogger(__name__)

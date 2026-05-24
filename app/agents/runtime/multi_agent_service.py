@@ -15,12 +15,12 @@ import time
 from dataclasses import dataclass, field
 
 from app.agents.orchestration.multi_agent import MultiAgentOrchestrator
-from app.services.fulfillment_plan_service import FulfillmentPlanService
-from app.services.inventory_analysis_service import InventoryAnalysisService
+from app.domain.fulfillment.plan_service import FulfillmentPlanService
+from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.services.order_analysis_service import OrderAnalysisService
-from app.services.substitute_sku_service import SubstituteSkuService
-from app.services.warehouse_service import WarehouseService
+from app.domain.orders.analysis import OrderAnalysisService
+from app.domain.fulfillment.substitute_sku import SubstituteSkuService
+from app.domain.inventory.warehouse_service import WarehouseService
 
 
 @dataclass
