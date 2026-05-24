@@ -161,7 +161,7 @@ def _milvus_runtime_config(settings: object) -> MilvusRuntimeConfig:
 def _embedding_dimension_from_gateway(settings: object) -> int | None:
     """优先从模型网关读取当前 Embedding 维度，避免 .env 配错导致维度不一致。"""
     try:
-        from app.services.model_gateway import ModelGateway
+        from app.infrastructure.llm.model_gateway import ModelGateway
 
         profile = ModelGateway(settings).resolve_profile(use_case="embedding", model_type="embedding")
         if profile and profile.dimension:

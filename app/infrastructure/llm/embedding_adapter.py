@@ -195,7 +195,7 @@ def _create_gateway_embed(settings: object):
         兼容 OpenAI API 的服务。
     """
     try:
-        from app.services.model_gateway import ModelGateway
+        from app.infrastructure.llm.model_gateway import ModelGateway
 
         gateway = ModelGateway(settings)
         profile = gateway.resolve_profile(use_case="embedding", model_type="embedding")

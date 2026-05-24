@@ -2,14 +2,14 @@
 
 历史上这里直接根据 `.env` 构造各家 ChatModel。
 现在主路径已经升级为后端模型网关：模型清单、用途、密钥来源由
-``app.services.model_gateway.ModelGateway`` 管理。
+``app.infrastructure.llm.model_gateway.ModelGateway`` 管理。
 
 保留 ``LLMFactory`` 是为了兼容项目里已有调用点。
 """
 
 from langchain_core.language_models import BaseChatModel
 
-from app.services.model_gateway import ModelGateway
+from app.infrastructure.llm.model_gateway import ModelGateway
 
 
 class LLMFactory:

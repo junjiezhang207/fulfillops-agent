@@ -1193,7 +1193,7 @@ class KnowledgeRetrievalService:
             f"chunk:{CHUNK_SIZE}:{CHUNK_OVERLAP}",
         ]
         try:
-            from app.services.model_gateway import ModelGateway
+            from app.infrastructure.llm.model_gateway import ModelGateway
 
             # 如果模型网关里配置了 embedding profile，也加入指纹。
             # 这样从本地 embedding 换到云端 embedding 时，会自动重建索引。

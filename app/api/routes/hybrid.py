@@ -44,21 +44,21 @@ from app.schemas.advanced_order import AdvancedOrderDetails, Location, Warehouse
 from app.schemas.common import ApiResponse
 from app.schemas.workflow import WorkflowRunRequest
 from app.agents.runtime.agent_service import AgentService
-from app.services.advanced_hybrid_service import AdvancedHybridService
+from app.application.routing.advanced_hybrid_service import AdvancedHybridService
 from app.agents.runtime.multi_agent_service import MultiAgentService
 from app.workflows.fulfillment.parallel_graph import (
     build_parallel_workflow,
     create_parallel_workflow_nodes,
 )
-from app.services.client_cache_service import get_response_cache
+from app.application.cache.client_cache_service import get_response_cache
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
-from app.services.hybrid_service import HybridService
-from app.services.session_memory_service import (
+from app.application.routing.hybrid_service import HybridService
+from app.application.memory.session_memory_service import (
     get_session_service,
 )
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
 from app.domain.inventory.warehouse_service import WarehouseService
-from app.services.workflow_service import WorkflowService
+from app.application.workflow.workflow_service import WorkflowService
 
 router = APIRouter(prefix="/hybrid")
 logger = logging.getLogger(__name__)

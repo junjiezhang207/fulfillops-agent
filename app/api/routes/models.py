@@ -17,7 +17,7 @@
 from fastapi import APIRouter, Query
 
 from app.schemas.common import ApiResponse
-from app.services.model_gateway import get_model_gateway
+from app.infrastructure.llm.model_gateway import get_model_gateway
 
 router = APIRouter(prefix="/models")
 

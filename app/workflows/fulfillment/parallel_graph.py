@@ -43,7 +43,7 @@ from app.workflows.fulfillment.nodes import WorkflowNodes
 from app.workflows.fulfillment.state import GraphState
 from app.workflows.fulfillment.trace import ErrorEvent, build_trace_event
 from app.domain.inventory.analysis import InventoryAnalysisService
-from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
+from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.domain.orders.analysis import OrderAnalysisService
 
 

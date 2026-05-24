@@ -299,7 +299,7 @@ def create_reranker(settings: object) -> PassageReranker | None:
     创建失败时返回 None，RAG 主链路会保持原始排序。
     """
     try:
-        from app.services.model_gateway import ModelGateway
+        from app.infrastructure.llm.model_gateway import ModelGateway
 
         # 从模型网关找 use_case=reranker 的模型配置。
         gateway = ModelGateway(settings)

@@ -19,10 +19,10 @@ from app.repositories.in_memory_inventory_repository import InMemoryInventoryRep
 from app.repositories.in_memory_order_repository import InMemoryOrderRepository
 from app.infrastructure.llm.chat_adapter import LLMFactory
 from app.domain.inventory.analysis import InventoryAnalysisService
-from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
+from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.domain.orders.analysis import OrderAnalysisService
-from app.services.query_rewriter import QueryRewriter
-from app.services.reranker import ContextualCompressor, create_reranker
+from app.rag.query_rewriter import QueryRewriter
+from app.rag.reranker import ContextualCompressor, create_reranker
 
 
 @lru_cache

@@ -32,7 +32,7 @@ Repository / Vector Store / 企业数据
 | --- | --- |
 | `app/api/` | FastAPI 路由，负责请求入口和响应模型 |
 | `app/domain/` | 业务域层，放订单、库存、履约、仓库、替代 SKU 和规则判断 |
-| `app/services/` | 应用服务层，负责编排 Workflow、Agent、RAG、Memory 和业务域能力 |
+| `app/application/` | 应用服务层，负责编排 Workflow、Agent、RAG、Memory 和业务域能力 |
 | `app/agents/` | Agent 编排、运行时、工具、安全防护、质量评测与可观测 |
 | `app/workflows/` | 履约 Workflow、状态、节点、路由、风险判断和 Trace |
 | `app/infrastructure/llm/` | ChatModel 与 Embedding 基础设施适配 |

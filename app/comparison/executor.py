@@ -20,11 +20,11 @@ from app.schemas.workflow import WorkflowRunRequest
 from app.agents.runtime.agent_service import AgentService
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.domain.inventory.analysis import InventoryAnalysisService
-from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
+from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.domain.orders.analysis import OrderAnalysisService
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
 from app.domain.inventory.warehouse_service import WarehouseService
-from app.services.workflow_service import WorkflowService
+from app.application.workflow.workflow_service import WorkflowService
 
 
 class ComparisonExecutor:

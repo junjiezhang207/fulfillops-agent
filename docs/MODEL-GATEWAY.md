@@ -17,7 +17,7 @@
 | --- | --- |
 | `.env` | 保存 API Key、基础开关、连接地址 |
 | `config/model_gateway.yaml` | 保存模型列表、用途、能力、路由、是否启用 |
-| `app/services/model_gateway.py` | 读取配置并创建 LangChain ChatModel |
+| `app/infrastructure/llm/model_gateway.py` | 读取配置并创建 LangChain ChatModel |
 | `app/infrastructure/llm/embedding_adapter.py` | 创建 Embedding 模型 |
 | `app/rag/reranker.py` | 创建 Reranker 模型 |
 

@@ -55,7 +55,7 @@
 5. `app/rag/knowledge_retrieval_service.py`
 6. `app/rag/rag_query_planner.py`
 7. `app/rag/reranker.py`
-8. `app/services/model_gateway.py`
+8. `app/infrastructure/llm/model_gateway.py`
 9. `app/rag/vector_store_factory.py`
 10. `frontend/`
 
