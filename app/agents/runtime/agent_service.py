@@ -1,6 +1,6 @@
-"""Agent 外观服务（学习版注释）。
+"""Agent 外观服务。
 
-这个文件可以理解成“业务系统和 LangChain Agent 之间的适配层”。
+本模块是业务系统和 LangChain Agent 之间的适配层。
 
 它不负责自己实现 ReAct 循环。模型什么时候调用工具、工具结果如何回到模型、
 模型什么时候生成最终回答，这些都交给 ``langchain.agents.create_agent`` 生成的
@@ -11,15 +11,7 @@ Agent 图来完成。
   2. 给工具统一加超时、重试、缓存和异常兜底。
   3. 接入 LangGraph checkpointer，保存会话内短期记忆。
   4. 接入长期记忆 store，只沉淀可复用的业务偏好和订单决策。
-  5. 接入 Langfuse，把关键调用链路上报到观测平台。
-  6. 把 LangChain 返回的消息历史整理成 API 需要的 reply、trace、decision。
-
-学习时建议按这个顺序读：
-  - ``__init__``：看 Agent 需要哪些依赖，以及短期/长期记忆怎么接进去。
-  - ``chat``：普通非流式接口的一轮完整主线。
-  - ``stream_chat``：流式接口如何把 LangChain chunk 转成前端事件。
-  - ``_remember_turn`` / ``_search_memories``：长期记忆的写入和召回策略。
-  - ``_extract_reply_and_tools``：如何从 LangChain 消息历史还原工程 trace。
+  5. 把 LangChain 返回的消息历史整理成 API 需要的 reply、trace、decision。
 """
 
 from __future__ import annotations
@@ -27,22 +19,25 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from contextlib import nullcontext
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Literal, Optional
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage, filter_messages
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
 
 from app.agents.orchestration.react_agent import ReflectiveAgentRunner, build_agent
 from app.agents.runtime.checkpointer import create_checkpointer
 from app.agents.runtime.context_manager import ContextWindowConfig, ContextWindowManager
-from app.agents.quality.evaluation.langfuse_tracer import LangfuseTracer, score_after_run
 from app.agents.tools.wrapper import wrap_all_tools
-from app.agents.tools.factory import make_inventory_tool, make_knowledge_tool, make_order_tool
+from app.agents.tools.contracts import make_agent_tool_context, tool_runtime_context
+from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
+from app.infrastructure.llm.model_gateway import get_model_gateway
 from app.memory import MemoryGovernanceService
+from app.observability.business_trace import add_trace_step
 from app.schemas.agent import (
     AgentExecutionTrace,
     FulfillmentDecision,
@@ -114,10 +109,54 @@ class MemoryWriteCandidate:
 _STRUCT_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "你是供应链履约决策分析器。根据以下 Agent 分析结果，提取结构化决策信息。"
-        "只基于提供的文本内容，不要添加未提到的信息。",
+        get_model_gateway().prompt_system(use_case="structured_extract"),
     ),
     ("human", "问题：{question}\n\nAgent 分析结果：{agent_reply}"),
+])
+
+
+class ExtractedMemory(BaseModel):
+    """LLM 输出的一条候选长期记忆。
+
+    这里不是最终入库模型，而是把 deepseek-v4-flash 的抽取结果约束成
+    AgentService 能继续转换为 MemoryWriteCandidate 的中间结构。
+    """
+
+    memory_type: Literal["user_preference", "order_decision", "conversation_summary"] = Field(
+        description="候选记忆类型，不允许生成 business_rule"
+    )
+    scope: Literal["session", "customer", "order"] = Field(description="记忆作用域")
+    summary: str | None = Field(default=None, description="订单决策或会话摘要")
+    preference: str | None = Field(default=None, description="用户明确表达的偏好")
+    order_id: str | None = Field(default=None, description="相关订单号")
+    customer_id: str | None = Field(default=None, description="相关客户号")
+    memory_facts: dict[str, Any] = Field(default_factory=dict, description="用于治理层冲突检测的结构化事实")
+    evidence: str = Field(default="", description="支持这条记忆的原文证据")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="抽取置信度")
+    importance: float = Field(default=0.5, ge=0.0, le=1.0, description="召回重要性")
+    ttl_days: int | None = Field(default=None, description="建议保留天数，空表示不过期")
+
+
+class ExtractedMemoryBatch(BaseModel):
+    """LLM 一次抽取返回的候选记忆集合。"""
+
+    memories: list[ExtractedMemory] = Field(default_factory=list)
+
+
+_MEMORY_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        get_model_gateway().prompt_system(use_case="memory_extract"),
+    ),
+    (
+        "human",
+        "会话 ID：{session_id}\n"
+        "用户问题：{user_message}\n\n"
+        "助手回答：{assistant_reply}\n\n"
+        "本轮工具调用：{tools_called}\n\n"
+        "工具观察结果摘要：\n{tool_observations}\n\n"
+        "请抽取候选长期记忆。",
+    ),
 ])
 
 
@@ -183,7 +222,6 @@ class AgentService:
         max_reflection_retries: int = 2,
         enable_structured_output: bool = True,
         structured_output_model: object | None = None,
-        langfuse_tracer: Optional[LangfuseTracer] = None,
     ) -> None:
         """完成 Agent 的一次性装配。
 
@@ -193,7 +231,7 @@ class AgentService:
         3. 包装工具弹性：超时、重试、缓存、异常净化都在工具外层处理。
         4. 创建记忆组件：checkpointer 管短期对话历史，store 管长期业务记忆。
         5. 编译 Agent 图：``build_agent`` 内部会调用 LangChain/LangGraph 能力。
-        6. 准备增强能力：反思质量门、结构化抽取、Langfuse 追踪。
+        6. 准备增强能力：反思质量门、结构化抽取。
         """
         if chat_model is None:
             raise AgentNotAvailableError(
@@ -204,15 +242,25 @@ class AgentService:
         # ContextWindowManager 只负责“历史太长时怎么裁剪”。
         # 它不会自己保存历史；真正的消息历史由 LangGraph checkpointer 保存。
         self._context_manager = ContextWindowManager(context_config, llm=chat_model)
-        self._langfuse_tracer = langfuse_tracer
 
-        # 基础工具来自业务 service。Agent 最终看到的是 LangChain Tool，
-        # 不是直接访问 repository 或数据库。
-        base_realtime_tools = [
-            make_order_tool(order_service),
-            make_inventory_tool(inventory_service),
-        ]
-        base_catalog_tools = [make_knowledge_tool(knowledge_service)]
+        # 基础工具来自 ToolRegistry。Agent 最终看到的是 LangChain Tool，
+        # 不是直接访问 repository 或数据库；工具可用性、权限和缓存元数据集中在 registry。
+        tool_services = ToolServiceBundle(
+            order_service=order_service,
+            inventory_service=inventory_service,
+            knowledge_service=knowledge_service,
+        )
+        tool_registry = get_tool_registry()
+        base_realtime_tools = tool_registry.build_tools(
+            services=tool_services,
+            use_case="agent",
+            include_names=("analyze_order", "check_inventory"),
+        )
+        base_catalog_tools = tool_registry.build_tools(
+            services=tool_services,
+            use_case="agent",
+            include_names=("retrieve_knowledge",),
+        )
         extra_realtime_tools, extra_catalog_tools = _split_by_cache_policy(extra_tools or [])
 
         # Agent 看到的是包装后的工具。包装层不改变工具语义，只处理工程问题：
@@ -230,8 +278,7 @@ class AgentService:
         settings = get_settings()
 
         # 短期记忆：保存“当前会话内”的完整消息历史。
-        # 同一个 session_id 会映射到 LangGraph config.configurable.thread_id。
-        # Redis 可用时持久化到 Redis；不可用时降级为 MemorySaver。
+        # 生产模式固定依赖 Redis，不能降级到 MemorySaver，否则多实例会话会不一致。
         checkpointer = create_checkpointer(
             settings.redis_url,
             ttl_seconds=settings.short_term_memory_ttl_seconds,
@@ -240,15 +287,10 @@ class AgentService:
         # 长期记忆：保存跨会话仍有价值的信息，例如用户偏好、订单处理结论。
         # 如果后端是 MySQL + Milvus，这里传入懒加载 embedding 代理，
         # 避免 FastAPI 启动时马上加载本地 embedding 权重。
-        memory_embed_model = None
-        long_term_backend = settings.long_term_memory_backend.strip().lower()
-        if long_term_backend in {"mysql_milvus", "mysql+milvus", "mysql", "milvus"}:
-            from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
+        from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
 
-            memory_embed_model = create_lazy_embed_model(settings)
+        memory_embed_model = create_lazy_embed_model(settings)
         self._memory_store = create_long_term_memory_store(
-            db_path=settings.long_term_memory_db_path,
-            backend=settings.long_term_memory_backend,
             mysql_url=settings.long_term_memory_mysql_url or settings.mysql_url,
             milvus_uri=settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}",
             milvus_token=settings.milvus_token,
@@ -265,7 +307,7 @@ class AgentService:
 
         # LangChain 的 checkpointer 按 thread_id 保存消息历史。
         # 所以后面每次调用只要传同一个 session_id，Agent 就能记住前几轮上下文。
-        # store 则是 LangGraph 的长期记忆接口，本项目用它挂 SQLite / MySQL + Milvus 实现。
+        # store 则是 LangGraph 的长期记忆接口，本项目固定使用 MySQL + Milvus 实现。
         self._agent = build_agent(
             chat_model,
             resilient_tools,
@@ -285,11 +327,25 @@ class AgentService:
             else None
         )
         extraction_model = structured_output_model or chat_model
+        self._memory_extractor_model_id = self._model_identifier(extraction_model)
         self._struct_extractor = (
             self._make_structured_extractor(extraction_model) if enable_structured_output else None
         )
+        self._memory_extractor = (
+            self._make_memory_extractor(extraction_model) if enable_structured_output else None
+        )
 
-    async def chat(self, session_id: str, message: str, include_trace: bool = True) -> dict:
+    async def chat(
+        self,
+        session_id: str,
+        message: str,
+        include_trace: bool = True,
+        tenant_id: str = "default",
+        user_id: str | None = None,
+        roles: list[str] | None = None,
+        permissions: list[str] | None = None,
+        request_id: str = "",
+    ) -> dict:
         """执行一轮非流式 Agent 对话。
 
         主线可以记成：
@@ -298,7 +354,7 @@ class AgentService:
         3. 裁剪短期消息历史，防止 prompt 无限膨胀。
         4. 运行 Agent，得到自然语言回复和工具调用记录。
         5. 可选抽取结构化履约决策。
-        6. 写入长期记忆、提交 Langfuse 评分、构造 trace。
+        6. 写入长期记忆、构造 trace。
         """
         callbacks = self._callbacks()
         config = self._run_config(session_id, callbacks)
@@ -306,51 +362,98 @@ class AgentService:
         # agent_message 是“当前用户问题 + 召回到的长期记忆”。
         # 原始 message 仍然保留，用于结构化抽取、记忆写入和 trace 展示。
         agent_message = self._message_with_memory(session_id, message)
-        span_context = (
-            self._langfuse_tracer.start_span(
-                name="agent.chat",
-                input={"session_id": session_id, "message": message},
-                metadata={"include_trace": include_trace},
-            )
-            if self._langfuse_tracer
-            else None
+        context = make_agent_tool_context(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            roles=roles,
+            permissions=permissions,
+            request_id=request_id,
         )
-
-        with (span_context if span_context is not None else nullcontext()) as langfuse_span:
+        with tool_runtime_context(context):
+            agent_step = add_trace_step(
+                step_type="agent",
+                name="react_agent_turn",
+                status="success",
+                summary="ReAct Agent 开始处理本轮问题",
+                input_summary=message,
+                metadata={
+                    "session_id": session_id,
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                },
+            )
+            agent_parent_id = agent_step.id if agent_step else None
             # 裁剪发生在调用 Agent 前。否则历史消息太长，会让 prompt 越来越贵，
             # 也可能超过模型上下文窗口。
             context_trimmed = self._maybe_trim_context(session_id)
 
+            started = time.monotonic()
             reply, tools_called, tool_call_details, reflection_info = await self._run_turn(
                 session_id=session_id,
                 message=agent_message,
                 config=config,
                 callbacks=callbacks,
             )
+            add_trace_step(
+                step_type="agent",
+                name="react_agent_result",
+                parent_id=agent_parent_id,
+                status="success",
+                duration_ms=(time.monotonic() - started) * 1000,
+                summary=f"Agent 完成，本轮工具调用 {len(tools_called)} 次",
+                output_summary=reply,
+                metadata={
+                    "tools_called": tools_called,
+                    "context_trimmed": context_trimmed,
+                    "reflection_enabled": self._reflective_runner is not None,
+                },
+            )
+            for index, detail in enumerate(tool_call_details, 1):
+                add_trace_step(
+                    step_type="agent_iteration",
+                    name=f"react_cycle_{index}:{detail.tool_name}",
+                    parent_id=agent_parent_id,
+                    status="success",
+                    summary=f"第 {index} 轮 ReAct 工具调用：{detail.tool_name}",
+                    input_summary=detail.input_args,
+                    output_summary=detail.output[:600],
+                    metadata={
+                        "cycle_index": index,
+                        "tool_name": detail.tool_name,
+                    },
+                )
 
             # 结构化抽取失败不影响主回答，所以 _extract_decision 内部会吞掉异常并返回 None。
             decision = await self._extract_decision(message, reply)
+            add_trace_step(
+                step_type="evaluation",
+                name="agent_quality_snapshot",
+                parent_id=agent_parent_id,
+                status="success",
+                summary="Agent 回答质量与结构化抽取快照",
+                metadata={
+                    "has_structured_decision": decision is not None,
+                    "reflection": reflection_info.model_dump() if reflection_info else None,
+                    "tools_called_count": len(tools_called),
+                    "reply_length": len(reply or ""),
+                },
+            )
 
             # 长期记忆只记录有复用价值的信息；寒暄、普通短确认会被策略过滤。
-            self._remember_turn(session_id, message, reply, tools_called)
-            self._score_langfuse(reply, tools_called, reflection_info)
+            await self._aremember_turn(
+                session_id=session_id,
+                message=message,
+                reply=reply,
+                tools_called=tools_called,
+                tool_call_details=tool_call_details,
+            )
 
             trace = (
                 self._build_trace(session_id, message, reply, tools_called, tool_call_details)
                 if include_trace
                 else None
             )
-            if langfuse_span is not None:
-                try:
-                    langfuse_span.update(
-                        output={"reply": reply, "tools_called": tools_called},
-                        metadata={
-                            "context_trimmed": context_trimmed,
-                            "reflection_score": reflection_info.score if reflection_info else None,
-                        },
-                    )
-                except Exception:
-                    pass
             return {
                 "reply": reply,
                 "tools_called": tools_called,
@@ -360,7 +463,16 @@ class AgentService:
                 "reflection": reflection_info,
             }
 
-    async def stream_chat(self, session_id: str, message: str) -> AsyncIterator[str]:
+    async def stream_chat(
+        self,
+        session_id: str,
+        message: str,
+        tenant_id: str = "default",
+        user_id: str | None = None,
+        roles: list[str] | None = None,
+        permissions: list[str] | None = None,
+        request_id: str = "",
+    ) -> AsyncIterator[str]:
         """以 JSON line 形式流式返回 token、工具调用和最终指标。
 
         ``stream_mode="messages"`` 是 LangGraph/LangChain 的消息流模式。
@@ -374,11 +486,43 @@ class AgentService:
         callbacks = self._callbacks()
         config = self._run_config(session_id, callbacks)
         agent_message = self._message_with_memory(session_id, message)
+        context = make_agent_tool_context(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            roles=roles,
+            permissions=permissions,
+            request_id=request_id,
+        )
 
         full_reply = ""
         tools_in_turn: list[str] = []
         reflection_info: Optional[ReflectionInfo] = None
 
+        with tool_runtime_context(context):
+            async for line in self._stream_chat_inner(
+                session_id=session_id,
+                message=message,
+                agent_message=agent_message,
+                config=config,
+                callbacks=callbacks,
+                full_reply=full_reply,
+                tools_in_turn=tools_in_turn,
+                reflection_info=reflection_info,
+            ):
+                yield line
+
+    async def _stream_chat_inner(
+        self,
+        session_id: str,
+        message: str,
+        agent_message: str,
+        config: dict,
+        callbacks: list,
+        full_reply: str,
+        tools_in_turn: list[str],
+        reflection_info: Optional[ReflectionInfo],
+    ) -> AsyncIterator[str]:
         if self._reflective_runner:
             # 反思评分必须先拿到完整回复才能算。如果在流式接口前置执行，
             # 前端仍然要等完整 Agent 跑完，首字响应会变慢。
@@ -389,6 +533,7 @@ class AgentService:
             })
 
         try:
+            tool_call_details: list[ToolCallDetail] = []
             async for chunk, metadata in self._agent.astream(
                 {"messages": [HumanMessage(content=agent_message)]},
                 config=config,
@@ -404,6 +549,12 @@ class AgentService:
                             name = _tool_call_name(tool_call)
                             if name and name not in tools_in_turn:
                                 tools_in_turn.append(name)
+                                tool_call_details.append(ToolCallDetail(
+                                    tool_name=name,
+                                    input_args=_tool_call_args(tool_call),
+                                    output="",
+                                    order=len(tool_call_details) + 1,
+                                ))
                                 yield _json_line({"type": "tool_call", "tool": name, "node": node_name})
                     elif chunk.content:
                         # 普通文本 token。这里直接累计起来，供最后 done 事件和长期记忆使用。
@@ -415,9 +566,14 @@ class AgentService:
                     # ToolMessage 是工具执行后的 observation。只截取前 200 字返回前端，
                     # 避免工具结果太长导致流式 UI 被大段 JSON/文本刷屏。
                     content = str(chunk.content)
+                    tool_name = str(getattr(chunk, "name", "unknown") or "unknown")
+                    for detail in reversed(tool_call_details):
+                        if detail.tool_name == tool_name and not detail.output:
+                            detail.output = content[:500]
+                            break
                     yield _json_line({
                         "type": "tool_result",
-                        "tool": getattr(chunk, "name", "unknown"),
+                        "tool": tool_name,
                         "result": content[:200],
                         "truncated": len(content) > 200,
                     })
@@ -440,7 +596,13 @@ class AgentService:
                 else None
             ),
         })
-        self._remember_turn(session_id, message, full_reply, tools_in_turn)
+        await self._aremember_turn(
+            session_id=session_id,
+            message=message,
+            reply=full_reply,
+            tools_called=tools_in_turn,
+            tool_call_details=tool_call_details,
+        )
 
     @staticmethod
     def _wrap_tools(
@@ -483,13 +645,33 @@ class AgentService:
         except Exception:
             return None
 
+    @staticmethod
+    def _make_memory_extractor(chat_model: object):
+        """创建“对话轮次 -> 候选长期记忆”的结构化抽取链。
+
+        模型由 API 层按 structured_extract use case 注入，当前配置默认是 deepseek-v4-flash。
+        抽取失败只会少写一批候选记忆，不影响 Agent 主回答。
+        """
+        try:
+            return _MEMORY_EXTRACTION_PROMPT | chat_model.with_structured_output(ExtractedMemoryBatch)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _model_identifier(chat_model: object) -> str:
+        """尽量从 LangChain 模型对象上取出可审计的模型标识。"""
+        model_ids = getattr(chat_model, "model_ids", None)
+        if isinstance(model_ids, list) and model_ids:
+            return ",".join(str(item) for item in model_ids)
+        for attr in ("model_name", "model", "model_id"):
+            value = getattr(chat_model, attr, None)
+            if value:
+                return str(value)
+        return "structured_extract"
+
     def _callbacks(self) -> list:
         """把本轮要使用的 LangChain callbacks 收集起来。"""
-        callbacks = []
-        if self._langfuse_tracer:
-            # Langfuse callback 负责把 LangChain run trace 上报到观测平台。
-            callbacks.append(self._langfuse_tracer.callback)
-        return callbacks
+        return []
 
     @staticmethod
     def _run_config(session_id: str, callbacks: list) -> dict:
@@ -590,6 +772,51 @@ class AgentService:
                 rendered.append(text[:300])
         return rendered[:limit]
 
+    async def _aremember_turn(
+        self,
+        session_id: str,
+        message: str,
+        reply: str,
+        tools_called: list[str],
+        tool_call_details: list[ToolCallDetail] | None = None,
+    ) -> None:
+        """用“规则候选 + LLM 候选”沉淀长期记忆。
+
+        规则候选继续兜底，deepseek-v4-flash 只负责补充更灵活的结构化候选；
+        最终仍然统一交给 MemoryGovernanceService 做冲突、重复和安全治理。
+        """
+        if not reply:
+            return
+        started = time.monotonic()
+        rule_candidates = self._build_memory_candidates(
+            session_id=session_id,
+            message=message,
+            reply=reply,
+            tools_called=tools_called,
+        )
+        llm_candidates = await self._build_llm_memory_candidates(
+            session_id=session_id,
+            message=message,
+            reply=reply,
+            tools_called=tools_called,
+            tool_call_details=tool_call_details or [],
+        )
+        merged = self._merge_memory_candidates(rule_candidates, llm_candidates)
+        self._write_memory_candidates(merged)
+        add_trace_step(
+            step_type="memory",
+            name="long_term_memory_write",
+            status="success",
+            duration_ms=(time.monotonic() - started) * 1000,
+            summary=f"长期记忆候选 {len(merged)} 条",
+            metadata={
+                "rule_candidates": len(rule_candidates),
+                "llm_candidates": len(llm_candidates),
+                "written_candidates": len(merged),
+                "extractor_model_id": self._memory_extractor_model_id,
+            },
+        )
+
     def _remember_turn(
         self,
         session_id: str,
@@ -617,6 +844,10 @@ class AgentService:
             reply=reply,
             tools_called=tools_called,
         )
+        self._write_memory_candidates(candidates)
+
+    def _write_memory_candidates(self, candidates: list[MemoryWriteCandidate]) -> None:
+        """把候选记忆统一交给治理层写入。"""
         try:
             for candidate in candidates:
                 # 写入前先经过治理层：安全脱敏、冲突检测、旧偏好失效。
@@ -629,6 +860,228 @@ class AgentService:
         except Exception:
             # 长期记忆失败不影响用户主回答。
             pass
+
+    async def _build_llm_memory_candidates(
+        self,
+        *,
+        session_id: str,
+        message: str,
+        reply: str,
+        tools_called: list[str],
+        tool_call_details: list[ToolCallDetail],
+    ) -> list[MemoryWriteCandidate]:
+        """调用 deepseek-v4-flash 抽取结构化长期记忆候选。"""
+        if not self._memory_extractor or not reply:
+            return []
+        tool_observations = self._format_tool_observations(tool_call_details)
+        try:
+            batch = await self._memory_extractor.ainvoke({
+                "session_id": session_id,
+                "user_message": message,
+                "assistant_reply": reply,
+                "tools_called": ", ".join(tools_called) if tools_called else "无",
+                "tool_observations": tool_observations,
+            })
+        except Exception:
+            return []
+
+        has_tool_observation = any(detail.output for detail in tool_call_details)
+        candidates: list[MemoryWriteCandidate] = []
+        for memory in self._coerce_extracted_memories(batch):
+            candidate = self._memory_candidate_from_extracted(
+                session_id=session_id,
+                message=message,
+                reply=reply,
+                tools_called=tools_called,
+                memory=memory,
+                has_tool_observation=has_tool_observation,
+            )
+            if candidate:
+                candidates.append(candidate)
+        return candidates
+
+    @staticmethod
+    def _format_tool_observations(tool_call_details: list[ToolCallDetail]) -> str:
+        """压缩工具 observation，给记忆抽取模型提供证据而不是完整大 JSON。"""
+        if not tool_call_details:
+            return "无"
+        lines = []
+        for detail in tool_call_details[:6]:
+            output = str(detail.output or "")[:500]
+            lines.append(f"{detail.order}. {detail.tool_name}: {output or '无输出'}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _coerce_extracted_memories(batch: object) -> list[ExtractedMemory]:
+        """兼容 Pydantic 对象、dict 和 list 三种结构化返回形态。"""
+        raw_items: list[object]
+        if isinstance(batch, ExtractedMemoryBatch):
+            raw_items = list(batch.memories)
+        elif isinstance(batch, dict):
+            raw_items = list(batch.get("memories") or [])
+        elif isinstance(batch, list):
+            raw_items = list(batch)
+        else:
+            raw_items = list(getattr(batch, "memories", []) or [])
+
+        memories: list[ExtractedMemory] = []
+        for item in raw_items:
+            try:
+                memories.append(item if isinstance(item, ExtractedMemory) else ExtractedMemory.model_validate(item))
+            except Exception:
+                continue
+        return memories
+
+    def _memory_candidate_from_extracted(
+        self,
+        *,
+        session_id: str,
+        message: str,
+        reply: str,
+        tools_called: list[str],
+        memory: ExtractedMemory,
+        has_tool_observation: bool,
+    ) -> MemoryWriteCandidate | None:
+        """把 LLM 抽取结果转换成现有治理层能处理的 MemoryWriteCandidate。"""
+        now = datetime.now(tz=timezone.utc).isoformat()
+        confidence = round(float(memory.confidence), 2)
+        importance = round(max(float(memory.importance), confidence), 2)
+        safe_message = self._redact_sensitive_text(message)[:500]
+        safe_reply = self._redact_sensitive_text(reply)[:800]
+        safe_evidence = self._redact_sensitive_text(memory.evidence or "")[:300]
+        safe_facts = self._safe_memory_facts(memory.memory_facts)
+
+        if memory.memory_type == "user_preference":
+            if confidence < 0.75 or not memory.preference:
+                return None
+            preference = self._redact_sensitive_text(memory.preference.strip())[:400]
+            if not preference:
+                return None
+            customer_id = memory.customer_id or self._extract_customer_id(f"{message}\n{reply}")
+            namespace = (
+                ("customers", customer_id, "preferences")
+                if memory.scope == "customer" and customer_id
+                else ("sessions", session_id, "preferences")
+            )
+            value = {
+                "memory_type": "user_preference",
+                "preference": preference,
+                "summary": self._redact_sensitive_text(memory.summary or "")[:400],
+                "memory_facts": safe_facts,
+                "evidence": safe_evidence,
+                "source_message": safe_message[:300],
+                "source": "llm_memory_extractor",
+                "extractor_model": self._memory_extractor_model_id,
+                "write_reason": "llm_structured_user_preference",
+                "business_score": confidence,
+                "confidence": confidence,
+                "created_from_session": session_id,
+                "updated_at": now,
+                "_importance": importance,
+                "_ttl_days": memory.ttl_days,
+            }
+            if customer_id:
+                value["customer_id"] = customer_id
+            return MemoryWriteCandidate(
+                namespace=namespace,
+                key=f"pref-{self._stable_memory_key(preference)}",
+                value=value,
+                score=confidence,
+                reason="llm_structured_user_preference",
+            )
+
+        if memory.memory_type == "order_decision":
+            if confidence < 0.70 or not tools_called or not has_tool_observation:
+                return None
+            order_id = (memory.order_id or self._extract_order_id(message) or "").upper()
+            summary = self._redact_sensitive_text(memory.summary or safe_evidence)[:700]
+            if not order_id or not summary:
+                return None
+            customer_id = memory.customer_id or self._extract_customer_id(f"{message}\n{reply}")
+            value = {
+                "memory_type": "order_decision",
+                "order_id": order_id,
+                "customer_id": customer_id,
+                "summary": summary,
+                "memory_facts": safe_facts,
+                "evidence": safe_evidence,
+                "user_message": safe_message,
+                "assistant_reply": safe_reply,
+                "tools_called": tools_called,
+                "source": "llm_memory_extractor",
+                "extractor_model": self._memory_extractor_model_id,
+                "write_reason": "llm_tool_grounded_order_decision",
+                "business_score": confidence,
+                "confidence": confidence,
+                "created_from_session": session_id,
+                "updated_at": now,
+                "_importance": importance,
+                "_ttl_days": memory.ttl_days if memory.ttl_days is not None else 365,
+            }
+            return MemoryWriteCandidate(
+                namespace=("orders", order_id),
+                key=f"decision-{self._stable_memory_key(summary)}",
+                value=value,
+                score=confidence,
+                reason="llm_tool_grounded_order_decision",
+            )
+
+        if memory.memory_type == "conversation_summary":
+            if confidence < 0.65 or not memory.summary:
+                return None
+            summary = self._redact_sensitive_text(memory.summary.strip())[:700]
+            if not summary:
+                return None
+            return MemoryWriteCandidate(
+                namespace=("sessions", session_id),
+                key=f"summary-{self._stable_memory_key(summary)}",
+                value={
+                    "memory_type": "conversation_summary",
+                    "summary": summary,
+                    "memory_facts": safe_facts,
+                    "evidence": safe_evidence,
+                    "user_message": safe_message,
+                    "assistant_reply": safe_reply,
+                    "tools_called": tools_called,
+                    "source": "llm_memory_extractor",
+                    "extractor_model": self._memory_extractor_model_id,
+                    "write_reason": "llm_structured_conversation_summary",
+                    "business_score": confidence,
+                    "confidence": confidence,
+                    "created_from_session": session_id,
+                    "updated_at": now,
+                    "_importance": importance,
+                    "_ttl_days": memory.ttl_days if memory.ttl_days is not None else 90,
+                },
+                score=confidence,
+                reason="llm_structured_conversation_summary",
+            )
+        return None
+
+    @staticmethod
+    def _safe_memory_facts(facts: dict[str, Any]) -> dict[str, str]:
+        """清洗 LLM 产出的事实字段，避免超长值或敏感信息进入治理层。"""
+        safe: dict[str, str] = {}
+        for key, value in (facts or {}).items():
+            clean_key = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(key)).strip("_")[:64]
+            clean_value = AgentService._redact_sensitive_text(str(value)).strip()[:200]
+            if clean_key and clean_value:
+                safe[clean_key] = clean_value
+        return safe
+
+    @staticmethod
+    def _merge_memory_candidates(
+        rule_candidates: list[MemoryWriteCandidate],
+        llm_candidates: list[MemoryWriteCandidate],
+    ) -> list[MemoryWriteCandidate]:
+        """合并规则候选和 LLM 候选，相同 namespace/key 只保留分数更高的一条。"""
+        merged: dict[tuple[tuple[str, ...], str], MemoryWriteCandidate] = {}
+        for candidate in [*rule_candidates, *llm_candidates]:
+            identity = (candidate.namespace, candidate.key)
+            existing = merged.get(identity)
+            if existing is None or candidate.score > existing.score:
+                merged[identity] = candidate
+        return list(merged.values())
 
     @staticmethod
     def _render_memory_item(value: dict) -> str:
@@ -896,28 +1349,6 @@ class AgentService:
             })
         except Exception:
             return None
-
-    def _score_langfuse(
-        self,
-        reply: str,
-        tools_called: list[str],
-        reflection_info: Optional[ReflectionInfo],
-    ) -> None:
-        """把本轮结果提交给 Langfuse 评分。
-
-        Langfuse 只负责观测，不参与主流程决策；没有配置时直接跳过。
-        """
-        if not self._langfuse_tracer:
-            return
-        score_after_run(
-            tracer=self._langfuse_tracer,
-            trace_id=self._langfuse_tracer.get_trace_id(),
-            reply=reply,
-            tools_called=tools_called,
-            reflection_score=reflection_info.score if reflection_info else None,
-            reflection_passed=reflection_info.passed if reflection_info else None,
-            reflection_reason=reflection_info.reason if reflection_info else "",
-        )
 
     @staticmethod
     def _reflection_info(run_result: dict) -> Optional[ReflectionInfo]:

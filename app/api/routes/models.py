@@ -1,17 +1,11 @@
 """模型网关查询接口。
 
-文件作用摘要：
-这个文件暴露模型配置的只读查询能力。前端可以通过这些接口展示“当前有哪些模型可选”
+本模块暴露模型配置的只读查询能力。前端可以通过这些接口展示“当前有哪些模型可选”
 以及“某个用途正在使用哪个模型”，但不能看到 API Key、环境变量或其它敏感配置。
 
-学习重点：
-1. ``use_case`` 不是模型类型，而是业务用途，例如 agent、workflow、reranker。
-2. ``model_type`` 用来区分 chat / embedding / reranker。
-3. 这个接口只读，不负责创建模型实例；真正创建模型在 ``LLMFactory``。
-
-面试官可能问：为什么要做模型网关，而不是每个地方直接读环境变量？
-回答：模型网关把“用途 → 模型 → Provider → 配置”集中管理，避免 Agent、RAG、Workflow
-散落一堆不同环境变量读取逻辑，也方便前端切换模型和排查当前配置。
+``use_case`` 表示业务用途，例如 agent、workflow、reranker；
+``model_type`` 用来区分 chat、embedding、reranker。这里不创建模型实例，
+真正的模型构造由 ``LLMFactory`` 完成。
 """
 
 from fastapi import APIRouter, Query

@@ -10,7 +10,9 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
+from langchain_core.tools import StructuredTool
 
+from app.agents.tools.contracts import ToolRuntimeContext, tool_runtime_context
 from app.agents.tools.factory import (
     make_fulfillment_plan_tool,
     make_inventory_tool,
@@ -19,6 +21,8 @@ from app.agents.tools.factory import (
     make_substitute_tool,
     make_warehouse_tool,
 )
+from app.agents.tools.telemetry import get_tool_telemetry
+from app.agents.tools.wrapper import wrap_tool_with_resilience
 
 
 # ── Mock 数据构造 ────────────────────────────────────────────────────────────
@@ -99,6 +103,7 @@ def _parse_and_validate(raw: str) -> dict:
     assert "status" in data, "缺少 status 字段"
     assert "summary" in data, "缺少 summary 字段"
     assert "data" in data, "缺少 data 字段"
+    assert data["schema_version"] == "1.0"
     assert data["status"] == "ok", f"status 应为 ok，实际为 {data['status']}"
     return data
 
@@ -120,9 +125,18 @@ class TestOrderToolOutput:
         svc = MagicMock()
         svc.analyze_order.side_effect = ValueError("订单不存在")
         tool = make_order_tool(svc)
-        # handle_tool_error=True 时返回错误字符串而非抛出
         result = tool.invoke({"order_id": "NOTFOUND"})
-        assert isinstance(result, str)
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "order_query_failed"
+
+    def test_validation_error_returns_structured_json(self):
+        svc = MagicMock()
+        tool = make_order_tool(svc)
+        result = tool.invoke({})
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "validation_error"
 
 
 class TestInventoryToolOutput:
@@ -147,6 +161,18 @@ class TestKnowledgeToolOutput:
         assert "key_rules" in data["data"]
         assert "suggested_actions" in data["data"]
         assert isinstance(data["data"]["hit_count"], int)
+
+    def test_order_id_is_optional(self):
+        svc = MagicMock()
+        svc.retrieve.return_value = _mock_knowledge_result()
+        tool = make_knowledge_tool(svc)
+
+        raw = tool.invoke({"question": "stockout SOP"})
+
+        data = _parse_and_validate(raw)
+        assert data["data"]["hit_count"] == 2
+        svc.retrieve.assert_called_once()
+        assert svc.retrieve.call_args.kwargs["order_id"] is None
 
 
 class TestWarehouseToolOutput:
@@ -187,3 +213,47 @@ class TestFulfillmentPlanToolOutput:
             action = data["data"]["actions"][0]
             assert "product" in action
             assert "action_type" in action
+
+
+class TestEnterpriseToolControls:
+    def test_wrapped_tool_denies_missing_permission(self):
+        def _tool(order_id: str) -> str:
+            return json.dumps({"status": "ok", "data": {"order_id": order_id}, "summary": "ok"})
+
+        base = StructuredTool.from_function(
+            func=_tool,
+            name="analyze_order",
+            description="test",
+        )
+        wrapped = wrap_tool_with_resilience(base, enable_cache=False, enable_circuit_breaker=False)
+
+        context = ToolRuntimeContext(
+            tenant_id="tenant-a",
+            user_id="u1",
+            roles=["agent_user"],
+            permissions=[],
+        )
+        with tool_runtime_context(context):
+            result = wrapped.invoke({"order_id": "SO123"})
+
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "permission_denied"
+
+    def test_tool_telemetry_records_success(self):
+        telemetry = get_tool_telemetry()
+        telemetry.reset()
+
+        def _tool(value: str) -> str:
+            return "ok"
+
+        wrapped = wrap_tool_with_resilience(
+            StructuredTool.from_function(func=_tool, name="unknown_test_tool", description="test"),
+            enable_cache=False,
+            enable_circuit_breaker=False,
+        )
+        assert wrapped.invoke({"value": "x"}) == "ok"
+
+        metric = telemetry.snapshot["unknown_test_tool"]
+        assert metric["calls"] == 1
+        assert metric["success"] == 1

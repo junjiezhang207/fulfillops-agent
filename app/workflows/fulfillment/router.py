@@ -10,9 +10,8 @@ LangGraph 1.0+ 的条件边是"函数式"的：
 本回合只有一条条件边：
     inventory_analysis → (fulfillable | stockout)
 
-为什么把路由字符串保持稳定？
-    mapping 中的 key 是"契约"，后续扩展分支时应该加新值，
-    而不是修改已有值，避免破坏图结构。
+路由字符串是图结构契约。后续扩展分支时应新增取值，
+避免修改已有值导致历史调用或测试失效。
 """
 
 from app.workflows.fulfillment.state import GraphState

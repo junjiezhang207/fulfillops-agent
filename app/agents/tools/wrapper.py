@@ -1,26 +1,18 @@
-"""文件作用摘要：给 Agent 工具加工程弹性，避免工具失败拖垮整轮对话。
+"""Agent 工具弹性包装。
 
-这个文件不定义业务工具本身，而是包装 ``tools.py`` 创建出来的工具。
-在真实 Agent 系统里，工具可能访问数据库、知识库、外部 API 或内部服务，
-这些下游可能超时、偶发失败、参数错误或被重复调用。本文件负责把这些问题
-收口在工具外层，让 Agent 收到可读的失败结果，而不是直接抛异常中断。
+本模块不定义业务工具本身，而是在工具外层统一处理缓存、熔断、重试、
+超时、权限检查、Telemetry 和输出净化。工具访问数据库、知识库、外部 API
+或内部服务时，失败会被转换成可读的工具结果，避免直接中断整轮 Agent 调用。
 
-主要做的事：
+主要组成：
 1. ``CircuitBreaker``：连续失败后短时间熔断，避免反复打爆下游服务。
 2. ``wrap_tool_with_resilience``：给单个工具加缓存、熔断、重试、超时和输出净化。
 3. ``wrap_all_tools``：批量包装工具列表，供 ``AgentService`` 装配时使用。
-4. 和 ``tool_cache.py`` 配合：目录/规则类工具可以缓存，实时数据工具可禁用缓存。
-5. 和 ``guardrails.py`` 配合：工具输出进入 LLM 前做间接注入净化。
 
 包装后的执行顺序：
 cache.get -> 命中直接返回
           -> 未命中 -> 熔断检查 -> 重试 -> 超时控制 -> 调真实工具
           -> 工具输出净化 -> 成功结果写入缓存。
-
-学习时先看：
-1. ``CircuitBreaker``：理解熔断状态如何从 closed/open/half_open 切换。
-2. ``wrap_tool_with_resilience``：这是工具弹性层主流程。
-3. ``wrap_all_tools``：看 AgentService 如何一次性包装所有工具。
 """
 
 import asyncio
@@ -33,8 +25,17 @@ from enum import Enum
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
 
+from app.agents.tools.contracts import (
+    authorize_tool_call,
+    error_envelope,
+    get_tool_runtime_context,
+    is_tool_success,
+    parse_tool_error,
+)
 from app.agents.tools.guardrails import get_tool_sanitizer
 from app.agents.tools.cache import GLOBAL_SCOPE, get_tool_cache
+from app.agents.tools.telemetry import get_tool_telemetry
+from app.observability.business_trace import add_trace_step
 
 _TOOL_TIMEOUT_EXECUTOR = ThreadPoolExecutor(
     max_workers=16,
@@ -46,9 +47,7 @@ _TOOL_TIMEOUT_EXECUTOR = ThreadPoolExecutor(
 # 熔断器（LangChain 无内置实现，保留 Python）
 # ============================================================================
 
-# 面试官可能问：为什么工具层要做熔断？
-# 回答：Agent 可能反复调用同一个失败工具，如果下游数据库/API 已经异常，
-# 不熔断会放大故障、浪费时间和成本。熔断让系统短时间快速失败，保护下游服务。
+# 熔断器用于在下游连续失败时快速失败，避免 Agent 重复调用放大故障。
 class CircuitState(Enum):
     CLOSED = "closed"
     OPEN = "open"
@@ -90,9 +89,7 @@ class CircuitBreaker:
 # 弹性工具包装
 # ============================================================================
 
-# 面试官可能问：这个包装函数解决了哪些生产问题？
-# 回答：它把缓存、熔断、重试、超时、工具输出净化都收口到工具外层。
-# 业务工具只关心“查什么数据”，工程问题在这里统一处理，避免每个工具重复写。
+# 工具包装层集中处理横切能力，业务工具只保留“查什么数据”的核心逻辑。
 def wrap_tool_with_resilience(
     tool: BaseTool,
     max_retries: int = 2,
@@ -133,7 +130,7 @@ def wrap_tool_with_resilience(
          当 Agent 传入的参数不符合 args_schema 时，LangChain 自动返回
          参数格式错误提示，而不是抛出 Pydantic ValidationError。
 
-    Args:
+    参数：
         enable_cache:  是否启用 TTL 缓存（默认 True）
         cache_scope:   缓存 scope（默认 GLOBAL_SCOPE 跨会话共享；
                        传入 session_id 则按会话隔离）
@@ -141,6 +138,7 @@ def wrap_tool_with_resilience(
     breaker = CircuitBreaker(failure_threshold=failure_threshold) if enable_circuit_breaker else None
     _cache = get_tool_cache() if enable_cache else None
     _sanitizer = get_tool_sanitizer()  # 间接 Prompt Injection 净化器
+    _telemetry = get_tool_telemetry()
 
     # ── LangChain: BaseTool.invoke() + RunnableLambda.with_retry() ────────
     # 直接调用原始 BaseTool，而不是拆 tool.func 自己执行。这样保留了 LangChain
@@ -160,38 +158,125 @@ def wrap_tool_with_resilience(
     def _cache_get(kwargs: dict) -> str | None:
         if _cache is None:
             return None
-        return _cache.get(cache_scope, tool.name, kwargs)
+        effective_scope = _effective_cache_scope()
+        cached = _cache.get(effective_scope, tool.name, kwargs)
+        if cached is None:
+            _telemetry.record_cache_miss(tool.name)
+            return None
+        _telemetry.record_cache_hit(tool.name)
+        return cached
 
     def _cache_set(kwargs: dict, result: str) -> None:
-        if _cache is not None:
-            _cache.set(cache_scope, tool.name, kwargs, result)
+        if _cache is not None and is_tool_success(result):
+            _cache.set(_effective_cache_scope(), tool.name, kwargs, result)
+
+    def _effective_cache_scope() -> str:
+        context = get_tool_runtime_context()
+        if cache_scope == GLOBAL_SCOPE and context.tenant_id:
+            return f"{GLOBAL_SCOPE}:tenant:{context.tenant_id}"
+        return cache_scope
 
     def _circuit_open_message() -> str | None:
         if not (breaker and breaker.is_open()):
             return None
-        return (
-            f"[CIRCUIT_OPEN] {tool.name} 熔断中"
-            f"（连续失败 {breaker._consecutive_failures} 次），"
-            f"{breaker.recovery_seconds:.0f}s 后自动恢复。"
+        return error_envelope(
+            "circuit_open",
+            (
+                f"{tool.name} 熔断中（连续失败 {breaker._consecutive_failures} 次），"
+                f"{breaker.recovery_seconds:.0f}s 后自动恢复。"
+            ),
+            retryable=True,
+            details={"tool_name": tool.name, "state": breaker.state.value},
         )
 
     def _sanitize_and_record_success(kwargs: dict, result: object) -> str:
-        if breaker:
-            breaker.record_success()
         result_text = _sanitizer.sanitize(str(result), source=tool.name)
+        if breaker:
+            if is_tool_success(result_text):
+                breaker.record_success()
+            else:
+                breaker.record_failure()
         _cache_set(kwargs, result_text)
         return result_text
 
+    def _record_result(
+        started_at: float,
+        result: str,
+        *,
+        cache_hit: bool | None = None,
+        metadata: dict | None = None,
+    ) -> str:
+        latency_ms = (time.monotonic() - started_at) * 1000
+        error = parse_tool_error(result)
+        if error is None:
+            _telemetry.record_call(tool.name, "success", latency_ms)
+            add_trace_step(
+                step_type="tool",
+                name=tool.name,
+                status="success",
+                duration_ms=latency_ms,
+                summary=f"工具 {tool.name} 调用成功",
+                output_summary=result,
+                metadata={
+                    "source": "agent",
+                    "cache_hit": cache_hit,
+                    "retry_count": max_retries,
+                    "timeout_seconds": timeout_seconds,
+                    **(metadata or {}),
+                },
+            )
+        else:
+            status = error.code if error.code in {"timeout", "circuit_open", "permission_denied"} else "error"
+            _telemetry.record_call(
+                tool.name,
+                status,
+                latency_ms,
+                error_code=error.code,
+                error_message=error.message,
+            )
+            add_trace_step(
+                step_type="tool",
+                name=tool.name,
+                status=status,
+                duration_ms=latency_ms,
+                summary=f"工具 {tool.name} 调用失败：{error.code}",
+                error_code=error.code,
+                error_message=error.message,
+                output_summary=result,
+                metadata={
+                    "source": "agent",
+                    "cache_hit": cache_hit,
+                    "retry_count": max_retries,
+                    "timeout_seconds": timeout_seconds,
+                    **(metadata or {}),
+                },
+            )
+        return result
+
+    def _permission_error_message(exc: PermissionError) -> str:
+        return error_envelope(
+            "permission_denied",
+            str(exc),
+            retryable=False,
+            details={"tool_name": tool.name},
+        )
+
     def resilient_func(**kwargs) -> str:
+        started_at = time.monotonic()
+        try:
+            authorize_tool_call(tool.name)
+        except PermissionError as exc:
+            return _record_result(started_at, _permission_error_message(exc), metadata={"permission_denied": True})
+
         # ── 1. 缓存命中快路径 ────────────────────────────────────────────────
         cached = _cache_get(kwargs)
         if cached is not None:
-            return cached
+            return _record_result(started_at, cached, cache_hit=True)
 
         # ── 2. 熔断检查（LangChain 无内置熔断器，保留）────────────────────
         circuit_message = _circuit_open_message()
         if circuit_message is not None:
-            return circuit_message
+            return _record_result(started_at, circuit_message, cache_hit=False, metadata={"circuit_open": True})
 
         # ── 3. 真实调用（含重试 + 超时）────────────────────────────────────
         try:
@@ -199,27 +284,48 @@ def wrap_tool_with_resilience(
             future = _TOOL_TIMEOUT_EXECUTOR.submit(retrying_runnable.invoke, kwargs)
             try:
                 result = future.result(timeout=timeout_seconds)
-                return _sanitize_and_record_success(kwargs, result)
+                return _record_result(started_at, _sanitize_and_record_success(kwargs, result), cache_hit=False)
             except FutureTimeoutError:
                 future.cancel()
                 if breaker:
                     breaker.record_failure()
-                return f"[TIMEOUT] {tool.name}: 超过 {timeout_seconds}s"
+                return _record_result(
+                    started_at,
+                    error_envelope(
+                        "timeout",
+                        f"{tool.name}: 超过 {timeout_seconds}s",
+                        retryable=True,
+                        details={"tool_name": tool.name, "timeout_seconds": timeout_seconds},
+                    ),
+                )
         except Exception as e:
             if breaker:
                 breaker.record_failure()
-            # 抛出异常，交给 StructuredTool 的 handle_tool_error 处理
-            raise e
+            return _record_result(
+                started_at,
+                error_envelope(
+                    "tool_execution_failed",
+                    f"{tool.name} 执行失败：{e}",
+                    retryable=True,
+                    details={"tool_name": tool.name},
+                ),
+            )
 
     async def resilient_afunc(**kwargs) -> str:
-        # async Agent / LangGraph 路径会走这里，优先使用 BaseTool.ainvoke 和 Runnable.ainvoke。
+        # 异步 Agent / LangGraph 路径会走这里，优先使用 BaseTool.ainvoke 和 Runnable.ainvoke。
+        started_at = time.monotonic()
+        try:
+            authorize_tool_call(tool.name)
+        except PermissionError as exc:
+            return _record_result(started_at, _permission_error_message(exc), metadata={"permission_denied": True})
+
         cached = _cache_get(kwargs)
         if cached is not None:
-            return cached
+            return _record_result(started_at, cached, cache_hit=True)
 
         circuit_message = _circuit_open_message()
         if circuit_message is not None:
-            return circuit_message
+            return _record_result(started_at, circuit_message, cache_hit=False, metadata={"circuit_open": True})
 
         try:
             try:
@@ -227,15 +333,31 @@ def wrap_tool_with_resilience(
                     retrying_runnable.ainvoke(kwargs),
                     timeout=timeout_seconds,
                 )
-                return _sanitize_and_record_success(kwargs, result)
-            except TimeoutError:
+                return _record_result(started_at, _sanitize_and_record_success(kwargs, result), cache_hit=False)
+            except asyncio.TimeoutError:
                 if breaker:
                     breaker.record_failure()
-                return f"[TIMEOUT] {tool.name}: 超过 {timeout_seconds}s"
+                return _record_result(
+                    started_at,
+                    error_envelope(
+                        "timeout",
+                        f"{tool.name}: 超过 {timeout_seconds}s",
+                        retryable=True,
+                        details={"tool_name": tool.name, "timeout_seconds": timeout_seconds},
+                    ),
+                )
         except Exception as e:
             if breaker:
                 breaker.record_failure()
-            raise e
+            return _record_result(
+                started_at,
+                error_envelope(
+                    "tool_execution_failed",
+                    f"{tool.name} 执行失败：{e}",
+                    retryable=True,
+                    details={"tool_name": tool.name},
+                ),
+            )
 
     # ── LangChain: StructuredTool + handle_tool_error 代替手写 try/except ──
     return StructuredTool.from_function(
@@ -244,15 +366,13 @@ def wrap_tool_with_resilience(
         name=tool.name,
         description=tool.description or "",
         args_schema=getattr(tool, "args_schema", None),
-        handle_tool_error=True,          # LangChain 捕获异常 → 返回错误字符串
-        handle_validation_error=True,    # LangChain 捕获参数校验错误
+        handle_tool_error=lambda exc: error_envelope("tool_exception", str(exc), retryable=True),
+        handle_validation_error=lambda exc: error_envelope("validation_error", f"工具参数校验失败：{exc}"),
         infer_schema=getattr(tool, "args_schema", None) is None,
     )
 
 
-# 面试官可能问：为什么有些工具 enable_cache=False？
-# 回答：订单、库存、履约方案是强实时数据，缓存可能导致错误决策；
-# 知识规则、替代 SKU 属于稳定目录数据，短时间缓存可以减少重复调用。
+# 实时数据工具应关闭缓存，目录和规则类工具可短时间缓存以减少重复调用。
 def wrap_all_tools(
     tools: list[BaseTool],
     max_retries: int = 2,
@@ -263,7 +383,7 @@ def wrap_all_tools(
 ) -> list[BaseTool]:
     """批量包装工具列表。
 
-    Args:
+    参数：
         enable_cache: 是否启用 TTL 缓存（默认 True）
         cache_scope:  缓存 scope（默认全局共享；传入 session_id 可按会话隔离）
     """

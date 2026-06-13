@@ -8,12 +8,20 @@
 学习时可以把这些测试当成 RAG 工程边界的例子。
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
-from llama_index.core.schema import NodeWithScore, TextNode
+from llama_index.core.schema import Document, NodeWithScore, TextNode
 
 from app.schemas.knowledge import QueryIntent, QueryIntentType
-from app.rag.knowledge_retrieval_service import BusinessMetadataEnricher, KnowledgeRetrievalService
+from app.repositories.file_system_knowledge_repository import FileSystemKnowledgeRepository
+from app.rag.knowledge_retrieval_service import (
+    BusinessMetadataEnricher,
+    KNOWLEDGE_ONLY_ORDER_ID,
+    KnowledgeFrontMatterExtractor,
+    KnowledgeRetrievalService,
+    MarkdownSectionSplitter,
+)
 from app.rag.rag_answer_builder import RAGAnswerBuilder
 from app.rag.rag_query_planner import RAGQueryPlanner, RetrievalInputs
 from app.rag.reranker import RankedPassage
@@ -30,6 +38,48 @@ def _node(chunk_id: str, category: str, score: float, text: str | None = None) -
         metadata={"chunk_id": chunk_id, "category": category},
     )
     return NodeWithScore(node=text_node, score=score)
+
+
+def test_file_system_knowledge_repository_reads_extra_dirs_recursively(tmp_path):
+    """主知识目录和 knowledge_base 这类附加目录都应进入 RAG 索引。"""
+    primary = tmp_path / "app_knowledge"
+    extra = tmp_path / "knowledge_base"
+    nested = extra / "business_rules"
+    primary.mkdir()
+    nested.mkdir(parents=True)
+    (primary / "stockout.md").write_text("# 缺货", encoding="utf-8")
+    (nested / "fulfillment.md").write_text("# 履约", encoding="utf-8")
+
+    repo = FileSystemKnowledgeRepository(str(primary), extra_dirs=[str(extra)], recursive=True)
+
+    paths = [Path(path).name for path in repo.list_knowledge_paths()]
+    assert paths == ["stockout.md", "fulfillment.md"]
+
+
+def test_ingestion_transforms_documents_into_text_nodes_with_chunk_ids():
+    """SimpleDirectoryReader 产出 Document，也必须被切成可 embedding 的 TextNode。"""
+
+    document = Document(
+        text=(
+            "---\n"
+            "document_id: stockout_policy\n"
+            "category: stockout_rule\n"
+            "---\n\n"
+            "# 缺货处理\n\n"
+            "当订单 SKU 库存不足时，先检查同区域仓库，再评估跨仓调拨。"
+        ),
+        metadata={"file_path": "stockout_policy.md"},
+    )
+
+    nodes = KnowledgeFrontMatterExtractor()([document])
+    nodes = MarkdownSectionSplitter()(nodes)
+    nodes = BusinessMetadataEnricher()(nodes)
+
+    assert nodes
+    assert all(isinstance(node, TextNode) for node in nodes)
+    assert nodes[0].metadata["document_id"] == "stockout_policy"
+    assert nodes[0].metadata["category"] == "stockout_rule"
+    assert nodes[0].metadata["chunk_id"] == "stockout_policy::chunk-0000"
 
 
 def test_dedupe_and_filter_nodes_applies_to_all_retrieval_channels():
@@ -120,6 +170,57 @@ def test_llm_rewrite_keeps_rule_based_business_queries():
     assert "库存不足 SKU：SKU-A，优先检索缺货处理与跨仓规则" in queries
 
 
+def test_retrieve_without_order_skips_inventory_analysis():
+    """Ad-hoc knowledge questions should not require an order lookup."""
+
+    class FailingInventoryService:
+        def analyze_inventory(self, order_id):
+            raise AssertionError(f"inventory should not be called for {order_id}")
+
+    service = KnowledgeRetrievalService.__new__(KnowledgeRetrievalService)
+    service._cross_encoder = None
+    service._query_planner = RAGQueryPlanner(inventory_analysis_service=FailingInventoryService())
+    service._answer_builder = RAGAnswerBuilder()
+    captured = {}
+
+    def fake_retrieve_nodes(question, prepared):
+        captured["prepared"] = prepared
+        return SimpleNamespace(
+            queries=service._query_planner.build_queries(question, prepared),
+            nodes=[],
+        )
+
+    service._retrieve_nodes = fake_retrieve_nodes
+    service._rank_and_build_hits = lambda question, retrieved, intent: []
+
+    result = service.retrieve(question="stockout SOP", filter_categories=["stockout_rule"])
+
+    assert result.order_id == KNOWLEDGE_ONLY_ORDER_ID
+    assert captured["prepared"].has_order_context is False
+    assert captured["prepared"].inventory_result.order_id == KNOWLEDGE_ONLY_ORDER_ID
+    assert all("SKU" not in query for query in result.expanded_queries)
+
+
+def test_intent_classifier_model_can_override_keyword_fallback():
+    """配置小模型后，意图识别可以处理关键词规则覆盖不到的表达。"""
+    planner = RAGQueryPlanner(inventory_analysis_service=SimpleNamespace())
+    planner._intent_classifier_chain = SimpleNamespace(
+        invoke=lambda payload: """
+        {"primary_intent":"after_sales","confidence":0.82,
+         "reasoning":"用户在询问补寄/售后处理", "secondary_intents":[]}
+        """
+    )
+
+    intent = planner.recognize_intent(
+        question="客户说东西坏了，想重新寄一个，怎么走流程？",
+        insufficient_skus=[],
+        fulfillment_ready=False,
+    )
+
+    assert intent.primary_intent == QueryIntentType.AFTER_SALES
+    assert intent.confidence == 0.82
+
+
 def test_business_metadata_enricher_uses_stable_chunk_id_as_node_id():
     """Milvus upsert 依赖稳定 node_id，避免重启后重复写入同一 chunk。"""
     node = TextNode(text="# 缺货规则\n\n库存不足时需要人工复核", metadata={"file_path": "stockout_rules.md"})
@@ -128,6 +229,45 @@ def test_business_metadata_enricher_uses_stable_chunk_id_as_node_id():
 
     assert enriched.metadata["chunk_id"] == "stockout_rules::chunk-0000"
     assert enriched.node_id == "stockout_rules::chunk-0000"
+
+
+def test_front_matter_metadata_overrides_filename_category():
+    """显式 metadata 应优先于文件名推断，便于运营治理知识库。"""
+    node = TextNode(
+        text=(
+            "---\n"
+            "category: priority_rule\n"
+            "title: VIP 履约规则\n"
+            "owner: ops\n"
+            "business_scope: [会员订单, 时效]\n"
+            "---\n\n"
+            "# VIP 履约规则\n\n高优先级订单需要人工关注。"
+        ),
+        metadata={"file_path": "misc.md"},
+    )
+
+    [prepared] = KnowledgeFrontMatterExtractor()([node])
+    [enriched] = BusinessMetadataEnricher()([prepared])
+
+    assert "---" not in enriched.get_content()
+    assert enriched.metadata["category"] == "priority_rule"
+    assert enriched.metadata["title"] == "VIP 履约规则"
+    assert enriched.metadata["owner"] == "ops"
+    assert "会员订单" in enriched.metadata["tags"]
+
+
+def test_markdown_section_splitter_keeps_heading_path_metadata():
+    """Markdown 标题路径要进入 chunk metadata，方便来源解释和章节过滤。"""
+    node = TextNode(
+        text="# 缺货规则\n\n总则\n\n## 跨仓调拨\n\n优先检查同区仓。\n",
+        metadata={"file_path": "stockout_rules.md"},
+    )
+
+    split_nodes = MarkdownSectionSplitter()([node])
+    section_paths = [item.metadata.get("_markdown_section_path") for item in split_nodes]
+
+    assert ["缺货规则"] in section_paths
+    assert ["缺货规则", "跨仓调拨"] in section_paths
 
 
 def test_business_metadata_enricher_numbers_chunks_per_document():

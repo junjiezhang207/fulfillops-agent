@@ -1,7 +1,6 @@
 """LangChain / LangGraph Agent 对话接口。
 
-文件作用摘要：
-这个文件是“自由问答型 Agent”的 HTTP 入口，主要承接商家运营、客服主管、仓储调度
+本模块是自由问答型 Agent 的 HTTP 入口，主要承接商家运营、客服主管、仓储调度
 这类用户的开放式问题。它把用户问题交给 ``AgentService``，再由 Agent 自主决定是否调用
 订单、库存、知识库、仓库、替代品、履约方案等工具。
 
@@ -11,15 +10,9 @@
     POST /api/v1/agent/plan-execute  — 先规划再执行的复杂任务 Agent
     GET/DELETE /api/v1/agent/cache   — 工具缓存观测和失效
 
-学习重点：
-1. 路由层负责限流、输入安全、模型选择、HTTP 异常映射。
-2. Agent 的具体运行、记忆、工具包装、反思质量门都在 ``AgentService`` 和 ``app/agents``。
-3. 没配 LLM 时不能让应用启动失败，而是在调用 Agent 接口时返回 503。
-4. 同一 ``session_id`` 会共享短期上下文，适合多轮追问。
-
-面试官可能问：为什么 Agent 初始化失败时不直接让 FastAPI 启动失败？
-回答：真实系统里 Agent 可能依赖外部模型供应商，模型不可用不应该拖垮订单、库存、
-健康检查、企业数据接入等基础接口。这里采用“服务可启动，能力按需 503”的降级方式。
+路由层负责限流、输入安全、模型选择和 HTTP 异常映射。Agent 的具体运行、
+记忆、工具包装和反思质量门由 ``AgentService`` 及 ``app/agents`` 内部模块处理。
+如果 LLM 未配置或不可用，应用仍可启动，Agent 接口在调用时返回 503。
 """
 
 import logging
@@ -27,14 +20,9 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from app.agents.quality.evaluation.langfuse_tracer import create_langfuse_tracer
 from app.agents.tools.guardrails import InputGuardrails
 from app.agents.tools.cache import GLOBAL_SCOPE, get_tool_cache
-from app.agents.tools.factory import (
-    make_fulfillment_plan_tool,
-    make_substitute_tool,
-    make_warehouse_tool,
-)
+from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
 from app.core.config import get_settings
 from app.core.rate_limiter import check_agent_rate_limit
 from app.core.service_registry import (
@@ -76,11 +64,24 @@ _fulfillment_service = FulfillmentPlanService(
 
 # ---- 构建扩展工具列表 ----
 # AgentService 会把基础工具和这里的额外工具合并，再统一套上弹性包装。
-_extra_tools = [
-    make_warehouse_tool(_warehouse_service),
-    make_substitute_tool(_substitute_service),
-    make_fulfillment_plan_tool(_fulfillment_service),
-]
+_tool_services = ToolServiceBundle(
+    order_service=_order_analysis_service,
+    inventory_service=_inventory_analysis_service,
+    knowledge_service=_knowledge_retrieval_service,
+    warehouse_service=_warehouse_service,
+    substitute_service=_substitute_service,
+    fulfillment_service=_fulfillment_service,
+)
+_tool_registry = get_tool_registry()
+_extra_tools = _tool_registry.build_tools(
+    services=_tool_services,
+    use_case="agent",
+    include_names=(
+        "search_warehouse_inventory",
+        "find_substitute_sku",
+        "generate_fulfillment_plan",
+    ),
+)
 
 # chat_model 为 None 时（未配置 LLM），各 service 保持 None，
 # 接口在运行时返回 503，不阻断应用启动。
@@ -88,7 +89,6 @@ _extra_tools = [
 _agent_chat_model = LLMFactory.create_chat_model(_settings, use_case="agent")
 _plan_execute_model = LLMFactory.create_chat_model(_settings, use_case="plan_execute")
 _structured_extract_model = LLMFactory.create_chat_model(_settings, use_case="structured_extract")
-_langfuse_tracer = create_langfuse_tracer(_settings)
 _input_guard = InputGuardrails()
 _agent_service: AgentService | None = None
 _plan_execute_service: PlanExecuteService | None = None
@@ -99,9 +99,8 @@ _plan_execute_services_by_model: dict[str, PlanExecuteService] = {}
 def _model_cache_key(model_id: str | None) -> str:
     """把模型 ID 规范成 service 缓存 key。
 
-    为什么要缓存不同 model_id 对应的 AgentService？
-    - 创建 AgentService 会组装工具、记忆、长短期存储和 tracing，重复创建没有必要。
-    - 前端切换模型时，同一个模型可以复用同一个 service 实例。
+    AgentService 创建时会组装工具、记忆、长短期存储和 tracing。
+    按模型 ID 复用 service 实例，可以减少前端切换模型时的重复初始化成本。
     """
     return model_id.strip() if model_id and model_id.strip() else "__default__"
 
@@ -109,8 +108,8 @@ def _model_cache_key(model_id: str | None) -> str:
 def _build_agent_service(chat_model: object, model_id: str | None = None) -> AgentService:
     """构建 ReAct Agent 服务。
 
-    这里是 API 层和 service 层的装配点：把业务服务、模型、扩展工具、反思配置、Langfuse
-    tracer 都传进去。真正 Agent 图的创建不在这里，而在 ``AgentService`` 内部。
+    这里是 API 层和 service 层的装配点：把业务服务、模型、扩展工具、反思配置传进去。
+    真正 Agent 图的创建不在这里，而在 ``AgentService`` 内部。
     """
     return AgentService(
         order_service=_order_analysis_service,
@@ -122,7 +121,6 @@ def _build_agent_service(chat_model: object, model_id: str | None = None) -> Age
         reflection_threshold=_settings.agent_reflection_threshold,
         max_reflection_retries=_settings.agent_max_reflection_retries,
         structured_output_model=_structured_extract_model,
-        langfuse_tracer=_langfuse_tracer,
     )
 
 
@@ -146,7 +144,6 @@ def _build_plan_execute_service(chat_model: object) -> PlanExecuteService:
 def _agent_service_for_model(model_id: str | None) -> AgentService | None:
     """按模型 ID 获取或懒加载 AgentService。
 
-    学习重点：
     - 默认模型启动时会预构建。
     - 非默认模型只有前端真正选择时才创建，减少启动成本。
     - 如果创建失败返回 None，由接口层统一转成 503。
@@ -248,11 +245,26 @@ async def agent_chat(request: AgentChatRequest, http_request: Request) -> ApiRes
         )
 
     try:
-        result = await agent_service.chat(
-            session_id=request.session_id,
-            message=request.message,
-            include_trace=True,
-        )
+        try:
+            result = await agent_service.chat(
+                session_id=request.session_id,
+                message=request.message,
+                include_trace=True,
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                roles=request.roles,
+                permissions=request.permissions,
+                request_id=getattr(http_request.state, "request_id", ""),
+            )
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            # 兼容旧版测试替身或外部复用的 AgentService 实现。
+            result = await agent_service.chat(
+                session_id=request.session_id,
+                message=request.message,
+                include_trace=True,
+            )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -310,6 +322,11 @@ async def agent_chat_stream(request: AgentChatRequest, http_request: Request) ->
         async for line in agent_service.stream_chat(
             session_id=request.session_id,
             message=request.message,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            roles=request.roles,
+            permissions=request.permissions,
+            request_id=getattr(http_request.state, "request_id", ""),
         ):
             yield line
 
@@ -333,17 +350,39 @@ def get_cache_stats() -> ApiResponse:
         total_misses    — 累计缓存未命中次数
         hit_rate        — 命中率（0.0 ~ 1.0）
     """
+    from app.agents.tools.telemetry import get_tool_telemetry
+
+    stats = get_tool_cache().stats
     return ApiResponse(
         success=True,
         message="缓存统计信息。",
-        data=get_tool_cache().stats,
+        data={
+            **stats,
+            "cache": stats,
+            "tool_metrics": get_tool_telemetry().snapshot,
+        },
+    )
+
+
+@router.get("/tools", response_model=ApiResponse)
+def list_agent_tools(
+    use_case: str | None = Query(default=None, description="按 use_case 过滤，如 agent/plan_execute/multi_agent"),
+    group: str | None = Query(default=None, description="按专家组过滤，如 multi_agent.inventory_agent"),
+) -> ApiResponse:
+    """查看 Tool Registry 中的工具治理元数据。"""
+    tools = _tool_registry.catalog(use_case=use_case, group=group, include_metrics=True)
+    return ApiResponse(
+        success=True,
+        message=f"已加载 {len(tools)} 个工具定义。",
+        data={"tools": tools, "total": len(tools)},
     )
 
 
 @router.delete("/cache", response_model=ApiResponse)
 def invalidate_cache(
     tool_name: str | None = Query(default=None, description="指定工具名称，留空则清理全部过期条目"),
-    scope: str = Query(default=GLOBAL_SCOPE, description="缓存 scope，默认全局"),
+    scope: str = Query(default=GLOBAL_SCOPE, description="缓存 scope，默认全局；传 * 表示全部 scope"),
+    event_type: str | None = Query(default=None, description="业务数据事件，如 knowledge_updated/catalog_updated"),
 ) -> ApiResponse:
     """主动失效工具缓存。
 
@@ -352,8 +391,14 @@ def invalidate_cache(
       （数据更新后调用，强制下次重新查询）
     """
     cache = get_tool_cache()
+    normalized_scope = None if scope == "*" else scope
+    if event_type:
+        result = cache.invalidate_event(event_type, normalized_scope)
+        count = sum(result.values())
+        msg = f"已按事件 '{event_type}' 删除 {count} 条缓存。"
+        return ApiResponse(success=True, message=msg, data={"evicted": count, "by_tool": result})
     if tool_name:
-        count = cache.invalidate_tool(tool_name, scope)
+        count = cache.invalidate_tool(tool_name, normalized_scope)
         msg = f"已删除工具 '{tool_name}' 在 scope='{scope}' 下的 {count} 条缓存。"
     else:
         count = cache.evict_expired()
@@ -403,6 +448,11 @@ async def run_plan_execute(request: PlanExecuteRequest, http_request: Request) -
             order_id=request.order_id,
             question=request.question,
             session_id=request.session_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            roles=request.roles,
+            permissions=request.permissions,
+            request_id=getattr(http_request.state, "request_id", ""),
         )
     except Exception as exc:
         raise HTTPException(

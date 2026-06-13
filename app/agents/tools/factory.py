@@ -1,11 +1,11 @@
-"""文件作用摘要：把业务能力封装成 Agent 可调用的 LangChain 工具。
+"""Agent 业务工具工厂。
 
-这个文件是 Agent 和业务服务之间的接口层。LLM 不直接访问数据库、
+本模块是 Agent 和业务服务之间的接口层。LLM 不直接访问数据库、
 repository 或 service，而是看到一组带名称、参数 schema 和 description 的工具。
 当模型判断“需要查订单 / 查库存 / 查规则”时，LangChain 会调用这里创建的
 ``StructuredTool``，再把工具结果作为 observation 返回给模型。
 
-主要做的事：
+主要工具：
 1. ``make_order_tool``：把订单分析服务封装成 ``analyze_order`` 工具。
 2. ``make_inventory_tool``：把库存分析服务封装成 ``check_inventory`` 工具。
 3. ``make_knowledge_tool``：把 RAG 知识检索封装成 ``retrieve_knowledge`` 工具。
@@ -17,20 +17,24 @@ repository 或 service，而是看到一组带名称、参数 schema 和 descrip
 - ``status``：程序可判断成功或失败。
 - ``data``：保留结构化业务字段，方便测试和后续处理。
 - ``summary``：给 LLM 快速阅读，减少它理解复杂 JSON 的负担。
-
-学习时先看：
-1. ``_ok``：理解工具返回格式。
-2. ``_as_structured_tool``：理解普通函数如何变成 LangChain Tool。
-3. 按顺序看各个 ``make_*_tool``，它们就是 Agent 的业务能力清单。
 """
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Callable
 
 from langchain_core.tools import StructuredTool, ToolException
 
+from app.agents.tools.contracts import (
+    AnalyzeOrderArgs,
+    CheckInventoryArgs,
+    FindSubstituteSkuArgs,
+    GenerateFulfillmentPlanArgs,
+    RetrieveKnowledgeArgs,
+    SearchWarehouseInventoryArgs,
+    error_envelope,
+    ok_envelope,
+)
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.domain.orders.analysis import OrderAnalysisService
@@ -41,23 +45,36 @@ if TYPE_CHECKING:
     from app.domain.inventory.warehouse_service import WarehouseService
 
 
-# 面试官可能问：为什么工具返回 JSON 字符串，而不是直接返回 dict？
-# 回答：LangChain 工具结果最终会进入 LLM 上下文，字符串最通用；但字符串内部
-# 用 JSON 组织，程序、测试、前端和后续结构化抽取都能稳定解析。
+# 工具返回 JSON 字符串，兼容 LLM 上下文，同时保留可解析的结构化字段。
 def _ok(data: dict, summary: str) -> str:
     """统一成功输出格式。
 
-    为什么工具返回字符串而不是 dict？
     LangChain Tool 的输出最终会进入 LLM 上下文，字符串最通用；
     但字符串内容用 JSON 组织，程序和测试又能稳定解析。
     """
-    return json.dumps({"status": "ok", "data": data, "summary": summary}, ensure_ascii=False)
+    return ok_envelope(data=data, summary=summary)
 
 
-# 面试官可能问：StructuredTool 的价值是什么？
-# 回答：它会根据 Python 函数签名生成参数 schema，LLM 能知道工具需要哪些参数。
-# 这样工具不是“随便拼字符串调用”，而是有名称、描述和参数约束的可控接口。
-def _as_structured_tool(func: Callable[..., str], name: str, description: str) -> StructuredTool:
+def _error(code: str, message: str, *, retryable: bool = False) -> str:
+    """统一工具失败输出，避免 LangChain 把异常转成不可解析的自由文本。"""
+    return error_envelope(code=code, message=message, retryable=retryable)
+
+
+def _handle_tool_error(exc: ToolException) -> str:
+    return _error("tool_exception", str(exc), retryable=True)
+
+
+def _handle_validation_error(exc) -> str:
+    return _error("validation_error", f"工具参数校验失败：{exc}", retryable=False)
+
+
+# StructuredTool 将函数封装成有名称、描述和参数约束的可控接口。
+def _as_structured_tool(
+    func: Callable[..., str],
+    name: str,
+    description: str,
+    args_schema: type | None = None,
+) -> StructuredTool:
     """把普通 Python 函数注册成 LangChain StructuredTool。
 
     ``StructuredTool`` 会根据函数签名推断参数 schema。例如：
@@ -68,14 +85,14 @@ def _as_structured_tool(func: Callable[..., str], name: str, description: str) -
         func=func,
         name=name,
         description=description,
-        handle_tool_error=True,
-        handle_validation_error=True,
+        args_schema=args_schema,
+        handle_tool_error=_handle_tool_error,
+        handle_validation_error=_handle_validation_error,
+        infer_schema=args_schema is None,
     )
 
 
-# 面试官可能问：为什么订单、库存、知识库都做成工具，而不是让 Agent 直接访问 service？
-# 回答：工具层是 Agent 和业务系统的边界。模型只能看到工具描述和参数 schema，
-# 不能随意访问内部对象；同时工具输出可测试、可审计、可加缓存/超时/安全净化。
+# 工具层是 Agent 和业务系统的边界，便于测试、审计和统一加弹性包装。
 def make_order_tool(service: OrderAnalysisService) -> StructuredTool:
     """创建订单分析工具。
 
@@ -99,20 +116,17 @@ def make_order_tool(service: OrderAnalysisService) -> StructuredTool:
                 summary=result.summary,
             )
         except Exception as exc:
-            # 抛 ToolException 而不是普通异常，是为了让 LangChain 的
-            # handle_tool_error=True 接住错误并返回给模型，Agent 还有机会继续回答。
-            raise ToolException(f"订单查询失败：{exc}") from exc
+            return _error("order_query_failed", f"订单查询失败：{exc}", retryable=True)
 
     return _as_structured_tool(
         _analyze_order,
         "analyze_order",
         "根据订单 ID 查询订单详情，返回商品数量、总件数、平台、区域等结构化信息。",
+        AnalyzeOrderArgs,
     )
 
 
-# 面试官可能问：库存工具为什么按 order_id 查询，而不是让模型自己传 SKU 列表？
-# 回答：履约判断要结合订单中的多个 SKU、数量、仓库库存和锁定库存。让 service
-# 根据 order_id 做完整分析，比让模型自己拆 SKU 更稳定，也减少参数遗漏。
+# 库存分析按订单执行，由 service 统一处理多 SKU、数量、仓库和锁定库存。
 def make_inventory_tool(service: InventoryAnalysisService) -> StructuredTool:
     """创建库存检查工具。
 
@@ -133,18 +147,17 @@ def make_inventory_tool(service: InventoryAnalysisService) -> StructuredTool:
                 summary=result.summary,
             )
         except Exception as exc:
-            raise ToolException(f"库存查询失败：{exc}") from exc
+            return _error("inventory_query_failed", f"库存查询失败：{exc}", retryable=True)
 
     return _as_structured_tool(
         _check_inventory,
         "check_inventory",
         "检查指定订单的库存状态，返回是否可全量履约、缺货 SKU 列表等结构化信息。",
+        CheckInventoryArgs,
     )
 
 
-# 面试官可能问：RAG 为什么也是一个工具？
-# 回答：Agent 需要在开放式追问中按需检索企业规则。把 RAG 封成工具后，
-# Agent 可以先查订单/库存，再根据问题选择是否查规则，实现结构化数据和知识库结合。
+# RAG 作为工具接入，便于 Agent 在开放式追问中按需检索企业规则。
 def make_knowledge_tool(service: KnowledgeRetrievalService) -> StructuredTool:
     """创建知识库检索工具。
 
@@ -152,14 +165,20 @@ def make_knowledge_tool(service: KnowledgeRetrievalService) -> StructuredTool:
     这里连接的是项目里的 RAG 服务。
     """
 
-    def _retrieve_knowledge(order_id: str, question: str, categories: str = "") -> str:
+    def _retrieve_knowledge(question: str, order_id: str = "", categories: str = "") -> str:
         """检索履约知识库。
 
-        Args:
-            order_id:   订单 ID。
+        参数：
+            order_id:   订单 ID，可选；不传时只检索知识库文档。
             question:   检索问题，如"缺货时应如何处理？"。
             categories: 逗号分隔的规则类别过滤（可选）。
         """
+        def _safe_float(value) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
         try:
             # categories 设计成字符串，是为了让 LLM 更容易传参；
             # 进入 service 前再转成 list，保持业务层接口干净。
@@ -174,6 +193,25 @@ def make_knowledge_tool(service: KnowledgeRetrievalService) -> StructuredTool:
             if result.answer_summary:
                 rules = list(result.answer_summary.key_rules)
                 actions = list(result.answer_summary.suggested_actions)
+            evidence = []
+            for hit in list(result.hits)[:3]:
+                metadata = getattr(hit, "metadata", None)
+                score_detail = getattr(hit, "score_detail", None)
+                evidence.append({
+                    "source_file": str(getattr(hit, "source_file", "")),
+                    "category": str(getattr(hit, "category", "")),
+                    "chunk_id": str(getattr(metadata, "chunk_id", "")) if metadata else "",
+                    "title": str(getattr(metadata, "title", "")) if metadata else "",
+                    "score": _safe_float(getattr(hit, "score", 0.0)),
+                    "score_detail": {
+                        "semantic": _safe_float(getattr(score_detail, "semantic_score", 0.0)) if score_detail else 0.0,
+                        "keyword": _safe_float(getattr(score_detail, "keyword_score", 0.0)) if score_detail else 0.0,
+                        "business_rule": _safe_float(getattr(score_detail, "business_rule_score", 0.0)) if score_detail else 0.0,
+                        "rerank": _safe_float(getattr(score_detail, "rerank_score", 0.0)) if score_detail else 0.0,
+                    },
+                    "matched_terms": list(getattr(hit, "matched_terms", []) or []),
+                    "excerpt": str(getattr(hit, "text", ""))[:180],
+                })
 
             return _ok(
                 data={
@@ -181,6 +219,9 @@ def make_knowledge_tool(service: KnowledgeRetrievalService) -> StructuredTool:
                     "matched_categories": list(result.matched_categories),
                     "key_rules": rules,
                     "suggested_actions": actions,
+                    "coverage_note": str(getattr(result.answer_summary, "coverage_note", "")) if result.answer_summary else "",
+                    "expanded_queries": list(getattr(result, "expanded_queries", []) or [])[:6],
+                    "evidence": evidence,
                 },
                 summary=(
                     f"命中 {len(result.hits)} 条规则：" + "；".join(rules[:3])
@@ -189,18 +230,17 @@ def make_knowledge_tool(service: KnowledgeRetrievalService) -> StructuredTool:
                 ),
             )
         except Exception as exc:
-            raise ToolException(f"知识检索失败：{exc}") from exc
+            return _error("knowledge_retrieval_failed", f"知识检索失败：{exc}", retryable=True)
 
     return _as_structured_tool(
         _retrieve_knowledge,
         "retrieve_knowledge",
         "检索履约知识库，获取缺货处理规则和建议动作，返回结构化规则列表。",
+        RetrieveKnowledgeArgs,
     )
 
 
-# 面试官可能问：为什么要单独做仓库库存工具，已有 check_inventory 不够吗？
-# 回答：check_inventory 面向订单整体是否可履约；仓库工具面向 SKU 在各仓的分布。
-# 当用户追问“哪个仓有货”“能不能跨仓调拨”时，SKU 维度工具更直接。
+# 仓库库存工具面向 SKU 维度，补充订单整体库存检查无法覆盖的仓库分布问题。
 def make_warehouse_tool(service: "WarehouseService") -> StructuredTool:
     """创建仓库库存搜索工具。
 
@@ -211,7 +251,7 @@ def make_warehouse_tool(service: "WarehouseService") -> StructuredTool:
     def _search_warehouse_inventory(sku_id: str) -> str:
         """查询某个 SKU 在全国仓库的库存分布。
 
-        Args:
+        参数：
             sku_id: 商品 SKU 编码，如 "SKU-IPHONE-CASE-001"。
         """
         try:
@@ -233,18 +273,17 @@ def make_warehouse_tool(service: "WarehouseService") -> StructuredTool:
                 summary=result.summary,
             )
         except Exception as exc:
-            raise ToolException(f"仓库查询失败：{exc}") from exc
+            return _error("warehouse_query_failed", f"仓库查询失败：{exc}", retryable=True)
 
     return _as_structured_tool(
         _search_warehouse_inventory,
         "search_warehouse_inventory",
         "查询某个 SKU 在全国仓库的库存分布和地域覆盖，返回各仓可用量结构化数据。",
+        SearchWarehouseInventoryArgs,
     )
 
 
-# 面试官可能问：替代 SKU 工具在业务上解决什么问题？
-# 回答：当主 SKU 缺货时，运营不只需要知道“不能发”，还需要候选替代品。
-# 这个工具把商品目录里的替代关系暴露给 Agent，便于生成可执行的补救方案。
+# 替代 SKU 工具暴露商品目录中的替代关系，用于缺货补救方案。
 def make_substitute_tool(service: "SubstituteSkuService") -> StructuredTool:
     """创建替代 SKU 查询工具。
 
@@ -254,7 +293,7 @@ def make_substitute_tool(service: "SubstituteSkuService") -> StructuredTool:
     def _find_substitute_sku(sku_id: str) -> str:
         """查询某个 SKU 缺货时的替代方案。
 
-        Args:
+        参数：
             sku_id: 原始 SKU 编码，如 "SKU-IPHONE-CASE-001"。
         """
         try:
@@ -274,18 +313,17 @@ def make_substitute_tool(service: "SubstituteSkuService") -> StructuredTool:
                 summary=result.summary,
             )
         except Exception as exc:
-            raise ToolException(f"替代方案查询失败：{exc}") from exc
+            return _error("substitute_query_failed", f"替代方案查询失败：{exc}", retryable=True)
 
     return _as_structured_tool(
         _find_substitute_sku,
         "find_substitute_sku",
         "查询某个 SKU 缺货时的替代方案，返回可用替代品及兼容说明的结构化列表。",
+        FindSubstituteSkuArgs,
     )
 
 
-# 面试官可能问：为什么履约方案生成也是工具，而不是直接让 LLM 编方案？
-# 回答：履约方案要结合库存、仓库、替代品和业务规则。封成工具后，规则和计算
-# 留在后端服务里，LLM 负责解释和组织语言，避免凭空生成不可执行方案。
+# 履约方案由后端服务生成，LLM 只负责解释和组织语言。
 def make_fulfillment_plan_tool(service: "FulfillmentPlanService") -> StructuredTool:
     """创建履约方案生成工具。
 
@@ -296,7 +334,7 @@ def make_fulfillment_plan_tool(service: "FulfillmentPlanService") -> StructuredT
     def _generate_fulfillment_plan(order_id: str) -> str:
         """为订单生成完整履约方案。
 
-        Args:
+        参数：
             order_id: 订单 ID，如 "SO202502140001"。
         """
         try:
@@ -322,10 +360,11 @@ def make_fulfillment_plan_tool(service: "FulfillmentPlanService") -> StructuredT
                 summary=plan.summary,
             )
         except Exception as exc:
-            raise ToolException(f"履约方案生成失败：{exc}") from exc
+            return _error("fulfillment_plan_failed", f"履约方案生成失败：{exc}", retryable=True)
 
     return _as_structured_tool(
         _generate_fulfillment_plan,
         "generate_fulfillment_plan",
         "为订单生成完整履约方案，返回包含仓库分配、替代品、时间线的结构化动作列表。",
+        GenerateFulfillmentPlanArgs,
     )

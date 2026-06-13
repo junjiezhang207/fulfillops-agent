@@ -2,7 +2,7 @@
 
 这个文件不是 Agent 主链路的短期记忆。
 
-当前项目的正式短期记忆由 LangGraph checkpointer + Redis/MemorySaver 负责；
+当前项目的正式短期记忆由 LangGraph checkpointer + Redis 负责；
 这里保留一个轻量内存缓存，只服务 `/hybrid/*` 演示路由，用来记录路由轮次、
 当前订单和少量缓存字段。
 """

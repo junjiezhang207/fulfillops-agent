@@ -34,20 +34,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def _build_eval_records() -> list[dict]:
     """构造评测记录。
 
-    生产中替换为：从 Langfuse 导出历史 trace → 解析 question/answer/contexts。
+    生产中替换为：从 Trace Center 或业务日志抽样 → 解析 question/answer/contexts。
     当前阶段使用 golden_dataset 中的问题 + mock 答案演示流程。
     """
     from app.agents.quality.evaluation.golden_dataset import GOLDEN_DATASET
 
     records = []
     for case in GOLDEN_DATASET:
-        # 使用 mock 答案（生产中替换为 Langfuse 导出的真实 answer）
+        # 使用 mock 答案（生产中替换为线上业务抽样的真实 answer）
         mock_answer = (
             f"根据系统数据分析：{case.question} "
             f"涉及以下关键实体：{'、'.join(case.must_contain or ['订单'])}。"
             f"建议操作：{', '.join(case.ground_truth_keywords[:2]) if case.ground_truth_keywords else '请查看详细报告'}。"
         )
-        # contexts：RAG 检索到的文本片段（生产中从 Langfuse trace 解析）
+        # contexts：RAG 检索到的文本片段（生产中从业务 trace 解析）
         mock_contexts = [
             f"知识库条目：{kw} 相关规则" for kw in case.ground_truth_keywords[:3]
         ] or ["暂无相关规则"]

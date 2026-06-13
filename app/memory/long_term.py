@@ -9,10 +9,10 @@
   - MySQL 保存精确字段、TTL、审计信息。
   - Milvus 保存向量索引，支持相似案例检索。
 
-这个项目为了本地可运行，先提供一个 SQLite 实现：
-  - 真的落盘，不是进程内存，服务重启后仍可读取。
-  - search() 支持 namespace 前缀、filter、TTL、importance、轻量文本相似度。
-  - 接口完全遵循 LangGraph BaseStore，后续切换 MySQL + Milvus 不影响节点代码。
+这个项目现在固定使用 MySQL + Milvus：
+  - MySQL 是权威数据源，保存结构化 value、TTL、审计信息。
+  - Milvus 是可重建语义索引，支持相似案例检索。
+  - Milvus 或 embedding 不可用时直接失败，不允许退回文本检索。
 """
 
 from __future__ import annotations
@@ -21,11 +21,9 @@ import hashlib
 import logging
 import json
 import re
-import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -40,16 +38,11 @@ from langgraph.store.base import (
 )
 
 
-DEFAULT_MEMORY_DB = Path("storage") / "long_term_memory.sqlite3"
 logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
-
-
-def _to_iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
 
 
 def _from_iso(value: str | None) -> datetime:
@@ -177,8 +170,8 @@ def _embed_text(embed_model: object | None, text: str) -> list[float] | None:
         if callable(embed_model):
             return [float(item) for item in embed_model(text)]
     except Exception as exc:
-        logger.warning("长期记忆 embedding 生成失败，降级为文本检索：%s", exc)
-    return None
+        raise RuntimeError(f"长期记忆 embedding 生成失败，生产模式拒绝降级：{exc}") from exc
+    raise RuntimeError("长期记忆未配置可用 embedding 模型，生产模式拒绝降级为文本检索。")
 
 
 @dataclass
@@ -193,288 +186,13 @@ class MemoryPolicy:
     default_importance: float = 0.5
 
 
-class SQLiteLongTermMemoryStore(BaseStore):
-    """可落盘的 LangGraph BaseStore 实现。
-
-    namespace 采用 tuple，例如：
-      ("customers", "C001")
-      ("orders", "SO202502140001")
-      ("sessions", "user-123")
-
-    key 是该 namespace 下的稳定 ID；value 必须是 dict。
-    """
-
-    def __init__(
-        self,
-        db_path: str | Path = DEFAULT_MEMORY_DB,
-        policy: MemoryPolicy | None = None,
-    ) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.policy = policy or MemoryPolicy()
-        self._init_schema()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS long_term_memory (
-                    namespace TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value_json TEXT NOT NULL,
-                    search_text TEXT NOT NULL,
-                    importance REAL NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    expires_at TEXT,
-                    access_count INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (namespace, key)
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ltm_namespace ON long_term_memory(namespace)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ltm_expires ON long_term_memory(expires_at)")
-
-    def _delete_expired(self, conn: sqlite3.Connection) -> None:
-        conn.execute(
-            "DELETE FROM long_term_memory WHERE expires_at IS NOT NULL AND expires_at <= ?",
-            (_to_iso(_now()),),
-        )
-
-    def put(
-        self,
-        namespace: tuple[str, ...],
-        key: str,
-        value: dict[str, Any],
-        index=None,
-        *,
-        ttl=None,
-    ) -> None:
-        """写入或更新一条长期记忆。
-
-        value 可选元字段：
-          _importance: 0~1，影响 search 排序。
-          _ttl_days: 单条记忆 TTL；None 表示使用默认策略。
-        """
-        now = _now()
-        ttl_days = value.get("_ttl_days", self.policy.default_ttl_days)
-        expires_at = None if ttl_days is None else now + timedelta(days=float(ttl_days))
-        if ttl is not None and not isinstance(ttl, bool):
-            expires_at = now + timedelta(seconds=float(ttl))
-
-        importance = float(value.get("_importance", self.policy.default_importance))
-        importance = max(0.0, min(1.0, importance))
-
-        namespace_raw = _namespace_key(namespace)
-        payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
-        search_text = _text_for_search(value)
-
-        with self._connect() as conn:
-            self._delete_expired(conn)
-            existing = conn.execute(
-                "SELECT created_at FROM long_term_memory WHERE namespace=? AND key=?",
-                (namespace_raw, key),
-            ).fetchone()
-            created_at = existing["created_at"] if existing else _to_iso(now)
-            conn.execute(
-                """
-                INSERT INTO long_term_memory (
-                    namespace, key, value_json, search_text, importance,
-                    created_at, updated_at, expires_at, access_count
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(
-                    (SELECT access_count FROM long_term_memory WHERE namespace=? AND key=?), 0
-                ))
-                ON CONFLICT(namespace, key) DO UPDATE SET
-                    value_json=excluded.value_json,
-                    search_text=excluded.search_text,
-                    importance=excluded.importance,
-                    updated_at=excluded.updated_at,
-                    expires_at=excluded.expires_at
-                """,
-                (
-                    namespace_raw,
-                    key,
-                    payload,
-                    search_text,
-                    importance,
-                    created_at,
-                    _to_iso(now),
-                    _to_iso(expires_at),
-                    namespace_raw,
-                    key,
-                ),
-            )
-
-    def get(
-        self,
-        namespace: tuple[str, ...],
-        key: str,
-        *,
-        refresh_ttl: bool | None = None,
-    ) -> Item | None:
-        namespace_raw = _namespace_key(namespace)
-        with self._connect() as conn:
-            self._delete_expired(conn)
-            row = conn.execute(
-                "SELECT * FROM long_term_memory WHERE namespace=? AND key=?",
-                (namespace_raw, key),
-            ).fetchone()
-            if row is None:
-                return None
-            conn.execute(
-                "UPDATE long_term_memory SET access_count=access_count+1 WHERE namespace=? AND key=?",
-                (namespace_raw, key),
-            )
-        return Item(
-            namespace=namespace,
-            key=key,
-            value=json.loads(row["value_json"]),
-            created_at=_from_iso(row["created_at"]),
-            updated_at=_from_iso(row["updated_at"]),
-        )
-
-    def search(
-        self,
-        namespace_prefix: tuple[str, ...],
-        /,
-        *,
-        query: str | None = None,
-        filter: dict[str, Any] | None = None,
-        limit: int = 10,
-        offset: int = 0,
-        refresh_ttl: bool | None = None,
-    ) -> list[SearchItem]:
-        prefix = list(namespace_prefix)
-        query_tokens = _tokens(query or "")
-        rows: list[sqlite3.Row]
-
-        with self._connect() as conn:
-            self._delete_expired(conn)
-            rows = list(conn.execute("SELECT * FROM long_term_memory"))
-
-        scored: list[tuple[float, sqlite3.Row, dict[str, Any]]] = []
-        for row in rows:
-            namespace = _parse_namespace(row["namespace"])
-            if tuple(namespace[: len(prefix)]) != tuple(prefix):
-                continue
-            value = json.loads(row["value_json"])
-            if not _matches_filter(value, filter):
-                continue
-
-            if query_tokens:
-                memory_tokens = _tokens(row["search_text"])
-                overlap = len(query_tokens & memory_tokens)
-                lexical = overlap / max(len(query_tokens), 1)
-            else:
-                lexical = 0.0
-
-            if query_tokens and lexical <= 0:
-                continue
-
-            # 排序分 = 文本相关性 + 重要性 + 访问热度的轻量加权。
-            score = lexical * 0.75 + float(row["importance"]) * 0.20 + min(row["access_count"], 10) * 0.005
-            scored.append((score, row, value))
-
-        scored.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
-        selected = scored[offset : offset + limit]
-        if selected:
-            with self._connect() as conn:
-                for _, row, _ in selected:
-                    conn.execute(
-                        "UPDATE long_term_memory SET access_count=access_count+1 WHERE namespace=? AND key=?",
-                        (row["namespace"], row["key"]),
-                    )
-
-        return [
-            SearchItem(
-                namespace=_parse_namespace(row["namespace"]),
-                key=row["key"],
-                value=value,
-                created_at=_from_iso(row["created_at"]),
-                updated_at=_from_iso(row["updated_at"]),
-                score=round(score, 4),
-            )
-            for score, row, value in selected
-        ]
-
-    def delete(self, namespace: tuple[str, ...], key: str) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "DELETE FROM long_term_memory WHERE namespace=? AND key=?",
-                (_namespace_key(namespace), key),
-            )
-
-    def list_namespaces(
-        self,
-        *,
-        prefix=None,
-        suffix=None,
-        max_depth: int | None = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[tuple[str, ...]]:
-        with self._connect() as conn:
-            self._delete_expired(conn)
-            rows = conn.execute("SELECT DISTINCT namespace FROM long_term_memory").fetchall()
-
-        namespaces = [_parse_namespace(row["namespace"]) for row in rows]
-        if prefix:
-            prefix_tuple = tuple(prefix)
-            namespaces = [ns for ns in namespaces if ns[: len(prefix_tuple)] == prefix_tuple]
-        if suffix:
-            suffix_tuple = tuple(suffix)
-            namespaces = [ns for ns in namespaces if ns[-len(suffix_tuple) :] == suffix_tuple]
-        if max_depth is not None:
-            namespaces = [ns[:max_depth] for ns in namespaces]
-
-        namespaces = sorted(set(namespaces))
-        return namespaces[offset : offset + limit]
-
-    def batch(self, ops: Iterable[GetOp | SearchOp | PutOp | ListNamespacesOp]) -> list[Any]:
-        results: list[Any] = []
-        for op in ops:
-            if isinstance(op, GetOp):
-                results.append(self.get(op.namespace, op.key, refresh_ttl=op.refresh_ttl))
-            elif isinstance(op, SearchOp):
-                results.append(
-                    self.search(
-                        op.namespace_prefix,
-                        query=op.query,
-                        filter=op.filter,
-                        limit=op.limit,
-                        offset=op.offset,
-                        refresh_ttl=op.refresh_ttl,
-                    )
-                )
-            elif isinstance(op, PutOp):
-                if op.value is None:
-                    self.delete(op.namespace, op.key)
-                else:
-                    self.put(op.namespace, op.key, op.value, index=op.index, ttl=op.ttl)
-                results.append(None)
-            elif isinstance(op, ListNamespacesOp):
-                results.append(self.list_namespaces(limit=op.limit, offset=op.offset, max_depth=op.max_depth))
-            else:
-                raise TypeError(f"Unsupported store op: {type(op)!r}")
-        return results
-
-    async def abatch(self, ops: Sequence[GetOp | SearchOp | PutOp | ListNamespacesOp]) -> list[Any]:
-        return self.batch(ops)
-
-
 class MySQLMilvusLongTermMemoryStore(BaseStore):
     """MySQL + Milvus 长期记忆实现。
 
     企业级拆分原则：
     - MySQL 是权威数据源，保存结构化 value、namespace、TTL、importance、访问热度和审计。
     - Milvus 是可重建的语义索引，只保存向量和少量检索元数据。
-    - 写入先落 MySQL，再尽力同步 Milvus；Milvus 不可用时降级为 MySQL 文本检索。
+    - 写入先落 MySQL，再同步 Milvus；Milvus 不可用时直接失败。
     """
 
     def __init__(
@@ -484,12 +202,12 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
         milvus_uri: str = "http://localhost:19530",
         milvus_token: str = "",
         milvus_database: str = "default",
-        milvus_collection: str = "long_term_memory_vectors",
+        milvus_collection: str = "long_term_memory_vectors_1024",
         milvus_alias: str = "ltm_milvus",
         milvus_timeout_seconds: float = 10.0,
         milvus_similarity_metric: str = "COSINE",
         embedding_model: object | None = None,
-        vector_dimension: int = 512,
+        vector_dimension: int = 1024,
         policy: MemoryPolicy | None = None,
         table_name: str = "long_term_memory",
         audit_table_name: str = "long_term_memory_audit",
@@ -582,8 +300,7 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
         try:
             from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, db, utility
         except ImportError as exc:
-            logger.warning("pymilvus 未安装，长期记忆将降级为 MySQL 文本检索：%s", exc)
-            return
+            raise RuntimeError("pymilvus 未安装，长期记忆无法连接 Milvus。") from exc
 
         try:
             connection_kwargs = {
@@ -647,7 +364,7 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
             self._milvus.load(timeout=self.milvus_timeout_seconds)
         except Exception as exc:
             self._milvus = None
-            logger.warning("Milvus 长期记忆索引初始化失败，降级为 MySQL 文本检索：%s", exc)
+            raise RuntimeError(f"Milvus 长期记忆索引初始化失败：{exc}") from exc
 
     @staticmethod
     def _milvus_vector_dim(collection: object) -> int | None:
@@ -676,12 +393,9 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
     def _embedding_for(self, text: str) -> list[float] | None:
         embedding = _embed_text(self.embedding_model, text)
         if embedding and len(embedding) != self.vector_dimension:
-            logger.warning(
-                "长期记忆 embedding 维度不匹配：实际 %s，配置 %s。本次降级为文本检索。",
-                len(embedding),
-                self.vector_dimension,
+            raise RuntimeError(
+                f"长期记忆 embedding 维度不匹配：实际 {len(embedding)}，配置 {self.vector_dimension}。"
             )
-            return None
         return embedding
 
     def _write_audit(
@@ -725,8 +439,10 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
         updated_at: datetime,
         expires_at: datetime | None,
     ) -> None:
-        if self._milvus is None or embedding is None:
-            return
+        if self._milvus is None:
+            raise RuntimeError("长期记忆 Milvus 未初始化，拒绝写入不完整记忆。")
+        if embedding is None:
+            raise RuntimeError("长期记忆缺少 embedding，拒绝写入不完整记忆。")
         try:
             row = [
                 [vector_id],
@@ -746,15 +462,15 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
             if hasattr(self._milvus, "flush"):
                 self._milvus.flush(timeout=self.milvus_timeout_seconds)
         except Exception as exc:
-            logger.warning("长期记忆 Milvus upsert 失败，MySQL 已保留权威记录：%s", exc)
+            raise RuntimeError(f"长期记忆 Milvus upsert 失败：{exc}") from exc
 
     def _delete_vector(self, vector_id: str) -> None:
         if self._milvus is None:
-            return
+            raise RuntimeError("长期记忆 Milvus 未初始化，拒绝只删除 MySQL 记录。")
         try:
             self._milvus.delete(f'id == "{_milvus_quote(vector_id)}"', timeout=self.milvus_timeout_seconds)
         except Exception as exc:
-            logger.warning("长期记忆 Milvus delete 失败：%s", exc)
+            raise RuntimeError(f"长期记忆 Milvus delete 失败：{exc}") from exc
 
     def put(
         self,
@@ -919,8 +635,10 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
         query_vector: list[float] | None,
         limit: int,
     ) -> list[tuple[str, float]]:
-        if self._milvus is None or query_vector is None:
-            return []
+        if self._milvus is None:
+            raise RuntimeError("长期记忆 Milvus 未初始化，无法执行语义检索。")
+        if query_vector is None:
+            raise RuntimeError("长期记忆缺少 query embedding，无法执行语义检索。")
         now_ms = _epoch_millis(_now())
         expr = f"(expires_at == 0 or expires_at > {now_ms})"
         if namespace_prefix:
@@ -937,8 +655,7 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
                 timeout=self.milvus_timeout_seconds,
             )
         except Exception as exc:
-            logger.warning("长期记忆 Milvus 搜索失败，降级 MySQL 文本检索：%s", exc)
-            return []
+            raise RuntimeError(f"长期记忆 Milvus 搜索失败：{exc}") from exc
 
         hits = raw[0] if raw else []
         results: list[tuple[str, float]] = []
@@ -1109,33 +826,32 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
 
 
 def create_long_term_memory_store(
-    db_path: str | Path | None = None,
     *,
-    backend: str = "sqlite",
     mysql_url: str = "",
     milvus_uri: str = "http://localhost:19530",
     milvus_token: str = "",
     milvus_database: str = "default",
-    milvus_collection: str = "long_term_memory_vectors",
+    milvus_collection: str = "long_term_memory_vectors_1024",
     milvus_alias: str = "ltm_milvus",
     milvus_timeout_seconds: float = 10.0,
     milvus_similarity_metric: str = "COSINE",
     embedding_model: object | None = None,
-    vector_dimension: int = 512,
+    vector_dimension: int = 1024,
     default_ttl_days: int | None = 180,
     default_importance: float = 0.5,
-) -> SQLiteLongTermMemoryStore | MySQLMilvusLongTermMemoryStore:
+) -> MySQLMilvusLongTermMemoryStore:
     """创建长期记忆 Store。
 
-    默认使用 SQLite，保证本地开发开箱即用。
-    配置 ``backend="mysql_milvus"`` 后切换到 MySQL + Milvus 企业级拆分存储。
+    长期记忆固定使用 MySQL + Milvus：
+    MySQL 保存权威记录和审计，Milvus 保存可重建语义索引。
     """
+    if not mysql_url:
+        raise ValueError("使用 MySQL + Milvus 长期记忆时必须配置 MYSQL_URL 或 LONG_TERM_MEMORY_MYSQL_URL")
     policy = MemoryPolicy(
         default_ttl_days=default_ttl_days,
         default_importance=default_importance,
     )
-    normalized_backend = backend.strip().lower()
-    if normalized_backend in {"mysql_milvus", "mysql+milvus", "mysql", "milvus"}:
+    try:
         return MySQLMilvusLongTermMemoryStore(
             mysql_url=mysql_url,
             milvus_uri=milvus_uri,
@@ -1149,12 +865,13 @@ def create_long_term_memory_store(
             vector_dimension=vector_dimension,
             policy=policy,
         )
-    return SQLiteLongTermMemoryStore(
-        db_path=db_path or DEFAULT_MEMORY_DB,
-        policy=policy,
-    )
+    except Exception as exc:
+        # 生产模式下长期记忆必须落到 MySQL + Milvus。
+        # 如果这里降级到 InMemoryStore，多实例会话会出现不可解释的不一致，
+        # 也无法满足审计、TTL、冲突治理和语义召回要求。
+        raise RuntimeError(f"长期记忆 MySQL/Milvus 初始化失败，生产模式拒绝降级：{exc}") from exc
 
 
-# 兼容旧导入名：之前 README/代码里提到 LongTermMemoryStore。
-LongTermMemoryStore = SQLiteLongTermMemoryStore
+# 兼容旧导入名：长期记忆现在固定由 MySQL + Milvus 实现。
+LongTermMemoryStore = MySQLMilvusLongTermMemoryStore
 

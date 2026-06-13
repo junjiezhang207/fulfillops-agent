@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 
 from app.agents.orchestration.multi_agent import MultiAgentOrchestrator
+from app.agents.runtime.checkpointer import create_checkpointer
+from app.agents.tools.contracts import make_agent_tool_context, tool_runtime_context
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
@@ -102,6 +104,31 @@ class MultiAgentService:
         fulfillment_service: FulfillmentPlanService,
         llm=None,
     ):
+        from app.core.config import get_settings
+        from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
+        from app.memory import create_long_term_memory_store
+
+        settings = get_settings()
+        # 多 Agent 的专家节点也会写短期状态，生产模式统一落 Redis。
+        checkpointer = create_checkpointer(
+            settings.redis_url,
+            ttl_seconds=settings.short_term_memory_ttl_seconds,
+        )
+        memory_embed_model = create_lazy_embed_model(settings)
+        # 跨专家、跨会话可复用的长期记忆固定落 MySQL + Milvus。
+        memory_store = create_long_term_memory_store(
+            mysql_url=settings.long_term_memory_mysql_url or settings.mysql_url,
+            milvus_uri=settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}",
+            milvus_token=settings.milvus_token,
+            milvus_database=settings.milvus_database,
+            milvus_collection=settings.long_term_memory_milvus_collection,
+            milvus_alias=settings.long_term_memory_milvus_alias,
+            milvus_timeout_seconds=settings.milvus_timeout_seconds,
+            milvus_similarity_metric=settings.milvus_similarity_metric,
+            embedding_model=memory_embed_model,
+            vector_dimension=settings.long_term_memory_vector_dimension,
+            default_ttl_days=settings.long_term_memory_ttl_days,
+        )
         # 这里集中组装 MultiAgentOrchestrator 的依赖。
         # 以后新增专业 Agent，通常也是从这里把新的 service 注入进去。
         self._orchestrator = MultiAgentOrchestrator(
@@ -112,9 +139,20 @@ class MultiAgentService:
             substitute_service=substitute_service,
             fulfillment_service=fulfillment_service,
             llm=llm,
+            checkpointer=checkpointer,
+            store=memory_store,
         )
 
-    def run(self, order_id: str, question: str) -> MultiAgentResult:
+    def run(
+        self,
+        order_id: str,
+        question: str,
+        tenant_id: str = "default",
+        user_id: str | None = None,
+        roles: list[str] | None = None,
+        permissions: list[str] | None = None,
+        request_id: str = "",
+    ) -> MultiAgentResult:
         """执行多 Agent 编排并返回标准化结果。
 
         Args:
@@ -126,8 +164,18 @@ class MultiAgentService:
         """
         start_time = time.time()
 
+        context = make_agent_tool_context(
+            session_id=f"multi-{order_id}",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            roles=roles,
+            permissions=permissions,
+            request_id=request_id,
+        )
+
         # 真正的多 Agent 调度发生在 orchestrator 内部。
-        raw = self._orchestrator.run(order_id=order_id, question=question)
+        with tool_runtime_context(context):
+            raw = self._orchestrator.run(order_id=order_id, question=question)
 
         # 记录端到端耗时，不包含前端渲染时间。
         execution_time_ms = (time.time() - start_time) * 1000

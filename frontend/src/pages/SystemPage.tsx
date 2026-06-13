@@ -2,8 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Activity, Brain, Database, Eye, GitBranch, Radio, Route, Server } from "lucide-react";
 
 import { StatusPill } from "../components/StatusPill";
-import { getEnterpriseStats, getHealth, getHybridStats } from "../lib/api";
-import { recentRuns } from "../lib/mockData";
+import { getEnterpriseStats, getHealth, getHybridStats, listBusinessTraces } from "../lib/api";
 
 type ServiceTone = "ok" | "warn" | "danger" | "info";
 
@@ -37,6 +36,7 @@ export function SystemPage() {
   const health = useQuery({ queryKey: ["health"], queryFn: getHealth });
   const enterpriseStats = useQuery({ queryKey: ["enterprise-stats"], queryFn: getEnterpriseStats });
   const hybridStats = useQuery({ queryKey: ["hybrid-stats"], queryFn: getHybridStats });
+  const recentTraces = useQuery({ queryKey: ["recent-business-traces"], queryFn: () => listBusinessTraces({ limit: 5 }) });
   const apiOk = health.data?.data.status === "ok";
 
   return (
@@ -45,7 +45,7 @@ export function SystemPage() {
         <div>
           <p className="eyebrow">系统运行状态</p>
           <h1>系统状态</h1>
-          <p>集中展示 API、Redis、Milvus、MySQL、Langfuse 和 Hybrid Routing 的运行状态，帮助运营与技术人员快速判断系统是否可用。</p>
+          <p>集中展示 API、Redis、Milvus、MySQL、Trace Center 和 Hybrid Routing 的运行状态，帮助运营与技术人员快速判断系统是否可用。</p>
         </div>
         <StatusPill tone={apiOk ? "ok" : health.isError ? "danger" : "warn"}>
           {apiOk ? "API 正常" : health.isError ? "API 异常" : "检查中"}
@@ -63,8 +63,8 @@ export function SystemPage() {
           <ServiceCard icon={Server} name="API 服务" value={apiOk ? "在线" : "检查中"} detail={health.data?.data.version || "FastAPI"} tone={apiOk ? "ok" : "warn"} />
           <ServiceCard icon={Radio} name="Redis" value="启用" detail="短期记忆 / 工具缓存 / 速率限制" />
           <ServiceCard icon={Brain} name="Milvus" value="向量检索" detail="RAG 与长期记忆语义搜索" tone="info" />
-          <ServiceCard icon={Database} name="MySQL / 本地数据" value={enterpriseStats.data?.data.order_count ?? 0} detail="企业结构化数据和长期记忆元数据" tone="info" />
-          <ServiceCard icon={Eye} name="Langfuse" value="Trace" detail="Agent 调用链路和质量观测" />
+          <ServiceCard icon={Database} name="MySQL" value={enterpriseStats.data?.data.order_count ?? 0} detail="企业结构化数据、HITL、Trace 和长期记忆元数据" tone="info" />
+          <ServiceCard icon={Eye} name="Trace Center" value="业务链路" detail="Hybrid / RAG / Tool / HITL 观测" />
         </div>
       </section>
 
@@ -100,7 +100,7 @@ export function SystemPage() {
             <article><strong>Redis</strong><span>用于短期记忆、工具缓存和接口速率限制。</span></article>
             <article><strong>Milvus</strong><span>用于 RAG 和长期记忆的向量检索。</span></article>
             <article><strong>MySQL</strong><span>保存企业结构化数据与长期记忆元数据。</span></article>
-            <article><strong>Langfuse</strong><span>记录 Agent Trace、模型调用和执行质量。</span></article>
+            <article><strong>Trace Center</strong><span>记录业务决策步骤、RAG 证据、工具调用和审计事件。</span></article>
             <article><strong>Hybrid Routing</strong><span>按问题复杂度选择 Workflow / Agent / RAG / Multi-Agent。</span></article>
           </div>
         </section>
@@ -110,27 +110,34 @@ export function SystemPage() {
         <div className="section-title">
           <div>
             <h2>最近运行</h2>
-            <p>用几条订单分析记录说明路由路径、耗时和是否进入人工审查。</p>
+            <p>来自 Trace Center 的真实业务链路记录。</p>
           </div>
           <Route size={20} />
         </div>
         <div className="run-card-list">
-          {recentRuns.map((run) => (
-            <article key={run.orderId}>
+          {recentTraces.isLoading && <div className="empty-mini">正在读取最近运行记录...</div>}
+          {recentTraces.isError && <div className="error-box">最近运行加载失败，请检查 Trace Center 和 MySQL。</div>}
+          {(recentTraces.data?.data.traces || []).map((run) => (
+            <article key={run.trace_id}>
               <div>
-                <strong>{run.orderId}</strong>
-                <span>{run.route} · {run.latency} · {run.result}</span>
+                <strong>{run.order_id || run.trace_id}</strong>
+                <span>{run.route || "Hybrid"} · {run.duration_ms ? `${Math.round(run.duration_ms)}ms` : "--"} · {run.status || "--"}</span>
               </div>
-              <StatusPill tone={run.review === "是" ? "warn" : "ok"}>HITL {run.review}</StatusPill>
+              <StatusPill tone={run.status === "pending_human" || run.status === "interrupted" ? "warn" : run.status === "error" ? "danger" : "ok"}>
+                {run.status === "pending_human" || run.status === "interrupted" ? "HITL 是" : "HITL 否"}
+              </StatusPill>
             </article>
           ))}
+          {!recentTraces.isLoading && (recentTraces.data?.data.traces || []).length === 0 && (
+            <div className="empty-mini">暂无真实运行记录，完成一次智能履约分析后会显示在这里。</div>
+          )}
         </div>
       </section>
 
       <section className="demo-bottom-notes">
         <article><Activity size={18} /><span>API、数据、路由和观测形成完整工程链路。</span></article>
-        <article><Brain size={18} /><span>Milvus + MySQL 表达长期记忆，不使用 PostgreSQL。</span></article>
-        <article><Eye size={18} /><span>Langfuse 用于查看每次 Agent 调用和 Trace。</span></article>
+        <article><Brain size={18} /><span>Milvus + MySQL 表达长期记忆，不使用本地文件降级。</span></article>
+        <article><Eye size={18} /><span>Trace Center 用于查看每次履约决策链路。</span></article>
       </section>
     </div>
   );

@@ -1,17 +1,11 @@
 """RAG 知识检索 API。
 
-文件作用摘要：
-这个文件暴露知识库检索能力，主要用于前端直接调试 RAG，也可以帮助你理解 Agent 工具
-``retrieve_knowledge`` 背后实际调用的服务是什么。
+本模块暴露知识库检索能力，主要用于前端直接调试 RAG，也支撑 Agent 工具
+``retrieve_knowledge`` 背后的检索服务。
 
-学习重点：
-1. 路由层只接收 ``order_id``、``question`` 和类别过滤，不关心向量检索细节。
-2. 检索、改写、BM25/向量混合召回、重排、摘要都在 ``KnowledgeRetrievalService``。
-3. ``/reindex`` 是手动重建索引入口，适合本地开发或知识文档变更后触发。
-
-面试官可能问：为什么 RAG 也要提供 HTTP 接口，而不是只给 Agent 用？
-回答：RAG 是一个可独立测试的能力。提供 HTTP 入口后，前端、测试、运维脚本和 Agent
-工具都能复用同一套检索服务，也方便排查“是检索没命中，还是 Agent 没用好检索结果”。
+路由层只接收 ``order_id``、``question`` 和类别过滤，不关心向量检索细节。
+检索、改写、BM25/向量混合召回、重排和摘要都在 ``KnowledgeRetrievalService``。
+``/reindex`` 是手动重建索引入口，适合本地开发或知识文档变更后触发。
 """
 
 from fastapi import APIRouter, HTTPException, status
@@ -33,7 +27,7 @@ def retrieve_knowledge(request: KnowledgeRetrieveRequest) -> ApiResponse:
     """知识检索接口。
 
     这里把业务问题交给 RAG 服务，不直接构造 Prompt，也不直接访问向量库。
-    如果你学习 RAG 链路，可以从这个接口打断点，然后继续追到 service 层。
+    RAG 链路的检索、重排和摘要都在 service 层完成。
     """
 
     try:

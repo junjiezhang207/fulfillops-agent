@@ -1,8 +1,59 @@
-from app.memory import MemoryGovernanceService, create_long_term_memory_store
+from datetime import datetime, timezone
+
+from langgraph.store.base import Item, SearchItem
+
+from app.memory import MemoryGovernanceService
 
 
-def test_govern_is_side_effect_free_when_conflict_detected(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
+class InMemoryLongTermMemoryStore:
+    def __init__(self):
+        self._items = {}
+
+    def put(self, namespace, key, value, index=None, *, ttl=None):
+        self._items[(tuple(namespace), key)] = {
+            "namespace": tuple(namespace),
+            "key": key,
+            "value": dict(value),
+            "created_at": datetime.now(tz=timezone.utc),
+            "updated_at": datetime.now(tz=timezone.utc),
+        }
+
+    def get(self, namespace, key, *, refresh_ttl=None):
+        raw = self._items.get((tuple(namespace), key))
+        if raw is None:
+            return None
+        return Item(
+            namespace=raw["namespace"],
+            key=raw["key"],
+            value=dict(raw["value"]),
+            created_at=raw["created_at"],
+            updated_at=raw["updated_at"],
+        )
+
+    def search(self, namespace_prefix, /, *, query=None, filter=None, limit=10, offset=0, refresh_ttl=None):
+        prefix = tuple(namespace_prefix)
+        results = []
+        for raw in self._items.values():
+            if raw["namespace"][: len(prefix)] != prefix:
+                continue
+            value = dict(raw["value"])
+            if filter and any(value.get(key) != expected for key, expected in filter.items()):
+                continue
+            results.append(
+                SearchItem(
+                    namespace=raw["namespace"],
+                    key=raw["key"],
+                    value=value,
+                    created_at=raw["created_at"],
+                    updated_at=raw["updated_at"],
+                    score=1.0,
+                )
+            )
+        return results[offset : offset + limit]
+
+
+def test_govern_is_side_effect_free_when_conflict_detected():
+    store = InMemoryLongTermMemoryStore()
     governance = MemoryGovernanceService()
     namespace = ("customers", "C-VIP-001", "preferences")
 
@@ -34,8 +85,8 @@ def test_govern_is_side_effect_free_when_conflict_detected(tmp_path):
     assert store.get(namespace, "pref-new") is None
 
 
-def test_memory_governance_supersedes_conflicting_preference(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
+def test_memory_governance_supersedes_conflicting_preference():
+    store = InMemoryLongTermMemoryStore()
     governance = MemoryGovernanceService()
     namespace = ("customers", "C-VIP-001", "preferences")
 
@@ -73,8 +124,8 @@ def test_memory_governance_supersedes_conflicting_preference(tmp_path):
     assert new_item.value["_governance"]["resolution"] == "newer_or_higher_priority_memory_supersedes_old"
 
 
-def test_memory_governance_merges_duplicate_preference_evidence(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
+def test_memory_governance_merges_duplicate_preference_evidence():
+    store = InMemoryLongTermMemoryStore()
     governance = MemoryGovernanceService()
     namespace = ("sessions", "s1", "preferences")
 
@@ -106,8 +157,8 @@ def test_memory_governance_merges_duplicate_preference_evidence(tmp_path):
     assert "last_confirmed_at" in merged.value
 
 
-def test_higher_priority_memory_conflict_requires_review(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
+def test_higher_priority_memory_conflict_requires_review():
+    store = InMemoryLongTermMemoryStore()
     governance = MemoryGovernanceService()
     namespace = ("customers", "C-VIP-001", "preferences")
 
@@ -138,8 +189,8 @@ def test_higher_priority_memory_conflict_requires_review(tmp_path):
     assert store.get(namespace, "rule-like-pref").value["memory_status"] == "active"
 
 
-def test_memory_governance_redacts_sensitive_values(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
+def test_memory_governance_redacts_sensitive_values():
+    store = InMemoryLongTermMemoryStore()
     governance = MemoryGovernanceService()
     namespace = ("orders", "SO1")
 
@@ -166,4 +217,3 @@ def test_memory_governance_redacts_sensitive_values(tmp_path):
     assert "[EMAIL]" in text
     assert "[SECRET_KEY]" in text
     assert set(item.value["_governance"]["safety_flags"]) >= {"phone", "email", "secret_key", "dropped_authorization"}
-

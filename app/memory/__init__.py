@@ -1,4 +1,4 @@
-"""记忆系统 — 短期（Redis）+ 长期（SQLite / MySQL + Milvus）。
+"""记忆系统 — 短期（Redis）+ 长期（MySQL + Milvus）。
 
 使用方式：
     from app.memory import create_redis_checkpointer, create_long_term_memory_store
@@ -7,7 +7,7 @@
     checkpointer = create_redis_checkpointer(redis_url="redis://localhost:6379")
 
     # 长期记忆：传给 graph.compile(store=...)
-    store = create_long_term_memory_store()
+    store = create_long_term_memory_store(mysql_url="mysql+pymysql://root:root@localhost:3306/multiship_agent")
 
     # 接入 Agent
     agent = build_agent(model, tools, checkpointer=checkpointer)
@@ -18,7 +18,6 @@ from app.memory.long_term import (
     LongTermMemoryStore,
     MemoryPolicy,
     MySQLMilvusLongTermMemoryStore,
-    SQLiteLongTermMemoryStore,
     create_long_term_memory_store,
 )
 from app.memory.governance import GovernanceDecision, MemoryGovernanceService
@@ -31,7 +30,6 @@ __all__ = [
     # 长期记忆
     "create_long_term_memory_store",
     "LongTermMemoryStore",
-    "SQLiteLongTermMemoryStore",
     "MySQLMilvusLongTermMemoryStore",
     "MemoryPolicy",
     "GovernanceDecision",

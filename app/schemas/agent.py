@@ -82,6 +82,10 @@ class AgentChatRequest(BaseModel):
     session_id: str = Field(..., description="会话 ID，相同 ID 共享对话历史")
     message: str = Field(..., description="用户本轮消息")
     model_id: str | None = Field(default=None, description="可选模型 ID，由后端模型网关解析")
+    tenant_id: str = Field(default="default", description="租户 ID，用于工具权限和缓存隔离")
+    user_id: str | None = Field(default=None, description="用户 ID，用于工具审计和权限上下文")
+    roles: list[str] | None = Field(default=None, description="用户角色列表")
+    permissions: list[str] | None = Field(default=None, description="用户显式工具权限列表")
 
 
 class PlanExecuteRequest(BaseModel):
@@ -90,6 +94,10 @@ class PlanExecuteRequest(BaseModel):
     question: str = Field(..., description="复杂问题，如'帮我完整分析履约方案'")
     session_id: str | None = Field(default=None, description="会话 ID（可选，留空自动生成）")
     model_id: str | None = Field(default=None, description="可选模型 ID，由后端模型网关解析")
+    tenant_id: str = Field(default="default", description="租户 ID，用于工具权限和缓存隔离")
+    user_id: str | None = Field(default=None, description="用户 ID，用于工具审计和权限上下文")
+    roles: list[str] | None = Field(default=None, description="用户角色列表")
+    permissions: list[str] | None = Field(default=None, description="用户显式工具权限列表")
 
 
 class PlanExecuteResponse(BaseModel):

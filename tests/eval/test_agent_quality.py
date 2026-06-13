@@ -1,31 +1,28 @@
-"""Agent 质量回归测试 — 基于 DeepEval + Golden Dataset。
+"""Agent 质量回归测试。
 
 测试分层：
-  Layer 1 — 无 LLM 断言（CI 必跑）
-    - 工具调用断言：Agent 至少调用了 expected_tools 中的一个工具
-    - 幻觉关键词检查：答案不包含 must_not_hallucinate 中的词
-    - 非空断言：Agent 返回了有效回复
+  Layer 1 — Golden Dataset 规则评分
+    - 工具调用覆盖度
+    - 工具证据是否支撑答案事实
+    - 业务结论是否符合结构化期望
+    - 硬失败条件：错误履约结论、编造实体、编造库存数量等
 
-  Layer 2 — DeepEval LLM-as-judge（加 --slow 参数时运行）
+  Layer 2 — DeepEval LLM-as-judge
     - AnswerRelevancyMetric: 答案与问题相关性 ≥ 0.7
-    - GEval: 自定义"是否基于工具数据而非凭空推断"
+    - GEval: 自定义“答案是否清晰、完整、可执行”
 
 运行方式：
-  # 仅 Layer 1（CI）：
-  pytest tests/eval/test_agent_quality.py -m "not slow"
+  pytest tests/eval/test_agent_quality.py -m "not slow" -q
 
-  # 完整评测（本地，需要 LLM）：
-  pytest tests/eval/test_agent_quality.py --slow
+  pytest tests/eval/test_agent_quality.py --slow -q
 
-  # 只跑某个标签的 case：
-  pytest tests/eval/test_agent_quality.py -k "gc-00"
+  pytest tests/eval/test_agent_quality.py -k "gc-inv" -q
 """
 
 import pytest
 
 from app.agents.quality.evaluation.golden_dataset import GOLDEN_DATASET, GoldenCase
-
-pytestmark = pytest.mark.slow
+from app.agents.quality.evaluation.scoring import evaluate_agent_result
 
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────────────
@@ -39,69 +36,22 @@ async def _run_agent(agent_service, case: GoldenCase) -> dict:
     )
 
 
-# ── Layer 1：无 LLM 断言（CI 常规跑）────────────────────────────────────────
+# ── Layer 1：Golden Dataset 规则评分 ────────────────────────────────────────
 
-class TestToolCallAssertion:
-    """验证 Agent 是否调用了正确的工具。
+class TestGoldenRegressionScore:
+    """使用结构化 Golden Case 评估 Agent 输出。
 
-    不依赖 LLM，快速验证 Agent routing 没有退化。
+    这里不使用 LLM-as-judge，所有判断都来自工具调用、trace 证据和结构化期望。
     """
 
     @pytest.mark.parametrize("case", GOLDEN_DATASET, ids=[c.id for c in GOLDEN_DATASET])
     @pytest.mark.asyncio
-    async def test_expected_tool_called(self, case: GoldenCase, agent_service_with_llm):
+    async def test_agent_result_passes_rule_score(self, case: GoldenCase, agent_service_with_llm):
         result = await _run_agent(agent_service_with_llm, case)
-        called = set(result.get("tools_called", []))
+        score = evaluate_agent_result(case, result)
 
-        assert called, (
-            f"[{case.id}] Agent 未调用任何工具。\n"
-            f"问题：{case.question}\n"
-            f"回复：{result.get('reply', '')[:200]}"
-        )
-        assert any(t in called for t in case.expected_tools), (
-            f"[{case.id}] 期望工具 {case.expected_tools} 之一被调用，实际调用了 {called}。\n"
-            f"问题：{case.question}"
-        )
-
-    @pytest.mark.parametrize("case", GOLDEN_DATASET, ids=[c.id for c in GOLDEN_DATASET])
-    @pytest.mark.asyncio
-    async def test_reply_not_empty(self, case: GoldenCase, agent_service_with_llm):
-        result = await _run_agent(agent_service_with_llm, case)
-        reply = result.get("reply", "").strip()
-
-        assert reply, (
-            f"[{case.id}] Agent 返回了空回复。\n"
-            f"问题：{case.question}"
-        )
-        assert len(reply) >= 20, (
-            f"[{case.id}] 回复过短（{len(reply)} 字符），疑似未正常作答。\n"
-            f"回复：{reply}"
-        )
-
-
-class TestHallucinationKeyword:
-    """黑名单关键词检查 — 答案中不应出现幻觉词。
-
-    检查逻辑：逐字符匹配 must_not_hallucinate 中的词，
-    任意命中则测试失败并报告具体词语。
-    """
-
-    @pytest.mark.parametrize(
-        "case",
-        [c for c in GOLDEN_DATASET if c.must_not_hallucinate],
-        ids=[c.id for c in GOLDEN_DATASET if c.must_not_hallucinate],
-    )
-    @pytest.mark.asyncio
-    async def test_no_hallucination_keywords(self, case: GoldenCase, agent_service_with_llm):
-        result = await _run_agent(agent_service_with_llm, case)
-        reply = result.get("reply", "")
-
-        hits = [kw for kw in case.must_not_hallucinate if kw in reply]
-        assert not hits, (
-            f"[{case.id}] 答案包含幻觉关键词 {hits}。\n"
-            f"问题：{case.question}\n"
-            f"回复：{reply[:300]}"
-        )
+        assert result.get("reply", "").strip(), f"[{case.id}] Agent 返回空回复"
+        assert score.passed, score.assert_message()
 
 
 # ── Layer 2：DeepEval LLM-as-judge（慢速测试）──────────────────────────────
@@ -135,7 +85,7 @@ class TestDeepEvalQuality:
     @pytest.mark.parametrize("case", GOLDEN_DATASET, ids=[c.id for c in GOLDEN_DATASET])
     @pytest.mark.asyncio
     async def test_tool_grounding(self, case: GoldenCase, agent_service_with_llm):
-        """答案必须基于工具数据，不能凭空推断（GEval 自定义标准）。"""
+        """答案应清晰、完整、可执行（GEval 自定义软指标）。"""
         try:
             from deepeval import assert_test
             from deepeval.metrics import GEval
@@ -149,26 +99,20 @@ class TestDeepEvalQuality:
         test_case = LLMTestCase(
             input=case.question,
             actual_output=result.get("reply", ""),
-            context=[f"工具调用：{', '.join(tools_called)}"] if tools_called else ["未调用工具"],
+            context=[
+                f"工具调用：{', '.join(tools_called)}" if tools_called else "未调用工具",
+                "评估要求：" + "；".join(case.judge_rubric or case.expected_answer_points),
+            ],
         )
         metric = GEval(
-            name="ToolGrounding",
+            name="AnswerUsefulness",
             criteria=(
-                "判断 Agent 的回答是否基于工具调用的实际数据，"
-                "而非凭空推断或使用训练知识。"
-                "如果回答中包含具体数字、订单号、SKU 或仓库名，且与工具调用结果一致，则得高分。"
+                "判断回答是否清晰、完整、可执行。事实正确性已经由规则评分器检查，"
+                "这里只评估表达是否直接回应问题、是否说明原因、是否给出下一步动作。"
             ),
             evaluation_params=[SingleTurnParams.INPUT, SingleTurnParams.ACTUAL_OUTPUT,
                                 SingleTurnParams.CONTEXT],
-            threshold=0.6,
+            threshold=0.7,
             verbose_mode=False,
         )
         assert_test(test_case, [metric])
-
-
-# ── 注册自定义 marker（避免 pytest 警告）────────────────────────────────────
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "slow: 需要 LLM 的慢速评测，CI 跳过，本地加 --slow 运行"
-    )

@@ -4,7 +4,7 @@
 
 当前策略：
   - 生产/企业级主路径：Milvus / Zilliz。
-  - 本地开发兜底：返回 None，让 LlamaIndex 使用本地默认向量存储。
+  - Milvus 不可用时直接失败，不再降级到本地索引。
 
 为什么要用工厂函数？
   KnowledgeRetrievalService 只关心 LlamaIndex StorageContext，不应该知道 Milvus
@@ -52,10 +52,9 @@ def create_vector_store(settings: object):
     这是 RAG 索引层的唯一入口。
     settings.vector_store_type 决定返回哪种后端：
       - "milvus" / "zilliz"：返回 MilvusVectorStore。
-      - 其他值：返回 None，由 LlamaIndex 使用本地存储。
+      - 生产模式只允许 "milvus" / "zilliz"。
 
     Returns:
-        None                  — 使用 LlamaIndex 默认本地存储
         MilvusVectorStore     — Milvus 向量数据库
 
     KnowledgeRetrievalService 接收此返回值，传入 StorageContext：
@@ -70,8 +69,9 @@ def create_vector_store(settings: object):
     if store_type in {"milvus", "zilliz"}:
         return _create_milvus_store(settings)
 
-    logger.info("RAG 向量存储使用本地文件系统（VECTOR_STORE_TYPE=local）")
-    return None
+    raise RuntimeError(
+        f"生产模式只允许使用 Milvus/Zilliz 向量库，当前 VECTOR_STORE_TYPE={store_type!r}。"
+    )
 
 
 def _create_milvus_store(settings: object):
@@ -117,13 +117,12 @@ def _create_milvus_store(settings: object):
         )
         return vector_store
 
-    except ImportError:
-        return _fallback_or_raise(
-            settings,
-            "pymilvus 或 llama-index-vector-stores-milvus 未安装，无法使用 Milvus 向量库。",
-        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "pymilvus 或 llama-index-vector-stores-milvus 未安装，无法使用 Milvus 向量库。"
+        ) from exc
     except Exception as exc:
-        return _fallback_or_raise(settings, f"Milvus 连接失败（{config.uri}）：{exc}")
+        raise RuntimeError(f"Milvus 连接失败（{config.uri}），生产模式拒绝降级：{exc}") from exc
 
 
 def _milvus_runtime_config(settings: object) -> MilvusRuntimeConfig:
@@ -131,9 +130,9 @@ def _milvus_runtime_config(settings: object) -> MilvusRuntimeConfig:
     host = getattr(settings, "milvus_host", "localhost")
     port = getattr(settings, "milvus_port", 19530)
     uri = getattr(settings, "milvus_uri", "") or f"http://{host}:{port}"
-    collection = getattr(settings, "milvus_collection", "knowledge_base")
+    collection = getattr(settings, "milvus_collection", "knowledge_base_1024")
     alias = getattr(settings, "milvus_alias", "") or f"rag_{collection}"
-    configured_dim = int(getattr(settings, "milvus_dim", 512))
+    configured_dim = int(getattr(settings, "milvus_dim", 1024))
     gateway_dim = _embedding_dimension_from_gateway(settings)
     dim = gateway_dim or configured_dim
     if gateway_dim and gateway_dim != configured_dim:
@@ -179,10 +178,9 @@ def _safe_milvus_alias(alias: str) -> str:
 def _prepare_milvus_with_pymilvus(config: MilvusRuntimeConfig) -> None:
     """使用 pymilvus 管理连接、database 和 collection 生命周期。
 
-    为什么这里还要用 pymilvus？
     LlamaIndex 的 MilvusVectorStore 很适合接入索引写入，但企业项目里通常还需要
     显式管理连接、数据库、覆盖策略、健康检查和 collection load。
-    这些属于基础设施生命周期，用 pymilvus 表达更清楚，也更容易被面试官理解。
+    这些属于基础设施生命周期，用 pymilvus 表达更直接。
     """
     from pymilvus import Collection, connections, db, utility
 
@@ -252,15 +250,3 @@ def _collection_vector_dim(collection: object) -> int | None:
         logger.warning("读取 Milvus collection 维度失败：%s", exc)
     return None
 
-
-def _fallback_or_raise(settings: object, message: str):
-    """Milvus 不可用时的降级策略。
-
-    本地开发默认允许 fallback 到本地向量存储，保证项目能跑起来。
-    生产环境建议设置 VECTOR_STORE_FALLBACK_TO_LOCAL=false，
-    避免 Milvus 挂了以后系统静默降级，导致检索结果和线上预期不一致。
-    """
-    if bool(getattr(settings, "vector_store_fallback_to_local", True)):
-        logger.warning("%s 已回退本地向量存储。", message)
-        return None
-    raise RuntimeError(message)

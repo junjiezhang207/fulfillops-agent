@@ -1,3 +1,13 @@
+---
+category: stockout_rule
+title: 缺货履约规则
+owner: fulfillment-ops
+version: v1
+effective_date: 2026-01-01
+business_scope: [库存, 缺货, 跨仓调拨]
+region: all
+---
+
 # 缺货履约规则
 
 当订单出现 SKU 库存不足时，系统需要按照以下顺序处理：

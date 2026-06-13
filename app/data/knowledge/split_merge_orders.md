@@ -1,3 +1,13 @@
+---
+category: split_merge_rule
+title: 拆单与合单履约规则
+owner: fulfillment-ops
+version: v1
+effective_date: 2026-01-01
+business_scope: [拆单, 合单, 子单]
+region: all
+---
+
 # 拆单与合单履约规则
 
 拆单和合单是供应链履约中高频出现的场景。

@@ -31,6 +31,8 @@ from app.application.memory.session_memory_service import (
     SessionMemoryService,
 )
 from app.application.workflow.workflow_service import WorkflowService
+from app.infrastructure.llm.model_gateway import get_model_gateway
+from app.observability.business_trace import add_trace_step
 
 
 @dataclass
@@ -45,9 +47,9 @@ class HybridResult:
     # 用户原始问题。
     question: str
     # 实际使用的路径。
-    path_used: str  # "workflow" | "agent" | "rag" | "multi_agent"
+    path_used: str  # "workflow" | "agent" | "rag" | "multi_agent" | "chat"
     # 意图分类等级。
-    intent_level: str  # "simple" | "rag" | "medium" | "complex" | "multi_domain"
+    intent_level: str  # "simple" | "rag" | "medium" | "complex" | "multi_domain" | "casual"
     # 分类置信度。
     confidence: float
     # 最终给用户看的回答。
@@ -120,7 +122,7 @@ class HybridService:
 
     def process(
         self,
-        order_id: str,
+        order_id: str | None,
         question: str,
         filter_categories: list = None,
         thread_id: Optional[str] = None,
@@ -128,6 +130,7 @@ class HybridService:
         """处理请求，根据意图复杂度动态选择路径。
 
         路由规则：
+          CASUAL       → 普通聊天（不调用业务工具）
           SIMPLE       → Workflow（支持 HITL 中断）
           RAG          → RAG 知识检索
           MEDIUM       → Agent
@@ -140,20 +143,29 @@ class HybridService:
 
         if filter_categories is None:
             filter_categories = []
+        normalized_order_id = (order_id or "").strip()
 
         # 第零步：检查响应缓存。这里只缓存低风险 completed 结果，不缓存 HITL/错误/高风险决策。
         cache_hit = False
         from_cache = False
         cache_context = self._cache_context(filter_categories)
         if self.response_cache:
-            cached_entry = self.response_cache.get(order_id, question, cache_context=cache_context)
+            cached_entry = self.response_cache.get(normalized_order_id, question, cache_context=cache_context)
             if cached_entry:
                 # 缓存命中时直接返回，不再走分类/Agent/Workflow。
                 cache_hit = True
                 from_cache = True
                 execution_time_ms = (time.time() - start_time) * 1000
+                add_trace_step(
+                    step_type="router",
+                    name="hybrid_response_cache",
+                    status="success",
+                    duration_ms=execution_time_ms,
+                    summary="Hybrid 响应缓存命中",
+                    metadata={"path_used": cached_entry.path_used, "cache_hit": True},
+                )
                 return HybridResult(
-                    order_id=order_id,
+                    order_id=normalized_order_id,
                     question=question,
                     path_used=cached_entry.path_used,
                     intent_level="cached",
@@ -175,36 +187,68 @@ class HybridService:
                 conversation_turns = session.conversation_turns + 1
             else:
                 # 新会话：创建 SessionContext。
-                session = SessionContext(thread_id=thread_id, order_id=order_id)
+                session = SessionContext(thread_id=thread_id, order_id=normalized_order_id)
                 self.session_cache.set_session(session)
                 conversation_turns = 1
 
         # 第二步：意图分类。优先大模型 JSON 路由，失败时回退规则分类器。
-        classification = self._classify_intent(order_id, question or "")
+        classification = self._classify_intent(normalized_order_id, question or "")
+        if not normalized_order_id and classification.level != IntentLevel.CASUAL:
+            classification = IntentClassificationResult(
+                level=IntentLevel.RAG,
+                score=max(classification.score, 0.86),
+                primary_keywords=classification.primary_keywords,
+                reasoning=f"无订单号请求，跳过订单链路，按知识库 RAG 检索处理；原路由：{classification.level.value}",
+            )
+        add_trace_step(
+            step_type="router",
+            name="hybrid_router",
+            status="success",
+            summary=f"识别意图并路由为 {classification.level.value}",
+            input_summary={"order_id": normalized_order_id or None, "question": question},
+            metadata={
+                "intent_level": classification.level.value,
+                "confidence": classification.score,
+                "reasoning": classification.reasoning,
+                "keywords": classification.primary_keywords,
+            },
+        )
 
         # 第三步：根据分类选择路径
-        if classification.level == IntentLevel.MULTI_DOMAIN:
+        if classification.level == IntentLevel.CASUAL:
+            path_result = self._run_casual_path(question)
+        elif classification.level == IntentLevel.MULTI_DOMAIN:
             # 跨领域复杂问题优先走多 Agent。
-            path_result = self._run_multi_agent_path(order_id, question, thread_id)
+            path_result = self._run_multi_agent_path(normalized_order_id, question, thread_id)
         elif classification.level == IntentLevel.RAG:
             # 规则、SOP、政策依据类问题走 RAG。
-            path_result = self._run_rag_path(order_id, question, filter_categories)
+            path_result = self._run_rag_path(normalized_order_id, question, filter_categories)
         elif classification.level == IntentLevel.COMPLEX:
             # 单域复杂问题走 ReAct Agent。
-            path_result = self._run_agent_path(order_id, question)
+            path_result = self._run_agent_path(normalized_order_id, question)
         elif classification.level == IntentLevel.MEDIUM:
-            path_result = self._run_agent_path(order_id, question)
+            path_result = self._run_agent_path(normalized_order_id, question)
         else:
             # SIMPLE → Workflow（带 HITL 支持）
             path_result = self._run_workflow_with_hitl(
-                order_id, question, filter_categories, thread_id
+                normalized_order_id, question, filter_categories, thread_id
             )
+        add_trace_step(
+            step_type="hybrid_path",
+            name=path_result.get("path", "unknown"),
+            status=path_result.get("status", "completed"),
+            summary=f"Hybrid 选择链路：{path_result.get('path', 'unknown')}",
+            metadata={
+                "tools_called": path_result.get("tools_called", []),
+                "has_interrupt": bool(path_result.get("interrupt")),
+            },
+        )
 
         execution_time_ms = (time.time() - start_time) * 1000
 
         # 把底层路径返回的 dict 包成统一 HybridResult。
         result = HybridResult(
-            order_id=order_id,
+            order_id=path_result.get("order_id") or normalized_order_id,
             question=question,
             path_used=path_result["path"],
             intent_level=classification.level.value,
@@ -226,7 +270,7 @@ class HybridService:
         if self.response_cache:
             # set 返回值这里不强依赖，因为是否缓存由策略决定。
             self.response_cache.set(
-                order_id=order_id,
+                order_id=normalized_order_id,
                 question=question,
                 answer=path_result["reply"],
                 path_used=path_result["path"],
@@ -249,6 +293,25 @@ class HybridService:
                     "intent_reasoning": classification.reasoning,
                 }
                 self.session_cache.set_session(session)
+
+        add_trace_step(
+            step_type="evaluation",
+            name="hybrid_quality_snapshot",
+            status="success" if result.status != "error" else "error",
+            summary="Hybrid 响应质量闭环快照",
+            metadata={
+                "path_used": result.path_used,
+                "intent_level": result.intent_level,
+                "confidence": result.confidence,
+                "has_final_answer": bool(result.final_answer),
+                "final_answer_length": len(result.final_answer or ""),
+                "tools_called_count": len(result.tools_called),
+                "status": result.status,
+                "hitl_required": result.status == "interrupted",
+                "from_cache": result.from_cache,
+                "execution_time_ms": result.execution_time_ms,
+            },
+        )
 
         return result
 
@@ -274,11 +337,32 @@ class HybridService:
         start_time = time.time()
 
         # resume 只恢复 Workflow，因为 HITL 中断来自 Workflow LangGraph。
-        stream_result = self.workflow_service.resume(thread_id, decision)
+        from app.schemas.workflow import ApprovalRequest
+
+        stream_result = self.workflow_service.resume(
+            thread_id,
+            ApprovalRequest(
+                decision=decision,
+                reason=notes or "人工审核未填写备注。",
+                approver_id="frontend-user",
+            ),
+        )
 
         execution_time_ms = (time.time() - start_time) * 1000
 
         if stream_result["status"] == "interrupted":
+            add_trace_step(
+                step_type="workflow",
+                name="fulfillment_workflow",
+                status="interrupted",
+                summary="Workflow 暂停，等待人工审核",
+                metadata={
+                    "thread_id": thread_id,
+                    "interrupt": stream_result["interrupt"].model_dump()
+                    if stream_result["interrupt"]
+                    else None,
+                },
+            )
             # 如果恢复后又遇到新的中断，继续把 interrupt 透传给前端。
             return HybridResult(
                 order_id="",
@@ -298,6 +382,17 @@ class HybridService:
 
         result = stream_result.get("result")
         if result:
+            add_trace_step(
+                step_type="workflow",
+                name="fulfillment_workflow",
+                status="success",
+                summary="Workflow 执行完成",
+                metadata={
+                    "thread_id": thread_id,
+                    "node_count": len(result.trace or []),
+                    "errors": [str(item) for item in (result.errors or [])[:5]],
+                },
+            )
             # WorkflowRunResult 中 final_answer 是结构化对象，取 conclusion 给前端。
             final_answer = result.final_answer.conclusion if result.final_answer else ""
         else:
@@ -320,32 +415,26 @@ class HybridService:
     # 路径实现
     # =========================================================================
 
-    def _classify_intent(self, order_id: str, question: str) -> IntentClassificationResult:
+    def _classify_intent(self, order_id: str | None, question: str) -> IntentClassificationResult:
         """优先用大模型识别路由目标，失败后回退规则分类器。"""
         fallback = self.classifier.classify(question or "")
         if self.intent_model is None:
             return fallback
 
-        prompt = f"""你是电商供应链系统的意图路由器。请只输出 JSON，不要解释。
-
-可选 route:
-- workflow: 固定履约判断、库存是否可发、订单是否满足履约条件、需要可审计流程/HITL。
-- rag: 规则、SOP、政策、知识库依据、售后制度、缺货/跨仓/优先级规则问答。
-- agent: 开放式分析、需要自主调用工具、替代品、履约建议、单域多步骤推理。
-- multi_agent: 同时涉及库存、履约、风险、成本、时效、仓库协同等多个领域的复杂综合问题。
-
-订单: {order_id}
-用户问题: {question or "按默认履约问题分析"}
-
-输出格式:
-{{"route":"workflow|rag|agent|multi_agent","confidence":0.0到1.0,"reasoning":"一句话理由","keywords":["关键词1","关键词2"]}}
-"""
+        prompt = (
+            f"{get_model_gateway().prompt_system(use_case='hybrid_router')}\n\n"
+            f"订单: {order_id}\n"
+            f"用户问题: {question or '按默认履约问题分析'}\n"
+        )
         try:
             response = self.intent_model.invoke(prompt)
             content = getattr(response, "content", response)
             payload = self._parse_intent_json(str(content))
             route = str(payload.get("route", "")).strip().lower()
             level_map = {
+                "casual": IntentLevel.CASUAL,
+                "chat": IntentLevel.CASUAL,
+                "smalltalk": IntentLevel.CASUAL,
                 "workflow": IntentLevel.SIMPLE,
                 "rag": IntentLevel.RAG,
                 "agent": IntentLevel.COMPLEX,
@@ -360,19 +449,16 @@ class HybridService:
             if not isinstance(keywords, list):
                 keywords = fallback.primary_keywords
             reasoning = str(payload.get("reasoning") or "LLM intent routing")
-            # 大模型有时会把“生成方案/综合建议”过度保守地判成 workflow。
-            # 如果规则分类器对 RAG / Agent / Multi-Agent 有较强信号，就用规则结果纠偏。
-            if (
-                level == IntentLevel.SIMPLE
-                and fallback.level != IntentLevel.SIMPLE
-                and fallback.score >= 0.7
-            ):
-                return IntentClassificationResult(
-                    level=fallback.level,
-                    score=fallback.score,
-                    primary_keywords=fallback.primary_keywords,
-                    reasoning=f"规则纠偏：LLM 判为 workflow，但问题命中 {fallback.level.value} 强信号；{fallback.reasoning}",
-                )
+            reconciled = self._reconcile_intent(
+                llm_level=level,
+                llm_confidence=confidence,
+                llm_keywords=[str(item) for item in keywords[:5]],
+                llm_reasoning=reasoning,
+                fallback=fallback,
+                question=question,
+            )
+            if reconciled is not None:
+                return reconciled
             return IntentClassificationResult(
                 level=level,
                 score=max(0.0, min(confidence, 1.0)),
@@ -381,6 +467,79 @@ class HybridService:
             )
         except Exception:
             return fallback
+
+    def _reconcile_intent(
+        self,
+        *,
+        llm_level: IntentLevel,
+        llm_confidence: float,
+        llm_keywords: list[str],
+        llm_reasoning: str,
+        fallback: IntentClassificationResult,
+        question: str,
+    ) -> IntentClassificationResult | None:
+        """融合 LLM 路由和规则强信号，避免单边误判。"""
+        safe_confidence = max(0.0, min(float(llm_confidence), 1.0))
+        text = (question or "").lower()
+
+        # 日常问题必须保持轻量，不要因为前端带了 order_id 就进入履约 workflow。
+        if fallback.level == IntentLevel.CASUAL and fallback.score >= 0.85:
+            return fallback
+
+        # 硬业务状态判断：模型误判为 agent/rag 时，仍优先 workflow。
+        if self.classifier._is_fixed_workflow_question(text) and llm_level != IntentLevel.RAG:
+            return IntentClassificationResult(
+                level=IntentLevel.SIMPLE,
+                score=max(0.9, safe_confidence),
+                primary_keywords=fallback.primary_keywords or llm_keywords,
+                reasoning=f"规则强纠偏：固定履约状态判断优先 Workflow；LLM: {llm_reasoning}",
+            )
+
+        # 明确规则/SOP/政策问题：模型误判为 workflow/agent 时，优先 RAG。
+        if (
+            self.classifier._is_explicit_rag_question(text)
+            and not self.classifier._is_plan_or_advice_question(text)
+            and llm_level != IntentLevel.MULTI_DOMAIN
+        ):
+            return IntentClassificationResult(
+                level=IntentLevel.RAG,
+                score=max(0.88, safe_confidence),
+                primary_keywords=fallback.primary_keywords or llm_keywords,
+                reasoning=f"规则强纠偏：明确询问规则/SOP/政策依据，优先 RAG；LLM: {llm_reasoning}",
+            )
+
+        # 多域强信号优先 Multi-Agent，尤其是模型保守判成 workflow 的时候。
+        if fallback.level == IntentLevel.MULTI_DOMAIN and fallback.score >= 0.75:
+            return IntentClassificationResult(
+                level=IntentLevel.MULTI_DOMAIN,
+                score=max(fallback.score, safe_confidence),
+                primary_keywords=fallback.primary_keywords or llm_keywords,
+                reasoning=f"规则强纠偏：命中多领域综合问题；{fallback.reasoning}",
+            )
+
+        # 低置信 LLM 不覆盖较强规则结论。
+        if safe_confidence < 0.62 and fallback.score >= 0.75:
+            return IntentClassificationResult(
+                level=fallback.level,
+                score=fallback.score,
+                primary_keywords=fallback.primary_keywords,
+                reasoning=f"低置信 LLM 回退规则：{fallback.reasoning}",
+            )
+
+        # LLM 把明显方案/建议类问题判成 workflow 时，使用规则侧的 Agent/Multi-Agent 信号。
+        if (
+            llm_level == IntentLevel.SIMPLE
+            and fallback.level in {IntentLevel.COMPLEX, IntentLevel.MULTI_DOMAIN, IntentLevel.RAG}
+            and fallback.score >= 0.7
+        ):
+            return IntentClassificationResult(
+                level=fallback.level,
+                score=fallback.score,
+                primary_keywords=fallback.primary_keywords,
+                reasoning=f"规则纠偏：LLM 判为 workflow，但问题命中 {fallback.level.value} 强信号；{fallback.reasoning}",
+            )
+
+        return None
 
     @staticmethod
     def _parse_intent_json(content: str) -> dict:
@@ -430,7 +589,27 @@ class HybridService:
         try:
             # run_stream 会返回 completed/interrupted/error 三种状态。
             stream_result = self.workflow_service.run_stream(request, effective_thread_id)
+            workflow_step = add_trace_step(
+                step_type="workflow",
+                name="fulfillment_workflow",
+                status=stream_result.get("status", "unknown"),
+                summary=f"Workflow run_stream 返回状态：{stream_result.get('status', 'unknown')}",
+                metadata={
+                    "thread_id": effective_thread_id,
+                    "has_interrupt": bool(stream_result.get("interrupt")),
+                    "has_result": bool(stream_result.get("result")),
+                },
+            )
         except Exception as exc:
+            add_trace_step(
+                step_type="workflow",
+                name="fulfillment_workflow",
+                status="error",
+                summary="Workflow 执行抛出异常",
+                error_code=exc.__class__.__name__,
+                error_message=str(exc),
+                metadata={"thread_id": effective_thread_id},
+            )
             return {
                 "path": "workflow",
                 "reply": f"Workflow error: {exc}",
@@ -440,6 +619,10 @@ class HybridService:
             }
 
         if stream_result["status"] == "interrupted":
+            self._record_workflow_node_trace(
+                stream_result.get("trace") or [],
+                parent_id=workflow_step.id if workflow_step else None,
+            )
             # HITL 中断时没有最终答案，前端需要展示 interrupt 等待人工处理。
             return {
                 "path": "workflow",
@@ -453,6 +636,10 @@ class HybridService:
 
         result = stream_result.get("result")
         if result:
+            self._record_workflow_node_trace(
+                result.trace,
+                parent_id=workflow_step.id if workflow_step else None,
+            )
             # completed 时提取最终结论和实际工具链路。
             final_answer = result.final_answer.conclusion if result.final_answer else ""
             tools_called = ["dispatch", "order_analysis", "inventory_analysis"]
@@ -475,7 +662,34 @@ class HybridService:
             "interrupt": None,
             }
 
-    def _run_rag_path(self, order_id: str, question: str, filter_categories: list) -> dict:
+    @staticmethod
+    def _record_workflow_node_trace(trace_events: list, parent_id: str | None = None) -> None:
+        """把 Workflow 内部节点 trace 展开写入业务 Trace。
+
+        WorkflowRunResult.trace 是 LangGraph state 内的节点级轨迹；BusinessTrace
+        是前端 Trace Center 使用的统一轨迹。这里做一次桥接，避免 Hybrid 页面
+        只能看到一个折叠的 fulfillment_workflow 步骤。
+        """
+        status_map = {"ok": "success", "error": "error", "skipped": "skipped"}
+        for event in trace_events or []:
+            status = status_map.get(getattr(event, "status", ""), "success")
+            add_trace_step(
+                step_type="workflow_node",
+                name=getattr(event, "node", "workflow_node"),
+                parent_id=parent_id,
+                status=status,
+                duration_ms=float(getattr(event, "elapsed_ms", 0) or 0),
+                summary=getattr(event, "note", "") or "",
+                started_at=getattr(event, "start_ts", None).isoformat()
+                if getattr(event, "start_ts", None)
+                else None,
+                ended_at=getattr(event, "end_ts", None).isoformat()
+                if getattr(event, "end_ts", None)
+                else None,
+                metadata={"source": "workflow_state_trace"},
+            )
+
+    def _run_rag_path(self, order_id: str | None, question: str, filter_categories: list) -> dict:
         """运行 RAG 路径，专门回答规则、SOP、政策依据类问题。"""
         try:
             result = self.knowledge_service.retrieve(
@@ -491,6 +705,7 @@ class HybridService:
                 parts.append("建议动作：\n" + "\n".join(f"- {item}" for item in summary.suggested_actions[:5]))
             return {
                 "path": "rag",
+                "order_id": result.order_id,
                 "reply": "\n\n".join(parts),
                 "tools_called": ["knowledge_retrieval", "hybrid_rag"],
                 "status": "completed",
@@ -505,8 +720,32 @@ class HybridService:
                 "interrupt": None,
             }
 
+    def _run_casual_path(self, question: str) -> dict:
+        """运行普通闲聊路径，不调用订单、库存、RAG 或 Agent 工具。"""
+        if self.intent_model is None:
+            reply = "你好，我是 Multiship 智能履约助手。你可以问我订单库存、缺货规则、履约方案或风险评估。"
+        else:
+            prompt = (
+                f"{get_model_gateway().prompt_system(use_case='casual_chat')}\n\n"
+                f"用户：{question or '你好'}"
+            )
+            try:
+                response = self.intent_model.invoke(prompt)
+                reply = str(getattr(response, "content", response)).strip()
+            except Exception:
+                reply = "你好，我是 Multiship 智能履约助手。你可以问我订单库存、缺货规则、履约方案或风险评估。"
+        return {
+            "path": "chat",
+            "reply": reply,
+            "tools_called": [],
+            "status": "completed",
+            "interrupt": None,
+        }
+
     def _run_agent_path(self, order_id: str, question: str) -> dict:
         """运行 Agent 路径。"""
+        if not order_id:
+            return self._run_rag_path(order_id, question, [])
         if self.agent_service is None:
             return self._run_workflow_fallback(order_id, question, [])
         try:
@@ -538,6 +777,8 @@ class HybridService:
 
         不可用时依次降级：Multi-Agent → Agent → Workflow。
         """
+        if not order_id:
+            return self._run_rag_path(order_id, question, [])
         if self.multi_agent_service is None:
             # 没注入 MultiAgentService 时自动降级到单 Agent。
             return self._run_agent_path(order_id, question)
@@ -601,12 +842,13 @@ class HybridService:
             "simple_threshold": self.simple_threshold,
             "complex_threshold": self.complex_threshold,
             "available_paths": [
+                "chat",
                 "workflow",
                 "rag",
                 "agent",
                 *(["multi_agent"] if self.multi_agent_service else []),
             ],
-            "description": "4-way routing: Workflow + RAG + Agent + Multi-Agent (with HITL)",
+            "description": "5-way routing: Chat + Workflow + RAG + Agent + Multi-Agent (with HITL)",
         }
 
     @staticmethod

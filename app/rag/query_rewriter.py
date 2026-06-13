@@ -22,6 +22,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
+from app.infrastructure.llm.model_gateway import get_model_gateway
+
 logger = logging.getLogger(__name__)
 
 # Query Rewrite 的提示词。
@@ -29,16 +31,9 @@ logger = logging.getLogger(__name__)
 _REWRITE_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "你是一个供应链履约领域的检索专家。"
-        "你的任务是把用户的原始问题改写成 {n} 个不同角度的检索查询，"
-        "每个查询单独成行，不加序号或符号前缀。"
-        "改写要求：\n"
-        "1. 每条查询聚焦一个具体维度（库存、规则、方案、风险等）\n"
-        "2. 使用领域关键词（履约、缺货、SKU、仓库、优先级等）\n"
-        "3. 避免重复，角度要有差异性\n"
-        "4. 保持简洁，每条不超过 20 字",
+        get_model_gateway().prompt_system(use_case="rag_rewrite"),
     ),
-    ("human", "原始问题：{question}"),
+    ("human", "请把原始问题改写成 {n} 个不同角度的检索查询。\n原始问题：{question}"),
 ])
 
 

@@ -1,17 +1,11 @@
 """库存分析 API。
 
-文件作用摘要：
-这个文件暴露 ``POST /inventory/analyze``，根据订单号判断库存是否足够、哪些 SKU 缺货、
+本模块暴露 ``POST /inventory/analyze``，根据订单号判断库存是否足够、哪些 SKU 缺货、
 履约是否有风险。它是订单分析之后的第二个基础业务接口。
 
-学习重点：
-1. 库存判断需要先知道订单明细，所以 service 层会间接依赖订单分析能力。
-2. 路由层不做库存计算，只负责把请求交给 ``InventoryAnalysisService``。
-3. 如果订单不存在，依旧返回 404；这是因为库存判断的前置数据缺失。
-
-面试官可能问：为什么不直接在 API 里查库存？
-回答：API 层直接查库存会让 HTTP 代码和业务规则耦合。把库存规则放进 service 后，
-Agent 工具、Workflow 节点、测试用例都可以复用同一套逻辑。
+路由层不做库存计算，只负责把请求交给 ``InventoryAnalysisService``，
+并把业务异常转换成 HTTP 状态码。库存规则保留在 service 层，供 API、Agent 工具、
+Workflow 节点和测试复用。
 """
 
 from fastapi import APIRouter, HTTPException, status

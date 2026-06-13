@@ -1,15 +1,19 @@
-"""Enterprise data repository.
+"""企业结构化数据 MySQL 仓储。
 
-Learning notes:
-- Stores structured orders and inventory imported from ERP/OMS/WMS or offline files.
-- Current storage is local JSON for demo purposes; the interface can later map to SQL/API storage.
-- Orders and inventory are structured business data, not RAG documents.
+生产边界：
+- 订单和库存是实时/准实时结构化业务数据，不能放进 RAG。
+- 本仓储只读写 MySQL，不再使用本地 JSON 文件。
+- 没有查到订单或库存时直接返回空结果，不再回退 demo 数据。
 """
+
+from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
-from threading import RLock
+from typing import Any
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.order_repository import OrderRepository
@@ -22,25 +26,39 @@ from app.schemas.inventory import InventoryRecord
 from app.schemas.orders import OrderRecord
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _json_dump(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _json_load(payload: str | bytes | None) -> Any:
+    if not payload:
+        return {}
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8")
+    return json.loads(payload)
+
+
 class EnterpriseDataRepository(OrderRepository, InventoryRepository):
-    """企业业务数据的本地持久化仓库。
+    """企业订单和库存的 MySQL 仓储。
 
-    这层不要和 RAG 混在一起：
-    - RAG 适合存制度、规则、说明文档这类非结构化知识。
-    - 订单、库存是强结构化业务数据，应该走仓库接口，被服务层直接查询。
-
-    当前实现用 JSON 文件落盘，方便面试演示和本地调试；接口边界已经按仓库层
-    设计好，后续替换成 MySQL/ERP API 时，上层服务基本不用改。
+    这里是生产版数据入口。上层 Workflow、Agent 和 RAG query planning 都只依赖
+    OrderRepository / InventoryRepository 接口，不关心数据来自 OMS、WMS 还是导入表。
     """
 
-    def __init__(self, data_dir: str | Path) -> None:
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = RLock()
-        self._sources_file = self.data_dir / "sources.json"
-        self._orders_file = self.data_dir / "orders.json"
-        self._inventory_file = self.data_dir / "inventory.json"
-        self._ensure_files()
+    def __init__(self, mysql_url: str) -> None:
+        if not mysql_url:
+            raise RuntimeError("企业数据仓储必须配置 MYSQL_URL，生产模式不允许使用本地文件。")
+        self.mysql_url = mysql_url
+        self._engine = create_engine(mysql_url, pool_pre_ping=True, pool_recycle=1800, future=True)
+        self._init_schema()
+
+    @property
+    def engine(self) -> Engine:
+        return self._engine
 
     def create_source(
         self,
@@ -48,65 +66,78 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
         *,
         allow_update: bool = False,
     ) -> EnterpriseDataSourceInfo:
-        """登记一个企业数据源。
+        source_id = (
+            self.normalize_source_id(request.source_id)
+            if request.source_id is not None
+            else self._build_source_id(request.name)
+        )
+        now = _utc_now()
+        existing = self._get_source_row(source_id)
+        if existing and not allow_update:
+            raise ValueError(f"数据源已存在：{source_id}")
 
-        allow_update 给后台配置页使用：同一个 source_id 再提交时可以更新名称、
-        描述和连接配置，而不会误删已经导入的业务数据。
-        """
-
-        with self._lock:
-            sources = self._read_sources()
-            source_id = (
-                self.normalize_source_id(request.source_id)
-                if request.source_id is not None
-                else self._build_source_id(request.name, sources)
-            )
-
-            now = datetime.now(timezone.utc)
-            if source_id in sources and not allow_update:
-                raise ValueError(f"数据源已存在：{source_id}")
-
-            existing = sources.get(source_id)
-            info = EnterpriseDataSourceInfo(
-                source_id=source_id,
-                name=request.name,
-                source_type=request.source_type,
-                description=request.description,
-                config=request.config,
-                enabled=request.enabled,
-                created_at=existing.created_at if existing else now,
-                updated_at=now,
-            )
-            sources[source_id] = self._attach_counts(info)
-            self._write_sources(sources)
-            return sources[source_id]
+        with self._engine.begin() as conn:
+            if existing:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE enterprise_data_sources
+                        SET name=:name, source_type=:source_type, description=:description,
+                            config_json=:config_json, enabled=:enabled, updated_at=:updated_at
+                        WHERE source_id=:source_id
+                        """
+                    ),
+                    {
+                        "source_id": source_id,
+                        "name": request.name,
+                        "source_type": str(request.source_type),
+                        "description": request.description,
+                        "config_json": _json_dump(request.config),
+                        "enabled": bool(request.enabled),
+                        "updated_at": now,
+                    },
+                )
+            else:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO enterprise_data_sources (
+                            source_id, name, source_type, description, config_json,
+                            enabled, created_at, updated_at
+                        ) VALUES (
+                            :source_id, :name, :source_type, :description, :config_json,
+                            :enabled, :created_at, :updated_at
+                        )
+                        """
+                    ),
+                    {
+                        "source_id": source_id,
+                        "name": request.name,
+                        "source_type": str(request.source_type),
+                        "description": request.description,
+                        "config_json": _json_dump(request.config),
+                        "enabled": bool(request.enabled),
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+        return self._attach_counts(self._row_to_source(self._get_source_row(source_id)))
 
     def list_sources(self) -> list[EnterpriseDataSourceInfo]:
-        with self._lock:
-            sources = self._read_sources()
-            return [self._attach_counts(source) for source in sources.values()]
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT * FROM enterprise_data_sources ORDER BY created_at DESC")
+            ).mappings().all()
+        return [self._attach_counts(self._row_to_source(row)) for row in rows]
 
     def delete_source(self, source_id: str) -> bool:
-        """删除数据源，同时删除该来源下已经导入的订单和库存。"""
-
-        with self._lock:
-            source_id = self.normalize_source_id(source_id)
-            sources = self._read_sources()
-            if source_id not in sources:
-                return False
-
-            sources.pop(source_id)
-            orders = {
-                order_id: entry
-                for order_id, entry in self._read_orders().items()
-                if entry["source_id"] != source_id
-            }
-            inventory = self._remove_inventory_by_source(source_id)
-
-            self._write_sources(sources)
-            self._write_json(self._orders_file, orders)
-            self._write_json(self._inventory_file, inventory)
-            return True
+        source_id = self.normalize_source_id(source_id)
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text("DELETE FROM enterprise_data_sources WHERE source_id=:source_id"),
+                {"source_id": source_id},
+            )
+        return bool(result.rowcount)
 
     def import_orders(
         self,
@@ -115,33 +146,47 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
         *,
         replace_source: bool = False,
     ) -> int:
-        """导入企业订单。
-
-        同一个 order_id 后导入会覆盖先导入的数据，这符合大多数后台同步语义：
-        企业系统里的订单状态、优先级、明细可能发生变化，分析时应取最新快照。
-        """
-
-        with self._lock:
-            source_id = self.normalize_source_id(source_id)
-            self._ensure_source_exists(source_id)
-            current = self._read_orders()
+        source_id = self.normalize_source_id(source_id)
+        self._ensure_source_exists(source_id)
+        now = _utc_now()
+        with self._engine.begin() as conn:
             if replace_source:
-                current = {
-                    order_id: entry
-                    for order_id, entry in current.items()
-                    if entry["source_id"] != source_id
-                }
-
+                conn.execute(text("DELETE FROM enterprise_orders WHERE source_id=:source_id"), {"source_id": source_id})
             for order in orders:
-                current[order.order_id] = {
-                    "source_id": source_id,
-                    "record": order.model_dump(mode="json"),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-
-            self._write_json(self._orders_file, current)
-            self._refresh_source_counts()
-            return len(orders)
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO enterprise_orders (
+                            order_id, source_id, platform, order_time, order_status,
+                            region, priority, record_json, updated_at
+                        ) VALUES (
+                            :order_id, :source_id, :platform, :order_time, :order_status,
+                            :region, :priority, :record_json, :updated_at
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            source_id=VALUES(source_id),
+                            platform=VALUES(platform),
+                            order_time=VALUES(order_time),
+                            order_status=VALUES(order_status),
+                            region=VALUES(region),
+                            priority=VALUES(priority),
+                            record_json=VALUES(record_json),
+                            updated_at=VALUES(updated_at)
+                        """
+                    ),
+                    {
+                        "order_id": order.order_id,
+                        "source_id": source_id,
+                        "platform": order.platform,
+                        "order_time": order.order_time,
+                        "order_status": order.order_status,
+                        "region": order.region,
+                        "priority": order.priority,
+                        "record_json": _json_dump(order.model_dump(mode="json")),
+                        "updated_at": now,
+                    },
+                )
+        return len(orders)
 
     def import_inventory(
         self,
@@ -150,78 +195,161 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
         *,
         replace_source: bool = False,
     ) -> int:
-        """导入企业库存快照。"""
-
-        with self._lock:
-            source_id = self.normalize_source_id(source_id)
-            self._ensure_source_exists(source_id)
-            inventory = self._read_inventory()
+        source_id = self.normalize_source_id(source_id)
+        self._ensure_source_exists(source_id)
+        now = _utc_now()
+        with self._engine.begin() as conn:
             if replace_source:
-                inventory = self._remove_inventory_by_source(source_id)
-
+                conn.execute(
+                    text("DELETE FROM enterprise_inventory WHERE source_id=:source_id"),
+                    {"source_id": source_id},
+                )
             for record in records:
-                inventory.setdefault(record.sku_id, [])
-                inventory[record.sku_id] = [
-                    entry
-                    for entry in inventory[record.sku_id]
-                    if not (
-                        entry["source_id"] == source_id
-                        and entry["record"]["warehouse_id"] == record.warehouse_id
-                    )
-                ]
-                inventory[record.sku_id].append(
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO enterprise_inventory (
+                            source_id, warehouse_id, warehouse_name, region, sku_id,
+                            available_stock, locked_stock, record_json, updated_at
+                        ) VALUES (
+                            :source_id, :warehouse_id, :warehouse_name, :region, :sku_id,
+                            :available_stock, :locked_stock, :record_json, :updated_at
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            warehouse_name=VALUES(warehouse_name),
+                            region=VALUES(region),
+                            available_stock=VALUES(available_stock),
+                            locked_stock=VALUES(locked_stock),
+                            record_json=VALUES(record_json),
+                            updated_at=VALUES(updated_at)
+                        """
+                    ),
                     {
                         "source_id": source_id,
-                        "record": record.model_dump(mode="json"),
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    }
+                        "warehouse_id": record.warehouse_id,
+                        "warehouse_name": record.warehouse_name,
+                        "region": record.region,
+                        "sku_id": record.sku_id,
+                        "available_stock": record.available_stock,
+                        "locked_stock": record.locked_stock,
+                        "record_json": _json_dump(record.model_dump(mode="json")),
+                        "updated_at": now,
+                    },
                 )
-
-            self._write_json(self._inventory_file, inventory)
-            self._refresh_source_counts()
-            return len(records)
+        return len(records)
 
     def get_order_by_id(self, order_id: str) -> OrderRecord | None:
-        with self._lock:
-            entry = self._read_orders().get(order_id)
-            if entry is None:
-                return None
-            return OrderRecord.model_validate(entry["record"])
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT record_json FROM enterprise_orders WHERE order_id=:order_id"),
+                {"order_id": order_id},
+            ).mappings().first()
+        if row is None:
+            return None
+        return OrderRecord.model_validate(_json_load(row["record_json"]))
+
+    def list_orders(self, limit: int = 100) -> list[OrderRecord]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT record_json FROM enterprise_orders ORDER BY updated_at DESC LIMIT :limit"),
+                {"limit": int(limit)},
+            ).mappings().all()
+        return [OrderRecord.model_validate(_json_load(row["record_json"])) for row in rows]
 
     def list_inventory_by_sku(self, sku_id: str) -> list[InventoryRecord]:
-        with self._lock:
-            entries = self._read_inventory().get(sku_id, [])
-            return [InventoryRecord.model_validate(entry["record"]) for entry in entries]
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT record_json FROM enterprise_inventory
+                    WHERE sku_id=:sku_id
+                    ORDER BY updated_at DESC
+                    """
+                ),
+                {"sku_id": sku_id},
+            ).mappings().all()
+        return [InventoryRecord.model_validate(_json_load(row["record_json"])) for row in rows]
 
     def stats(self) -> EnterpriseDataStats:
-        with self._lock:
-            orders = self._read_orders()
-            inventory = self._read_inventory()
-            return EnterpriseDataStats(
-                source_count=len(self._read_sources()),
-                order_count=len(orders),
-                inventory_record_count=sum(len(entries) for entries in inventory.values()),
-                inventory_sku_count=len(inventory),
-            )
+        with self._engine.connect() as conn:
+            source_count = conn.execute(text("SELECT COUNT(*) FROM enterprise_data_sources")).scalar_one()
+            order_count = conn.execute(text("SELECT COUNT(*) FROM enterprise_orders")).scalar_one()
+            inventory_count = conn.execute(text("SELECT COUNT(*) FROM enterprise_inventory")).scalar_one()
+            sku_count = conn.execute(text("SELECT COUNT(DISTINCT sku_id) FROM enterprise_inventory")).scalar_one()
+        return EnterpriseDataStats(
+            source_count=int(source_count),
+            order_count=int(order_count),
+            inventory_record_count=int(inventory_count),
+            inventory_sku_count=int(sku_count),
+        )
 
-    def _ensure_files(self) -> None:
-        if not self._sources_file.exists():
-            manual = EnterpriseDataSourceInfo(
-                source_id="manual",
-                name="手动导入",
-                source_type="manual",
-                description="后台手动 JSON 导入的数据源。",
-            )
-            self._write_json(self._sources_file, {"manual": manual.model_dump(mode="json")})
-        if not self._orders_file.exists():
-            self._write_json(self._orders_file, {})
-        if not self._inventory_file.exists():
-            self._write_json(self._inventory_file, {})
+    def normalize_source_id(self, source_id: str | None) -> str:
+        if source_id is None:
+            return "manual"
+        normalized = source_id.strip().lower().replace(" ", "-")
+        return normalized or "manual"
+
+    def _init_schema(self) -> None:
+        """初始化生产表结构。
+
+        这里直接在应用启动时建表，便于单体项目部署。更严格的生产环境可以把这些
+        DDL 迁移到 Alembic，但运行时仍保持同一套 Repository 接口。
+        """
+        with self._engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS enterprise_data_sources (
+                    source_id VARCHAR(128) PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    source_type VARCHAR(64) NOT NULL,
+                    description TEXT,
+                    config_json LONGTEXT NOT NULL,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at DATETIME(6) NOT NULL,
+                    updated_at DATETIME(6) NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS enterprise_orders (
+                    order_id VARCHAR(128) PRIMARY KEY,
+                    source_id VARCHAR(128) NOT NULL,
+                    platform VARCHAR(128),
+                    order_time DATETIME(6),
+                    order_status VARCHAR(128),
+                    region VARCHAR(128),
+                    priority VARCHAR(64),
+                    record_json LONGTEXT NOT NULL,
+                    updated_at DATETIME(6) NOT NULL,
+                    KEY idx_enterprise_orders_source (source_id),
+                    KEY idx_enterprise_orders_updated (updated_at),
+                    CONSTRAINT fk_enterprise_orders_source
+                        FOREIGN KEY (source_id) REFERENCES enterprise_data_sources(source_id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS enterprise_inventory (
+                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    source_id VARCHAR(128) NOT NULL,
+                    warehouse_id VARCHAR(128) NOT NULL,
+                    warehouse_name VARCHAR(255),
+                    region VARCHAR(128),
+                    sku_id VARCHAR(128) NOT NULL,
+                    available_stock INT NOT NULL,
+                    locked_stock INT NOT NULL,
+                    record_json LONGTEXT NOT NULL,
+                    updated_at DATETIME(6) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uq_enterprise_inventory_source_warehouse_sku (source_id, warehouse_id, sku_id),
+                    KEY idx_enterprise_inventory_sku (sku_id),
+                    KEY idx_enterprise_inventory_updated (updated_at),
+                    CONSTRAINT fk_enterprise_inventory_source
+                        FOREIGN KEY (source_id) REFERENCES enterprise_data_sources(source_id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """))
 
     def _ensure_source_exists(self, source_id: str) -> None:
-        source_id = self.normalize_source_id(source_id)
-        sources = self._read_sources()
-        if source_id in sources:
+        if self._get_source_row(source_id) is not None:
             return
         self.create_source(
             EnterpriseDataSourceCreate(
@@ -233,87 +361,49 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
             allow_update=True,
         )
 
-    def _read_sources(self) -> dict[str, EnterpriseDataSourceInfo]:
-        raw = self._read_json(self._sources_file)
-        return {
-            source_id: EnterpriseDataSourceInfo.model_validate(payload)
-            for source_id, payload in raw.items()
-        }
+    def _get_source_row(self, source_id: str):
+        with self._engine.connect() as conn:
+            return conn.execute(
+                text("SELECT * FROM enterprise_data_sources WHERE source_id=:source_id"),
+                {"source_id": source_id},
+            ).mappings().first()
 
-    def _write_sources(self, sources: dict[str, EnterpriseDataSourceInfo]) -> None:
-        self._write_json(
-            self._sources_file,
-            {
-                source_id: source.model_dump(mode="json")
-                for source_id, source in sources.items()
-            },
-        )
-
-    def _read_orders(self) -> dict[str, dict]:
-        return self._read_json(self._orders_file)
-
-    def _read_inventory(self) -> dict[str, list[dict]]:
-        return self._read_json(self._inventory_file)
-
-    def _read_json(self, path: Path) -> dict:
-        with path.open("r", encoding="utf-8") as fp:
-            return json.load(fp)
-
-    def _write_json(self, path: Path, payload: dict) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as fp:
-            json.dump(payload, fp, ensure_ascii=False, indent=2)
-
-    def _build_source_id(
-        self,
-        name: str,
-        sources: dict[str, EnterpriseDataSourceInfo],
-    ) -> str:
+    def _build_source_id(self, name: str) -> str:
         base = "-".join(name.strip().lower().split()) or "source"
         candidate = base
         index = 2
-        while candidate in sources:
+        while self._get_source_row(candidate) is not None:
             candidate = f"{base}-{index}"
             index += 1
         return candidate
 
-    def normalize_source_id(self, source_id: str | None) -> str:
-        if source_id is None:
-            return "manual"
-        normalized = source_id.strip().lower().replace(" ", "-")
-        return normalized or "manual"
-
-    def _remove_inventory_by_source(self, source_id: str) -> dict[str, list[dict]]:
-        inventory = self._read_inventory()
-        cleaned: dict[str, list[dict]] = {}
-        for sku_id, entries in inventory.items():
-            kept = [entry for entry in entries if entry["source_id"] != source_id]
-            if kept:
-                cleaned[sku_id] = kept
-        return cleaned
-
-    def _attach_counts(self, source: EnterpriseDataSourceInfo) -> EnterpriseDataSourceInfo:
-        orders = self._read_orders()
-        inventory = self._read_inventory()
-        return source.model_copy(
-            update={
-                "order_count": sum(
-                    1 for entry in orders.values() if entry["source_id"] == source.source_id
-                ),
-                "inventory_record_count": sum(
-                    1
-                    for entries in inventory.values()
-                    for entry in entries
-                    if entry["source_id"] == source.source_id
-                ),
-            }
+    def _row_to_source(self, row) -> EnterpriseDataSourceInfo:
+        if row is None:
+            raise ValueError("数据源不存在。")
+        return EnterpriseDataSourceInfo(
+            source_id=row["source_id"],
+            name=row["name"],
+            source_type=row["source_type"],
+            description=row["description"] or "",
+            config=_json_load(row["config_json"]),
+            enabled=bool(row["enabled"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
-    def _refresh_source_counts(self) -> None:
-        sources = self._read_sources()
-        self._write_sources(
-            {
-                source_id: self._attach_counts(source)
-                for source_id, source in sources.items()
+    def _attach_counts(self, source: EnterpriseDataSourceInfo) -> EnterpriseDataSourceInfo:
+        with self._engine.connect() as conn:
+            order_count = conn.execute(
+                text("SELECT COUNT(*) FROM enterprise_orders WHERE source_id=:source_id"),
+                {"source_id": source.source_id},
+            ).scalar_one()
+            inventory_count = conn.execute(
+                text("SELECT COUNT(*) FROM enterprise_inventory WHERE source_id=:source_id"),
+                {"source_id": source.source_id},
+            ).scalar_one()
+        return source.model_copy(
+            update={
+                "order_count": int(order_count),
+                "inventory_record_count": int(inventory_count),
             }
         )

@@ -100,7 +100,10 @@ class KnowledgeRetrieveRequest(BaseModel):
     - 过滤在重排前，保证最终结果仍然是按质量排序的。
     """
 
-    order_id: str = Field(..., description="订单编号。")
+    order_id: str | None = Field(
+        default=None,
+        description="订单编号。可选；不传时只检索知识库，不做订单和库存上下文增强。",
+    )
     question: str = Field(..., description="用户希望检索的业务问题。")
     filter_categories: list[str] = Field(
         default_factory=list,
@@ -132,7 +135,7 @@ class HybridScoreDetail(BaseModel):
     - semantic_score：LlamaIndex 混合召回返回的基础相关性分。
     - keyword_score：query 与 chunk 的业务关键词重合度。
     - business_rule_score：意图类别命中后的业务加权分。
-    - rerank_score：Cross-Encoder/Jina reranker 的归一化分。
+    - rerank_score：Cross-Encoder/DashScope reranker 的归一化分。
     - final_score：上面信号参与排序后的最终分。
     """
 
@@ -150,7 +153,7 @@ class HybridScoreDetail(BaseModel):
     )
     rerank_score: float = Field(
         default=0.0,
-        description="rerank 归一化分，来自 Cross-Encoder/Jina 等重排模型。",
+        description="rerank 归一化分，来自 Cross-Encoder/DashScope 等重排模型。",
     )
     final_score: float = Field(
         ...,
@@ -168,6 +171,12 @@ class KnowledgeMetadata(BaseModel):
     tags: list[str] = Field(..., description="知识标签。")
     source_file: str = Field(..., description="来源文件名。")
     source_path: str = Field(..., description="来源文件路径。")
+    version: str = Field(default="", description="知识版本号，来自 front matter。")
+    owner: str = Field(default="", description="知识负责人，来自 front matter。")
+    effective_date: str = Field(default="", description="生效日期，来自 front matter。")
+    expires_at: str = Field(default="", description="规则过期日期，来自 front matter；过期规则不会进入最终检索结果。")
+    region: str = Field(default="", description="适用区域，来自 front matter。")
+    business_scope: list[str] = Field(default_factory=list, description="适用业务范围。")
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,8 @@ import hashlib
 import json
 import logging
 import re
+import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,11 +66,13 @@ from app.schemas.knowledge import (
     QueryIntent,
     QueryIntentType,
 )
+from app.schemas.inventory import InventoryAnalysisResult
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.query_rewriter import QueryRewriter
 from app.rag.rag_answer_builder import RAGAnswerBuilder
 from app.rag.rag_query_planner import RAGQueryPlanner, RetrievalInputs
 from app.rag.reranker import ContextualCompressor, PassageReranker
+from app.observability.business_trace import add_trace_step
 
 
 logger = logging.getLogger(__name__)
@@ -81,6 +85,10 @@ CHUNK_OVERLAP = 40
 RETRIEVAL_TOP_K = 8
 # 最终返回给前端/Agent 的知识片段数量，控制回答上下文不要过长。
 FINAL_HIT_COUNT = 5
+# 无订单检索时使用的占位订单号。
+# 这个值不会真的去查 OMS/WMS，只是为了让返回结构里的 order_id 字段保持稳定，
+# 这样上层 Agent、Trace Center 和前端展示逻辑不用因为“有没有订单号”再写两套分支。
+KNOWLEDGE_ONLY_ORDER_ID = "ADHOC-KNOWLEDGE"
 # Cross-Encoder 精排时只处理前几个候选，避免本地小模型或云端 reranker 成本过高。
 RERANK_TOP_K = 8
 # 主意图对应知识类别的业务加权分。
@@ -134,6 +142,203 @@ CATEGORY_BY_INTENT = {
     QueryIntentType.GENERAL: "general",
 }
 
+CATEGORY_ALIASES = {
+    "stockout": "stockout_rule",
+    "缺货": "stockout_rule",
+    "缺货处理": "stockout_rule",
+    "priority": "priority_rule",
+    "优先级": "priority_rule",
+    "高优先级": "priority_rule",
+    "regional": "regional_strategy",
+    "区域履约": "regional_strategy",
+    "仓配策略": "regional_strategy",
+    "split": "split_merge_rule",
+    "split_merge": "split_merge_rule",
+    "拆单合单": "split_merge_rule",
+    "after_sales": "after_sales_rule",
+    "售后": "after_sales_rule",
+    "通用": "general",
+    "general": "general",
+}
+
+
+class KnowledgeFrontMatterExtractor(TransformComponent):
+    """读取 Markdown front matter，把显式业务 metadata 写入文档。
+
+    知识库文档可以在开头写类似这样的元信息：
+
+    ``category: priority_rule``
+    ``tags: [高优先级, 直发]``
+    ``expires_at: 2026-12-31``
+
+    这些字段不会直接参与正文切片，但会被写进 node.metadata，后面可以用于：
+    - 向量库 metadata filter，例如只检索某个 category。
+    - 前端展示来源、版本、负责人、失效时间。
+    - 注册表对比和旧 chunk 清理。
+    """
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "KnowledgeFrontMatterExtractor"
+
+    def __call__(self, nodes: list[BaseNode], **kwargs) -> list[BaseNode]:
+        for node in nodes:
+            # LlamaIndex 传进来的 node 此时还是整篇文档级别。
+            # 如果文档没有 front matter，就保持原样进入后续 Markdown 切片流程。
+            text = node.get_content()
+            parsed = self._parse_front_matter(text)
+            if parsed is None:
+                continue
+            metadata, body = parsed
+            # front matter 字段写入 metadata，正文只保留 body。
+            # 这样 embedding 时不会把 category/version 这类治理字段当作正文语义。
+            node.metadata.update(metadata)
+            node.metadata["frontmatter"] = metadata
+            node.set_content(body.strip())
+        return nodes
+
+    @classmethod
+    def _parse_front_matter(cls, text: str) -> tuple[dict[str, object], str] | None:
+        """解析 Markdown 开头的 ``---`` front matter。
+
+        返回值是 ``(metadata, body)``：
+        - metadata：解析出来的键值对。
+        - body：去掉 front matter 后的正文。
+
+        这里没有引入 PyYAML，是因为当前知识库只需要很轻量的 key/value 和列表解析；
+        保持纯文本解析能减少依赖，也方便面试时解释实现边界。
+        """
+        if not text.startswith("---"):
+            return None
+        match = re.match(r"\A---\s*\n(.*?)\n---\s*(?:\n|$)(.*)\Z", text, flags=re.DOTALL)
+        if not match:
+            return None
+        raw_meta, body = match.groups()
+        metadata: dict[str, object] = {}
+        for raw_line in raw_meta.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if not key:
+                continue
+            metadata[key] = cls._parse_front_matter_value(key, value)
+        return metadata, body
+
+    @staticmethod
+    def _parse_front_matter_value(key: str, value: str) -> object:
+        """把 front matter 字符串值转成更适合 metadata 的 Python 对象。"""
+        list_like_keys = {"tags", "aliases", "categories", "regions", "business_scope"}
+        if value.startswith("[") and value.endswith("]"):
+            raw_items = value[1:-1].split(",")
+            return [item.strip().strip("'\"") for item in raw_items if item.strip()]
+        if key in list_like_keys and "," in value:
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+
+class MarkdownSectionSplitter(TransformComponent):
+    """按 Markdown 标题优先切片，再用 SentenceSplitter 兜底处理长章节。
+
+    直接对整篇文档做固定长度切片的问题是：一个 chunk 可能跨越多个业务章节，
+    召回后很难解释“这段内容属于哪个 SOP 小节”。这里先按 Markdown 标题切出章节，
+    再对过长章节做 SentenceSplitter，可以同时保留章节路径和合理 chunk 长度。
+    """
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "MarkdownSectionSplitter"
+
+    def __call__(self, nodes: list[BaseNode], **kwargs) -> list[BaseNode]:
+        # SentenceSplitter 只负责把过长章节切短；章节识别由本类自己完成。
+        # include_metadata=False 很关键：切片长度只按正文计算，避免 metadata 太长影响切片。
+        splitter = SentenceSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            include_metadata=False,
+        )
+        output: list[BaseNode] = []
+        for node in nodes:
+            text = node.get_content()
+            if not text.strip():
+                continue
+            metadata = dict(node.metadata)
+            sections = self._split_markdown_sections(node.get_content())
+            if not sections:
+                # 没有 Markdown 标题时退回普通切片，保证纯文本/简单文档也能入库。
+                output.extend(self._split_with_metadata(splitter, text, metadata))
+                continue
+            for section_path, section_text in sections:
+                section_metadata = dict(metadata)
+                if section_path:
+                    # _markdown_title 和 _markdown_section_path 是临时字段，
+                    # 后面 BusinessMetadataEnricher 会转换成稳定的 title/section_path。
+                    section_metadata["_markdown_title"] = section_path[0]
+                    section_metadata["_markdown_section_path"] = section_path
+                output.extend(self._split_with_metadata(splitter, section_text.strip(), section_metadata))
+        return output
+
+    @staticmethod
+    def _split_with_metadata(
+        splitter: SentenceSplitter,
+        text: str,
+        metadata: dict[str, object],
+    ) -> list[BaseNode]:
+        """先按正文切片，再把 metadata 补回每个 chunk。
+
+        LlamaIndex 的 splitter 如果带着 metadata 一起算长度，较长的 tags/section_path
+        会挤占 chunk 预算，导致正文被切得过碎。这里先用空 metadata 切正文，
+        再把业务 metadata 复制回去，切片效果更稳定。
+        """
+
+        chunks = list(splitter([TextNode(text=text, metadata={})]))
+        for chunk in chunks:
+            chunk.metadata.update(metadata)
+        return chunks
+
+    @staticmethod
+    def _split_markdown_sections(text: str) -> list[tuple[list[str], str]]:
+        """按 Markdown 标题层级拆出章节文本。
+
+        返回的每一项是 ``(section_path, section_text)``：
+        - section_path：例如 ``["售后政策", "退货限制"]``。
+        - section_text：该标题下的正文，包含标题行本身。
+
+        这里保留标题行，是为了让 chunk 即使脱离原文，也带有最基本的语义提示。
+        """
+        heading_re = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+        sections: list[tuple[list[str], str]] = []
+        current_lines: list[str] = []
+        current_path: list[str] = []
+        heading_stack: list[str] = []
+
+        def flush() -> None:
+            # 遇到下一个标题或文档结束时，把当前章节写入 sections。
+            content = "\n".join(current_lines).strip()
+            if content:
+                sections.append((list(current_path), content))
+
+        for line in text.splitlines():
+            match = heading_re.match(line.strip())
+            if match:
+                flush()
+                level = len(match.group(1))
+                title = match.group(2).strip()
+                # 根据标题层级维护一个栈：
+                # # A -> ["A"]
+                # ## B -> ["A", "B"]
+                # 新的同级/上级标题会覆盖对应层级之后的旧路径。
+                heading_stack[:] = heading_stack[: level - 1] + [title]
+                current_path = list(heading_stack)
+                current_lines = [line]
+                continue
+            current_lines.append(line)
+        flush()
+        return sections
+
+
 @dataclass
 class RetrievedNodes:
     """RAG 召回阶段的中间结果。
@@ -177,13 +382,18 @@ class BusinessMetadataEnricher(TransformComponent):
 
             # 优先取 file_path，其次取 filename；都没有时给 unknown。
             # Path(...).name 只保留文件名，避免不同机器上的绝对路径污染 metadata。
-            source_file = Path(
-                str(node.metadata.get("file_path") or node.metadata.get("filename") or "unknown")
-            ).name
+            source_path = str(node.metadata.get("file_path") or node.metadata.get("filename") or "unknown")
+            source_file = Path(source_path).name
             # 通过文件名推断知识类别，例如 stockout_rules.md -> stockout_rule。
-            category = self._infer_category(source_file)
+            category = self._normalize_category(
+                str(node.metadata.get("category") or self._infer_category(source_file))
+            )
             # document_id 用文件名去掉 .md，方便前端或日志展示。
-            document_id = source_file.removesuffix(".md")
+            document_id = str(
+                node.metadata.get("document_id")
+                or node.metadata.get("doc_id")
+                or self._infer_document_id(source_path, source_file)
+            )
 
             # chunk_id 必须稳定：同一个文档同一个切片顺序生成相同 id。
             # 后面向量 + BM25 融合去重时，就靠这个字段判断是不是同一段知识。
@@ -196,9 +406,22 @@ class BusinessMetadataEnricher(TransformComponent):
 
             # title/section_path/tags 都是为了“可解释召回”。
             # 面试时可以说：不是只返回一段文本，还能说清楚它来自哪个业务章节。
-            title = self._extract_title(node.get_content(), source_file)
-            section_path = self._extract_section_path(node.get_content(), title)
-            tags = sorted(set([category, *section_path]))
+            title = str(
+                node.metadata.get("title")
+                or node.metadata.get("_markdown_title")
+                or self._extract_title(node.get_content(), source_file)
+            )
+            section_path = list(
+                node.metadata.get("_markdown_section_path")
+                or self._extract_section_path(node.get_content(), title)
+            )
+            explicit_tags = node.metadata.get("tags", [])
+            if isinstance(explicit_tags, str):
+                explicit_tags = [explicit_tags]
+            business_scope = node.metadata.get("business_scope", [])
+            if isinstance(business_scope, str):
+                business_scope = [business_scope]
+            tags = sorted(set([category, *section_path, *explicit_tags, *business_scope]))
 
             # metadata 会随 node 一起写入向量库。Milvus/本地索引都可以用这些字段过滤或展示。
             node.metadata.update(
@@ -210,10 +433,22 @@ class BusinessMetadataEnricher(TransformComponent):
                     "section_path": section_path,
                     "tags": tags,
                     "source_file": source_file,
-                    "source_path": str(node.metadata.get("file_path", source_file)),
+                    "source_path": source_path,
+                    "version": str(node.metadata.get("version", "")),
+                    "owner": str(node.metadata.get("owner", "")),
+                    "effective_date": str(node.metadata.get("effective_date", "")),
+                    # expires_at 是知识治理字段：运营可以在上传时声明规则失效日期。
+                    # 检索阶段会再次检查这个字段，过期 chunk 不参与最终排序，避免旧 SOP 误导 Agent。
+                    "expires_at": str(node.metadata.get("expires_at", "")),
+                    "region": str(node.metadata.get("region", "")),
+                    "business_scope": list(business_scope),
                 }
             )
         return nodes
+
+    def _normalize_category(self, value: str) -> str:
+        normalized = value.strip()
+        return CATEGORY_ALIASES.get(normalized, CATEGORY_ALIASES.get(normalized.lower(), normalized or "general"))
 
     def _infer_category(self, source_file: str) -> str:
         """根据文件名推断业务类别。
@@ -226,6 +461,22 @@ class BusinessMetadataEnricher(TransformComponent):
             if keyword in fname:
                 return category
         return "general"
+
+    def _infer_document_id(self, source_path: str, source_file: str) -> str:
+        """从路径生成稳定 document_id，避免递归知识库里同名文件互相覆盖。"""
+        path = Path(source_path)
+        stem_path = path.with_suffix("")
+        parts = list(stem_path.parts)
+        for marker in ("knowledge_base", "knowledge"):
+            if marker in parts:
+                relative_parts = parts[parts.index(marker) + 1 :]
+                if relative_parts:
+                    return self._safe_document_id("__".join(relative_parts))
+        return self._safe_document_id(Path(source_file).stem)
+
+    @staticmethod
+    def _safe_document_id(value: str) -> str:
+        return re.sub(r"[^\w.-]+", "_", value, flags=re.UNICODE).strip("._-") or "unknown"
 
     def _extract_title(self, text: str, source_file: str) -> str:
         """从 Markdown 一级标题中提取文档标题。
@@ -327,6 +578,16 @@ class KnowledgeRetrievalService:
     这个类是 RAG 的“编排层”，它不自己写 embedding 算法，也不自己写 BM25 算法，
     而是把 LlamaIndex、模型网关、知识仓库、业务意图识别组合起来。
 
+    这里刻意把职责拆成几个清晰阶段：
+    - 输入准备：判断是否有订单上下文，并调用 QueryPlanner 做意图识别和 query 扩展。
+    - 索引准备：懒加载或预热向量索引，同时准备 BM25 关键词索引。
+    - 混合召回：向量召回负责语义相似，BM25 负责关键词精确命中。
+    - 业务排序：根据意图、关键词和可选 reranker 调整顺序。
+    - 结果封装：把框架内部 NodeWithScore 转成稳定的业务 schema。
+
+    这样写的好处是：面试时可以把它讲成一条完整 RAG 工程链路，
+    而不是“调一个向量数据库接口”。
+
     依赖关系：
     - KnowledgeRepository：告诉服务知识文件在哪里、是否支持重建索引。
     - InventoryAnalysisService：给 QueryPlanner 用，用订单上下文增强 query。
@@ -340,15 +601,19 @@ class KnowledgeRetrievalService:
         knowledge_repository: KnowledgeRepository,
         inventory_analysis_service: InventoryAnalysisService,
         query_rewriter: QueryRewriter | None = None,
+        intent_classifier_model=None,
         cross_encoder: PassageReranker | None = None,
         compressor: ContextualCompressor | None = None,
     ) -> None:
         # 知识文件访问层。这个服务不直接写死 app/data/knowledge，方便未来换存储。
+        # 例如现在是本地文件系统，后续可以换成对象存储、后台上传目录或数据库。
         self.knowledge_repository = knowledge_repository
 
         # 向量索引懒加载缓存。第一次检索才构建，避免项目启动时加载模型很慢。
+        # 如果调用 warmup_index()，也可以在启动阶段主动构建，避免用户第一次提问超时。
         self._index: VectorStoreIndex | None = None
         # 当前知识库切出来的 TextNode。BM25 必须基于内存节点构建。
+        # 即使用 Milvus 做外部向量库，BM25 仍然需要这些本地文本节点。
         self._nodes: list[TextNode] = []
         # BM25 关键词检索器懒加载缓存。
         self._bm25_retriever: BM25Retriever | None = None
@@ -361,6 +626,7 @@ class KnowledgeRetrievalService:
         self._query_planner = RAGQueryPlanner(
             inventory_analysis_service=inventory_analysis_service,
             query_rewriter=query_rewriter,
+            intent_classifier_model=intent_classifier_model,
         )
         # AnswerBuilder 负责“把命中的片段组装成结果/摘要”，和召回逻辑分离。
         self._answer_builder = RAGAnswerBuilder()
@@ -370,21 +636,27 @@ class KnowledgeRetrievalService:
         # 避免 FastAPI 启动阶段被模型权重加载卡住。
         self._embed_model = None
         self._vector_store = None
+        # 多个请求同时第一次进入 RAG 时，只允许一个线程真正构建索引。
+        # 否则本地开发会出现重复 embedding、重复写 Milvus、接口一起超时的问题。
+        self._index_build_lock = threading.Lock()
         # 最近一次重建时的文档变化摘要，用于 API 返回和排查“旧文档是否已清理”。
         self._last_registry_changes: list[dict[str, object]] = []
         # IngestionPipeline 是 LlamaIndex 的文档处理流水线：
-        # 先切片，再给每个切片补业务 metadata。
+        # 1. KnowledgeFrontMatterExtractor：抽取文档开头的 category/tags/version 等元数据。
+        # 2. MarkdownSectionSplitter：按标题层级切分，再用 SentenceSplitter 控制 chunk 大小。
+        # 3. BusinessMetadataEnricher：补齐 document_id/chunk_id/source_file 等检索治理字段。
         self._pipeline = IngestionPipeline(
             transformations=[
-                SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP),
+                KnowledgeFrontMatterExtractor(),
+                MarkdownSectionSplitter(),
                 BusinessMetadataEnricher(),
             ]
         )
 
     def retrieve(
         self,
-        order_id: str,
-        question: str,
+        order_id: str | None = None,
+        question: str = "",
         filter_categories: list[str] | None = None,
     ) -> KnowledgeRetrieveResult:
         """同步检索入口。
@@ -395,27 +667,231 @@ class KnowledgeRetrievalService:
         2. retrieve：混合召回候选知识片段。
         3. rank/build：业务重排、可选 rerank、转 KnowledgeHit。
         4. build_result：组装最终结果。
+
+        ``order_id`` 允许为空：
+        - 有订单号：使用订单、库存、履约状态增强 query。
+        - 无订单号：直接走知识库问答，适合运营人员查 SOP、规则和上传文档内容。
         """
-        prepared = self._query_planner.prepare(order_id, question, filter_categories)
-        retrieved = self._retrieve_nodes(question, prepared)
-        hits = self._rank_and_build_hits(question, retrieved, prepared.intent)
-        return self._build_result(order_id, question, prepared, retrieved.queries, hits)
+        started_at = time.monotonic()
+        # 统一把 None、空格等输入归一化成空字符串，后面只判断 truthy/falsy。
+        normalized_order_id = self._normalize_order_id(order_id)
+        try:
+            # 这一层会根据是否有订单号，选择“订单上下文检索”或“纯知识库检索”。
+            prepared = self._prepare_retrieval_inputs(normalized_order_id, question, filter_categories)
+            # retrieved 仍然是框架内部的 NodeWithScore，不急着转业务 schema。
+            retrieved = self._retrieve_nodes(question, prepared)
+            # 排序阶段会写入 score_detail 需要的 metadata，再统一转 KnowledgeHit。
+            hits = self._rank_and_build_hits(question, retrieved, prepared.intent)
+            result = self._build_result(
+                normalized_order_id or KNOWLEDGE_ONLY_ORDER_ID,
+                question,
+                prepared,
+                retrieved.queries,
+                hits,
+            )
+            add_trace_step(
+                # Trace Center 记录 RAG 链路的输入、输出、证据片段和耗时。
+                # 这里不是业务逻辑必需，但对排查“为什么没检索到/为什么慢”非常重要。
+                step_type="rag",
+                name="retrieve_knowledge",
+                status="success",
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                summary="RAG 检索完成",
+                input_summary={
+                    "order_id": normalized_order_id or None,
+                    "query": question,
+                    "filter_categories": filter_categories or [],
+                    "retrieval_top_k": RETRIEVAL_TOP_K,
+                },
+                output_summary={"hit_count": len(hits), "expanded_query_count": len(retrieved.queries)},
+                metadata={
+                    "expanded_queries": retrieved.queries,
+                    "matched_categories": self._hit_categories(hits),
+                    "empty_result": len(hits) == 0,
+                    "low_confidence": bool(hits and max(hit.score for hit in hits) < 0.35),
+                    "rerank_enabled": self._cross_encoder is not None,
+                    "has_order_context": getattr(prepared, "has_order_context", bool(normalized_order_id)),
+                },
+                evidence=[
+                    {
+                        "source_file": hit.metadata.source_file,
+                        "chunk_id": hit.metadata.chunk_id,
+                        "title": hit.metadata.title,
+                        "score": hit.score,
+                    }
+                    for hit in hits[:5]
+                    if hit.metadata
+                ],
+            )
+            return result
+        except Exception as exc:
+            add_trace_step(
+                # 失败也写 trace，这样前端看到超时或 SSL 错误时，Trace Center 里还能定位到 RAG 阶段。
+                step_type="rag",
+                name="retrieve_knowledge",
+                status="error",
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                summary="RAG 检索失败",
+                error_code=exc.__class__.__name__,
+                error_message=str(exc),
+                input_summary={
+                    "order_id": normalized_order_id or None,
+                    "query": question,
+                    "filter_categories": filter_categories or [],
+                },
+            )
+            raise
 
     async def aretrieve(
         self,
-        order_id: str,
-        question: str,
+        order_id: str | None = None,
+        question: str = "",
         filter_categories: list[str] | None = None,
     ) -> "KnowledgeRetrieveResult":
         """异步检索入口。
 
         给异步 API / Agent 调用使用。它和同步版本返回结构一致，
         只是 query rewrite、检索、rerank、compress 尽量走异步方法。
+
+        注意：向量库和 reranker 的底层实现不一定是真异步。
+        所以这里的异步主要是为了不阻塞 FastAPI 事件循环，并让多条 expanded query 可以并发等待。
         """
-        prepared = self._query_planner.prepare(order_id, question, filter_categories)
-        retrieved = await self._aretrieve_nodes(question, prepared)
-        hits = await self._arank_and_build_hits(question, retrieved, prepared.intent)
-        return self._build_result(order_id, question, prepared, retrieved.queries, hits)
+        started_at = time.monotonic()
+        normalized_order_id = self._normalize_order_id(order_id)
+        try:
+            prepared = self._prepare_retrieval_inputs(normalized_order_id, question, filter_categories)
+            retrieved = await self._aretrieve_nodes(question, prepared)
+            hits = await self._arank_and_build_hits(question, retrieved, prepared.intent)
+            result = self._build_result(
+                normalized_order_id or KNOWLEDGE_ONLY_ORDER_ID,
+                question,
+                prepared,
+                retrieved.queries,
+                hits,
+            )
+            add_trace_step(
+                # 异步入口和同步入口记录同样的 trace 字段，便于横向对比。
+                step_type="rag",
+                name="retrieve_knowledge",
+                status="success",
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                summary="异步 RAG 检索完成",
+                input_summary={
+                    "order_id": normalized_order_id or None,
+                    "query": question,
+                    "filter_categories": filter_categories or [],
+                    "retrieval_top_k": RETRIEVAL_TOP_K,
+                },
+                output_summary={"hit_count": len(hits), "expanded_query_count": len(retrieved.queries)},
+                metadata={
+                    "expanded_queries": retrieved.queries,
+                    "matched_categories": self._hit_categories(hits),
+                    "empty_result": len(hits) == 0,
+                    "low_confidence": bool(hits and max(hit.score for hit in hits) < 0.35),
+                    "rerank_enabled": self._cross_encoder is not None,
+                    "has_order_context": getattr(prepared, "has_order_context", bool(normalized_order_id)),
+                },
+                evidence=[
+                    {
+                        "source_file": hit.metadata.source_file,
+                        "chunk_id": hit.metadata.chunk_id,
+                        "title": hit.metadata.title,
+                        "score": hit.score,
+                    }
+                    for hit in hits[:5]
+                    if hit.metadata
+                ],
+            )
+            return result
+        except Exception as exc:
+            add_trace_step(
+                # 异步失败也保留输入摘要，避免只看到前端“请求超时”但不知道 query 内容。
+                step_type="rag",
+                name="retrieve_knowledge",
+                status="error",
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                summary="异步 RAG 检索失败",
+                error_code=exc.__class__.__name__,
+                error_message=str(exc),
+                input_summary={
+                    "order_id": normalized_order_id or None,
+                    "query": question,
+                    "filter_categories": filter_categories or [],
+                },
+            )
+            raise
+
+    @staticmethod
+    def _normalize_order_id(order_id: str | None) -> str:
+        """清洗订单号输入。
+
+        这里不做订单格式校验，只负责把 None/空白字符串统一成空字符串。
+        订单是否存在由 QueryPlanner/InventoryAnalysisService 负责判断。
+        """
+        return (order_id or "").strip()
+
+    def _prepare_retrieval_inputs(
+        self,
+        order_id: str,
+        question: str,
+        filter_categories: list[str] | None,
+    ) -> RetrievalInputs:
+        """准备检索需要的上下文对象。
+
+        ``RetrievalInputs`` 是 QueryPlanner 给检索层的标准上下文：
+        - active_filters：需要过滤的知识类别。
+        - inventory_result：订单/库存分析结果，或者无订单时的占位结果。
+        - intent：用户问题对应的业务意图。
+        - retrieval_context：用于 query rewrite 的上下文文本。
+        """
+        if order_id:
+            # 有订单号时走完整业务链路：查订单、查库存、识别风险，再扩展 query。
+            return self._query_planner.prepare(order_id, question, filter_categories)
+        # 没有订单号时，不再强行查订单，直接构造“知识库检索”上下文。
+        return self._prepare_without_order(question, filter_categories)
+
+    def _prepare_without_order(
+        self,
+        question: str,
+        filter_categories: list[str] | None,
+    ) -> RetrievalInputs:
+        """构造无订单知识库检索上下文。
+
+        这个方法解决之前项目过度围绕订单的问题：
+        运营人员可以直接问“哪些情况不允许直接补发”“高优先级订单规则是什么”，
+        系统仍然会做意图识别、query 扩展、RAG 检索，只是不再依赖订单和库存数据。
+        """
+        # 无订单时仍然保留意图识别。
+        # 这样“补发/退货/高优先级/跨仓”之类问题仍能映射到对应知识 category。
+        intent = self._query_planner.recognize_intent(
+            question=question,
+            insufficient_skus=[],
+            fulfillment_ready=False,
+        )
+        # 构造一个占位 InventoryAnalysisResult，是为了复用下游 RetrievalInputs schema。
+        # 它明确声明“没有订单上下文”，避免 AnswerBuilder/Trace 误以为真的查过订单。
+        inventory_result = InventoryAnalysisResult(
+            order_id=KNOWLEDGE_ONLY_ORDER_ID,
+            fulfillment_ready=False,
+            insufficient_skus=[],
+            sku_checks=[],
+            order_summary="未提供订单号，本次请求只检索知识库文档。",
+            summary="无订单上下文，已跳过订单和库存分析。",
+        )
+        # retrieval_context 会进入 QueryPlanner 的 query rewrite/扩展逻辑。
+        # 这里强调“规则、SOP、制度、上传文档”，防止无订单问题被错误改写成订单分析问题。
+        retrieval_context = (
+            f"用户问题：{question}\n"
+            "检索模式：无订单知识库检索。\n"
+            "请检索最相关的规则、SOP、制度、表格或上传文档内容。"
+        )
+        return RetrievalInputs(
+            active_filters=filter_categories or [],
+            inventory_result=inventory_result,
+            intent=intent,
+            retrieval_context=retrieval_context,
+            has_order_context=False,
+        )
 
     def _retrieve_nodes(self, question: str, prepared: RetrievalInputs) -> RetrievedNodes:
         """同步召回候选节点。
@@ -483,12 +959,20 @@ class KnowledgeRetrievalService:
         排序分两层：
         - 先做业务规则加权，让“问题意图对应的知识类别”更靠前。
         - 如果配置了 reranker，再用 Cross-Encoder/重排模型做语义精排。
+
+        这里没有把 reranker 当成必需依赖：
+        - 本地开发可以不配 reranker，避免额外模型调用导致超时。
+        - 面试展示时可以说明这是一个“可插拔增强点”，不是硬耦合。
         """
+        # 第一步：给每个 node 写入 keyword_score。
+        # 这一步不是重新召回，而是为排序和可解释性补一个轻量信号。
         keyword_scored = self._annotate_keyword_scores(nodes, expanded_queries)
+        # 第二步：按业务意图加权，例如“高优先级”问题优先展示 priority_rule。
         ranked = self._postprocess_by_business_rules(keyword_scored, expanded_queries, intent)
         if self._cross_encoder is None or not ranked:
             return ranked
         # reranker 通常输入纯文本列表，返回最相关的 passage 文本和相关性分数。
+        # 只取前 RERANK_TOP_K 个候选，避免精排阶段成为主要耗时来源。
         top_passages = self._cross_encoder.rerank_with_scores(
             question,
             [node.node.get_content() for node in ranked],
@@ -553,6 +1037,8 @@ class KnowledgeRetrievalService:
         merged_query = " ".join(expanded_queries)
         scored: list[NodeWithScore] = []
         for node_with_score in nodes:
+            # semantic_score 这里代表 QueryFusionRetriever 融合后的基础分。
+            # 它已经包含向量/BM25 的 RRF 排名信号，但不方便解释具体命中了哪些业务词。
             semantic_score = float(node_with_score.score or 0.0)
             keyword_score = self._keyword_overlap_score(
                 node_with_score.node.get_content(),
@@ -561,6 +1047,8 @@ class KnowledgeRetrievalService:
             keyword_boost = keyword_score * KEYWORD_SCORE_WEIGHT
             node_with_score.node.metadata.update(
                 {
+                    # 这些 _rag_* 字段只在本次检索链路内部使用，
+                    # 最终会被 _node_to_hit 读取并写入 HybridScoreDetail。
                     "_rag_semantic_score": round(semantic_score, 4),
                     "_rag_keyword_score": round(keyword_score, 4),
                     "_rag_keyword_boost": round(keyword_boost, 4),
@@ -706,6 +1194,17 @@ class KnowledgeRetrievalService:
             hits=hits,
         )
 
+    @staticmethod
+    def _hit_categories(hits: list[KnowledgeHit]) -> list[str]:
+        categories: set[str] = set()
+        for hit in hits:
+            category = getattr(hit, "category", None)
+            if not category and getattr(hit, "metadata", None):
+                category = getattr(hit.metadata, "category", None)
+            if category:
+                categories.add(str(category))
+        return sorted(categories)
+
     async def _aretrieve_with_expanded_queries(
         self,
         hybrid_retriever: "QueryFusionRetriever",
@@ -738,6 +1237,10 @@ class KnowledgeRetrievalService:
 
         用于知识库文档更新后刷新向量索引和 BM25 索引。
         FastAPI 的 knowledge-mgmt rebuild 接口最终会走到这里。
+
+        重建不是简单地“再插入一遍向量”：
+        外部向量库不会自动删除旧 chunk，所以这里会结合 document registry
+        先找出已经删除或变化的旧 chunk，再清理，再写入新索引。
         """
         if not self.knowledge_repository.rebuild_index_required():
             return "当前知识源不支持手动重建索引。"
@@ -773,20 +1276,38 @@ class KnowledgeRetrievalService:
         )
 
     def _get_or_build_index(self) -> VectorStoreIndex:
-        """懒加载向量索引。"""
+        """懒加载向量索引。
+
+        第一次检索或 warmup_index 会触发这里。
+        加锁的原因是：多个用户请求同时到达时，只允许一个请求执行建库，
+        其他请求等待建库完成后直接复用同一个 ``self._index``。
+        """
         # 第一次访问时加载/构建；后续复用，避免重复 embedding。
         if self._index is None:
-            self._index = self._load_or_build_index()
+            with self._index_build_lock:
+                if self._index is None:
+                    self._index = self._load_or_build_index()
         return self._index
 
     def _load_or_build_index(self) -> VectorStoreIndex:
-        """优先加载缓存索引，缓存不可用时重新构建。"""
+        """优先加载缓存索引，缓存不可用时重新构建。
+
+        根据向量后端不同分三种情况：
+        - Milvus 外部向量库：优先判断 collection 里是否已有向量。
+        - 配置了外部向量库但连接失败并降级：不复用旧本地缓存，避免维度不一致。
+        - 纯本地模式：通过文档指纹判断 ``storage/knowledge_index`` 是否还能复用。
+        """
         # LlamaIndex 的索引构建会读取全局 Settings.embed_model。
         Settings.embed_model = self._get_embed_model()
 
         vector_store = self._get_vector_store()
         if vector_store is not None:
             # 外部向量库由后端自己管理持久化，不依赖本地 doc_fingerprint。
+            # 如果 collection 里已经有向量，只需要创建一个指向该 collection 的 VectorStoreIndex。
+            # 这样服务重启不会重复 embedding 已入库文档。
+            loaded = self._load_existing_external_index(vector_store)
+            if loaded is not None:
+                return loaded
             return self._build_index(persist=False)
 
         if self._configured_external_vector_store():
@@ -815,16 +1336,83 @@ class KnowledgeRetrievalService:
         # 没缓存、指纹不一致、缓存坏了，都会走重建。
         return self._build_index(persist=True)
 
+    def warmup_index(self) -> str:
+        """预热 RAG 索引，避免用户第一次提问时承担建库成本。
+
+        本地开发时最容易超时的点通常不是检索本身，而是第一次请求顺便触发：
+        1. 加载 embedding 模型或连接云端 embedding。
+        2. 读取所有 Markdown 文档并切片。
+        3. 写入 Milvus 向量库。
+        4. 构建 BM25 内存索引。
+
+        预热把这些工作提前到启动/手动调用阶段完成，用户真正提问时只做检索和排序。
+        """
+        # 先确保向量索引可用；当前配置为 Milvus，这里会完成连接或建库。
+        self._get_or_build_index()
+        if self._bm25_retriever is None and self._nodes:
+            # 向量索引预热后，顺手把 BM25 也建好。
+            # 否则第一次混合召回仍然会在用户请求里构建 BM25。
+            self._bm25_retriever = BM25Retriever.from_defaults(
+                nodes=self._nodes,
+                similarity_top_k=self._retrieval_top_k(),
+            )
+        return f"知识索引预热完成：{len(self._nodes)} 个 chunk。"
+
+    def _load_existing_external_index(self, vector_store: object) -> VectorStoreIndex | None:
+        """外部向量库已有数据时直接加载，避免每次重启都全量 embedding。
+
+        对 Milvus 这类持久化向量库来说，服务重启后 collection 里的向量还在。
+        如果这里仍然全量构建，就会造成：
+        - 启动/首次提问耗时很长。
+        - 旧 chunk 没清理干净时可能重复写入。
+        - 云端 embedding 产生额外成本。
+
+        因此只要能判断 collection 已有数据，就直接从 vector_store 创建索引对象。
+        """
+        if not self._external_vector_store_has_data(vector_store):
+            return None
+        # BM25 不是外部持久化的，仍然需要跑一次 ingestion 拿到内存 TextNode。
+        self._nodes = self._run_ingestion_pipeline()
+        return VectorStoreIndex.from_vector_store(
+            vector_store=vector_store,
+            embed_model=self._get_embed_model(),
+        )
+
+    @staticmethod
+    def _external_vector_store_has_data(vector_store: object) -> bool:
+        """尽量用各后端公开能力判断外部向量库是否已有向量。
+
+        不同 LlamaIndex VectorStore 暴露的 collection 属性名不完全一致：
+        - Milvus/LlamaIndex 适配器通常会暴露 collection 相关内部属性。
+        - Milvus/Zilliz 的实现也可能包一层内部对象。
+
+        这里不强依赖具体类型，只要对象上有 count() 能力，就用它判断是否已有数据。
+        判断失败时返回 False，让后续走安全的重建逻辑。
+        """
+        collection = getattr(vector_store, "_collection", None)
+        if collection is not None and hasattr(collection, "count"):
+            try:
+                return int(collection.count()) > 0
+            except Exception:
+                return False
+        return False
+
     def _build_index(self, persist: bool) -> VectorStoreIndex:
         """构建向量索引，并按配置选择本地持久化或外部向量库。
 
         VectorStoreIndex 是 LlamaIndex 的核心索引对象。
         它负责把 TextNode 通过 embedding 模型转成向量，并写入对应的存储后端。
+
+        ``persist`` 只影响本地 LlamaIndex 存储：
+        - 本地模式：persist=True 时写入 knowledge_index_cache_dir。
+        - 外部向量库模式：向量库自己持久化，persist 参数不参与。
         """
         # 构建索引前先重新跑文档流水线，拿到最新 TextNode。
         self._nodes = self._run_ingestion_pipeline()
+        # current_documents 记录“当前文件 -> 当前 chunk_ids”，用于和上一次注册表对比。
         current_documents = self._build_current_document_records(self._nodes)
         previous_registry = self._read_document_registry()
+        # changes 里包含 created/updated/deleted/unchanged，以及需要删除的旧 chunk_id。
         changes = self._build_document_change_plan(
             current_documents=current_documents,
             previous_documents=previous_registry.get("documents", {}),
@@ -835,6 +1423,7 @@ class KnowledgeRetrievalService:
             # 外部向量库不会自动知道“某个文档删了/变短了”。
             # 所以重建前先按旧 registry 里的 chunk_id 删除过期向量，再写入新切片。
             self._delete_stale_vector_chunks(vector_store, changes)
+            self._sanitize_node_metadata_for_vector_store(self._nodes)
             # 外部向量库模式：把 Milvus 等 vector_store 注入 LlamaIndex StorageContext。
             storage_context = StorageContext.from_defaults(
                 vector_store=vector_store
@@ -855,6 +1444,28 @@ class KnowledgeRetrievalService:
         self._write_document_registry(current_documents, changes)
         return index
 
+    @staticmethod
+    def _sanitize_node_metadata_for_vector_store(nodes: list[TextNode]) -> None:
+        """写入外部向量库前清洗 metadata。
+
+        Milvus 等向量库通常只接受 str/int/float/None 这类标量 metadata。
+        但项目里的 ``tags``、``section_path``、``business_scope`` 是 list，
+        如果直接写入会报错。因此这里把复杂结构序列化成 JSON 字符串。
+
+        读取命中结果时会通过 ``_metadata_list`` 再把 JSON 字符串还原成 list 展示。
+        """
+        allowed = (str, int, float, type(None))
+        for node in nodes:
+            cleaned: dict[str, object] = {}
+            for key, value in node.metadata.items():
+                if isinstance(value, bool):
+                    cleaned[key] = str(value).lower()
+                elif isinstance(value, allowed):
+                    cleaned[key] = value
+                else:
+                    cleaned[key] = json.dumps(value, ensure_ascii=False)
+            node.metadata = cleaned
+
     def list_document_statuses(self) -> list[dict[str, object]]:
         """返回知识文档与索引注册表的对比状态。
 
@@ -862,6 +1473,12 @@ class KnowledgeRetrievalService:
         - 文件是否已进入索引。
         - 当前文件内容是否和上一次索引时一致。
         - 是否存在已经从目录删除、但注册表里仍有记录的文档。
+
+        sync_status 含义：
+        - new：当前目录有文件，但还没有写入索引注册表。
+        - changed：文件 hash 和注册表不一致，需要重建索引。
+        - indexed：文件和注册表一致，说明已入库。
+        - deleted：注册表里有记录，但当前目录已找不到文件，需要清理旧向量。
         """
 
         registry = self._read_document_registry()
@@ -872,16 +1489,19 @@ class KnowledgeRetrievalService:
         for document_id, file_info in current_files.items():
             indexed = indexed_docs.get(document_id)
             if indexed is None:
+                # 新文件：还没有任何 chunk 写入过索引。
                 sync_status = "new"
                 version = 1
                 indexed_hash = ""
                 chunk_count = 0
             elif indexed.get("content_hash") != file_info["content_hash"]:
+                # 文件存在但内容变了：需要重建并替换旧 chunk。
                 sync_status = "changed"
                 version = int(indexed.get("version", 1))
                 indexed_hash = str(indexed.get("content_hash", ""))
                 chunk_count = len(indexed.get("chunk_ids", []))
             else:
+                # hash 一致：说明当前文件和上次建索引时一致。
                 sync_status = "indexed"
                 version = int(indexed.get("version", 1))
                 indexed_hash = str(indexed.get("content_hash", ""))
@@ -898,6 +1518,8 @@ class KnowledgeRetrievalService:
         for document_id, indexed in indexed_docs.items():
             if document_id in current_files:
                 continue
+            # 注册表里有、当前目录没有，说明用户删除了知识文件。
+            # 这种状态必须暴露出来，否则外部向量库里的旧 chunk 会继续被命中。
             rows.append({
                 "document_id": document_id,
                 "filename": indexed.get("filename", f"{document_id}.md"),
@@ -915,7 +1537,11 @@ class KnowledgeRetrievalService:
         return sorted(rows, key=lambda item: str(item["document_id"]))
 
     def document_registry_snapshot(self) -> dict[str, object]:
-        """返回知识文档注册表快照，供状态页展示和面试讲解。"""
+        """返回知识文档注册表快照，供状态页展示和面试讲解。
+
+        这个快照不是业务知识内容，而是“索引状态账本”：
+        它记录每个文档的 hash、版本、chunk_id 列表以及最近一次变更摘要。
+        """
 
         registry = self._read_document_registry()
         return {
@@ -936,7 +1562,11 @@ class KnowledgeRetrievalService:
         return Path(self._settings.knowledge_index_cache_dir) / "knowledge_document_registry.json"
 
     def _read_document_registry(self) -> dict[str, object]:
-        """读取知识文档注册表；不存在或损坏时返回空注册表。"""
+        """读取知识文档注册表；不存在或损坏时返回空注册表。
+
+        这里选择容错读取：注册表坏了不会让应用完全启动失败。
+        后续重建索引时会按空注册表处理，相当于重新建立一份索引状态账本。
+        """
 
         path = self._document_registry_path()
         if not path.exists():
@@ -956,6 +1586,9 @@ class KnowledgeRetrievalService:
 
         registry 的核心作用是解决“旧文档污染检索”：
         下次重建索引时，可以知道旧版本有哪些 chunk_id，从而在 Milvus 里先删旧 chunk。
+
+        last_changes 只保留摘要，不保存完整 stale_chunk_ids，
+        是为了让 API 展示足够清晰，同时避免注册表越来越臃肿。
         """
 
         payload = {
@@ -977,20 +1610,44 @@ class KnowledgeRetrievalService:
         self._last_registry_changes = payload["last_changes"]
 
     def _scan_knowledge_files(self) -> dict[str, dict[str, object]]:
-        """扫描当前知识目录中的 Markdown 文档，并计算内容 hash。"""
+        """扫描当前知识目录中的 Markdown 文档，并计算内容 hash。
+
+        这一步只看“文件级别”的状态，不做切片、不做 embedding。
+        它的作用是快速得到当前知识源的 document_id/category/hash，
+        用来和注册表比较是否需要重建索引。
+        """
 
         files: dict[str, dict[str, object]] = {}
+        # 复用 BusinessMetadataEnricher 的 document_id/category 推断规则，
+        # 保证状态页看到的 document_id 和真正入库时的 document_id 一致。
+        enricher = BusinessMetadataEnricher()
         for path_text in self.knowledge_repository.list_knowledge_paths():
             path = Path(path_text)
             if not path.exists() or not path.is_file():
                 continue
             content = path.read_bytes()
-            document_id = path.stem
+            try:
+                # front matter 只支持 UTF-8 文档；无法解码时仍然可以用文件名推断元数据。
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                text = ""
+            parsed_frontmatter = KnowledgeFrontMatterExtractor._parse_front_matter(text)
+            frontmatter = parsed_frontmatter[0] if parsed_frontmatter else {}
+            # document_id 优先使用文档显式声明，没声明时按路径生成稳定 ID。
+            # 这样递归目录里出现同名文件时，不会互相覆盖。
+            document_id = str(
+                frontmatter.get("document_id")
+                or frontmatter.get("doc_id")
+                or enricher._infer_document_id(str(path), path.name)
+            )
+            category = enricher._normalize_category(
+                str(frontmatter.get("category") or enricher._infer_category(path.name))
+            )
             files[document_id] = {
                 "document_id": document_id,
                 "filename": path.name,
                 "source_path": str(path),
-                "category": BusinessMetadataEnricher()._infer_category(path.name),
+                "category": category,
                 "size_bytes": len(content),
                 "last_modified": path.stat().st_mtime,
                 "content_hash": hashlib.sha256(content).hexdigest(),
@@ -1001,12 +1658,19 @@ class KnowledgeRetrievalService:
         self,
         nodes: list[TextNode],
     ) -> dict[str, dict[str, object]]:
-        """根据当前文件和切片结果生成新的文档注册表 documents 字段。"""
+        """根据当前文件和切片结果生成新的文档注册表 documents 字段。
+
+        ``_scan_knowledge_files`` 只能知道文件 hash；
+        这个方法会额外把每个文档对应的 chunk_ids 记录下来。
+        外部向量库清理旧数据时，真正删除的是 chunk_id，而不是文件名。
+        """
 
         old_documents = self._read_document_registry().get("documents", {})
         current_files = self._scan_knowledge_files()
         chunk_ids_by_doc: dict[str, list[str]] = {}
         for node in nodes:
+            # BusinessMetadataEnricher 已经给每个 node 写入 document_id/chunk_id。
+            # 这里按文档聚合，形成 document -> chunk_ids 的映射。
             document_id = str(node.metadata.get("document_id", "unknown"))
             chunk_id = str(node.metadata.get("chunk_id", node.node_id))
             chunk_ids_by_doc.setdefault(document_id, []).append(chunk_id)
@@ -1016,6 +1680,7 @@ class KnowledgeRetrievalService:
             old = old_documents.get(document_id, {})
             content_changed = old.get("content_hash") != file_info["content_hash"]
             old_version = int(old.get("version", 0) or 0)
+            # 只有内容变化时版本号递增；纯重启/重复预热不会让版本号乱涨。
             version = old_version + 1 if content_changed else max(old_version, 1)
             documents[document_id] = {
                 **file_info,
@@ -1040,6 +1705,9 @@ class KnowledgeRetrievalService:
         - updated：同 document_id 内容或切片发生变化，先删旧 chunk 再写新 chunk。
         - deleted：文件已不存在，删除旧 chunk。
         - unchanged：没有变化，不需要清理。
+
+        这里同时比较 chunk_size/chunk_overlap，是因为切片参数变化即使文件内容不变，
+        chunk_id 列表也可能变化；旧切片必须清理，否则新旧切片会同时被召回。
         """
 
         changes: list[dict[str, object]] = []
@@ -1057,6 +1725,7 @@ class KnowledgeRetrievalService:
                 old_chunk_ids = list(previous.get("chunk_ids", []))
                 new_chunk_ids = list(current.get("chunk_ids", []))
                 changed = (
+                    # 内容变更、切片参数变更、chunk_id 列表变更，都视为需要替换。
                     previous.get("content_hash") != current.get("content_hash")
                     or previous.get("chunk_size") != current.get("chunk_size")
                     or previous.get("chunk_overlap") != current.get("chunk_overlap")
@@ -1086,9 +1755,15 @@ class KnowledgeRetrievalService:
         1. 同名文档替换：删旧 chunk，再写新 chunk。
         2. 文档变短：旧版本多出来的 chunk 不会残留。
         3. 文档删除：旧文档不会继续被 RAG 命中。
+
+        这是外部向量库模式最关键的治理逻辑之一。
+        没有这一步，用户删除或更新文档后，Milvus 里仍可能保留旧向量，
+        RAG 就会回答已经失效的规则。
         """
 
         stale_chunk_ids = sorted({
+            # changes 里只有 updated/deleted 才会带 stale_chunk_ids；
+            # created/unchanged 会自然被过滤掉。
             chunk_id
             for change in changes
             for chunk_id in change.get("stale_chunk_ids", [])
@@ -1122,7 +1797,10 @@ class KnowledgeRetrievalService:
         Settings.embed_model = self._get_embed_model()
         # SimpleDirectoryReader 负责读取 Markdown 文件内容。
         documents = SimpleDirectoryReader(input_files=knowledge_paths).load_data()
-        # IngestionPipeline 顺序执行 SentenceSplitter 和 BusinessMetadataEnricher。
+        # IngestionPipeline 顺序执行：
+        # 1. front matter 抽取；
+        # 2. Markdown 章节切片；
+        # 3. 业务 metadata 补齐。
         nodes = self._pipeline.run(documents=documents)
         # 过滤出 TextNode，保证后续 BM25/向量检索处理的是文本切片。
         return [n for n in nodes if isinstance(n, TextNode)]
@@ -1132,6 +1810,9 @@ class KnowledgeRetrievalService:
 
         ``create_embed_model`` 已经接入模型网关配置：
         可以根据企业配置选择云端 embedding 或本地开源 embedding。
+
+        这里不在 __init__ 里加载，是为了避免服务启动时就触发模型下载、
+        API 连通性检查或云端鉴权；真正需要 RAG 时再初始化。
         """
         if self._embed_model is None:
             self._embed_model = create_embed_model(self._settings)
@@ -1140,15 +1821,20 @@ class KnowledgeRetrievalService:
     def _get_vector_store(self):
         """懒创建向量库连接。
 
-        当前项目可以按配置返回 Milvus vector store；
-        如果返回 None，就代表使用 LlamaIndex 本地索引缓存。
+        当前项目按配置返回 Milvus/Zilliz vector store。
+        Milvus 不可用时直接抛错，不再回退到本地索引。
         """
         if self._vector_store is None:
             self._vector_store = create_vector_store(self._settings)
         return self._vector_store
 
     def _configured_external_vector_store(self) -> bool:
-        """当前配置是否期望使用外部向量库。"""
+        """当前配置是否期望使用外部向量库。
+
+        这个判断和 ``_get_vector_store()`` 的返回值不是完全一回事：
+        - 配置期望外部向量库时，factory 连接失败会直接抛错。
+        - 这里仍保留独立判断，便于跳过历史本地缓存复用。
+        """
         return str(getattr(self._settings, "vector_store_type", "local") or "local").strip().lower() in {
             "milvus",
             "zilliz",
@@ -1230,6 +1916,9 @@ class KnowledgeRetrievalService:
 
         mode="reciprocal_rerank" 表示用 RRF 融合排序。
         RRF 不直接比较两路分数，而是融合各自排名，更适合不同检索器混用。
+
+        这里传入 MockLLM，是因为本项目的 query rewrite 已经由 RAGQueryPlanner 负责；
+        QueryFusionRetriever 不需要再额外调用 LLM 生成子查询，避免重复改写和额外耗时。
         """
         # 向量检索：擅长语义相似，比如“库存不够”和“缺货处理”。
         vector_retriever = self._get_or_build_index().as_retriever(
@@ -1255,6 +1944,9 @@ class KnowledgeRetrievalService:
 
         这个过滤器会传给向量 retriever，让向量检索只查指定 category。
         注意 BM25 不一定支持同样的过滤，所以后面还会二次过滤。
+
+        过滤器只在用户显式选择规则来源/业务类别时生效；
+        无过滤条件时返回 None，表示全知识库检索。
         """
         if not categories:
             return None
@@ -1304,6 +1996,11 @@ class KnowledgeRetrievalService:
             # BM25 可能没有吃到 metadata filter，所以这里再拦一次。
             if allowed and node_with_score.node.metadata.get("category") not in allowed:
                 continue
+            # 过期规则检测必须放在融合后的统一过滤里。
+            # 原因：向量检索可以做 metadata filter，但 BM25 召回通常不支持同样的过滤表达式。
+            # 如果只在向量侧过滤，过期规则仍可能通过 BM25 混进最终结果。
+            if self._is_expired_knowledge(node_with_score.node.metadata.get("expires_at")):
+                continue
             node_key = str(
                 node_with_score.node.metadata.get("chunk_id") or node_with_score.node.node_id
             )
@@ -1313,6 +2010,23 @@ class KnowledgeRetrievalService:
             if existing is None or (node_with_score.score or 0) > (existing.score or 0):
                 seen[node_key] = node_with_score
         return list(seen.values())
+
+    @staticmethod
+    def _is_expired_knowledge(value: object) -> bool:
+        """判断知识片段是否已经过期。
+
+        支持 front matter 中常见的 ``YYYY-MM-DD`` 或 ISO datetime 字符串。
+        解析失败时不把文档当成过期，因为错误 metadata 应该在入库质检报告中暴露，
+        检索侧保持保守，避免误杀仍然有效的规则。
+        """
+
+        if not value:
+            return False
+        try:
+            expires_at = datetime.fromisoformat(str(value)[:10]).date()
+        except ValueError:
+            return False
+        return expires_at < datetime.now(timezone.utc).date()
 
     @staticmethod
     def _keyword_overlap_score(text: str, query: str) -> float:
@@ -1382,7 +2096,7 @@ class KnowledgeRetrievalService:
             rerank_score=round(rerank_score, 4),
             final_score=final_score,
         )
-        retrieval_channels = list(metadata.get("_rag_retrieval_channels", ["semantic"]))
+        retrieval_channels = self._metadata_list(metadata.get("_rag_retrieval_channels", ["semantic"]))
         if keyword_score > 0 and "keyword" not in retrieval_channels:
             retrieval_channels.append("keyword")
         if business_rule_score > 0:
@@ -1395,10 +2109,16 @@ class KnowledgeRetrievalService:
             document_id=str(metadata.get("document_id", "unknown")),
             chunk_id=str(metadata.get("chunk_id", node.node_id)),
             title=str(metadata.get("title", "unknown")),
-            section_path=list(metadata.get("section_path", [])),
-            tags=list(metadata.get("tags", [])),
+            section_path=self._metadata_list(metadata.get("section_path", [])),
+            tags=self._metadata_list(metadata.get("tags", [])),
             source_file=str(metadata.get("source_file", source_file)),
             source_path=str(metadata.get("source_path", source_file)),
+            version=str(metadata.get("version", "")),
+            owner=str(metadata.get("owner", "")),
+            effective_date=str(metadata.get("effective_date", "")),
+            expires_at=str(metadata.get("expires_at", "")),
+            region=str(metadata.get("region", "")),
+            business_scope=self._metadata_list(metadata.get("business_scope", [])),
         )
 
         # KnowledgeHit 是最终给 API/Agent 的命中文档片段。
@@ -1412,3 +2132,33 @@ class KnowledgeRetrievalService:
             matched_terms=matched_terms,
             text=text,
         )
+
+    @staticmethod
+    def _metadata_list(value: object) -> list[str]:
+        """把 metadata 中的列表字段统一还原成 ``list[str]``。
+
+        为什么需要这个方法：
+        - 本地 LlamaIndex 节点里，``tags``/``section_path`` 可能本来就是 list。
+        - 写入 Milvus 等外部向量库前，复杂 metadata 会被转成 JSON 字符串。
+        - 少数情况下字段可能只是普通字符串。
+
+        对外返回前统一转成 list，可以让前端和 API schema 不用关心底层存储差异。
+        """
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        return [str(item) for item in parsed]
+                except Exception:
+                    # 不是合法 JSON 时按普通字符串处理，避免 metadata 解析问题影响整次检索。
+                    pass
+            return [stripped]
+        return [str(value)]

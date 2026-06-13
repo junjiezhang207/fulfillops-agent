@@ -5,12 +5,19 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.deepeval/
 
 # Virtual environments
 .venv
 
 # Environment variables (contains API keys)
 .env
+.env.local
+.env.docker
+.env.*.local
 
 # Local assistant/editor state
 .claude/
@@ -24,8 +31,12 @@ frontend/.env.local
 storage/
 
 # Local server logs
+logs/
 backend-*.out
 backend-*.err
 backend-*.log
 frontend-vite-*.out
 frontend-vite-*.err
+frontend/frontend-dev.*.log
+frontend/frontend-dev.stdout.log
+frontend/frontend-dev.stderr.log

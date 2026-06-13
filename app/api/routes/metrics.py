@@ -1,4 +1,4 @@
-"""Prometheus 指标端点 — 暴露 AI 业务指标供监控大盘使用。
+"""Prometheus 指标端点。
 
 端点：GET /metrics（Prometheus 标准格式）
 
@@ -22,15 +22,8 @@
     - rag_cache_hit_ratio（Ragas faithfulness 趋势）
     - tool_success_rate（按工具名分组）
 
-学习重点：
-1. 业务 API 返回 JSON，但 Prometheus 需要标准文本格式，所以这里直接返回 ``Response``。
-2. Counter 只能递增，适合请求数、token 数、错误数。
-3. Gauge 可以上下变化，适合当前缓存命中率、队列长度、在线会话数。
-4. Histogram 适合耗时分布，比如 P50/P95/P99 延迟。
-
-面试官可能问：为什么 Agent 项目要做指标？
-回答：LLM 应用上线后最怕“慢、贵、不稳定”。指标可以持续观察请求量、耗时、工具失败、
-缓存命中、token 消耗和质量分数，帮助定位是模型慢、工具慢、RAG 差，还是限流/缓存策略有问题。
+业务 API 返回 JSON，但 Prometheus 需要标准文本格式，所以这里直接返回 ``Response``。
+指标用于观察请求量、耗时、工具失败、缓存命中、token 消耗和质量分数。
 """
 
 from fastapi import APIRouter
@@ -103,6 +96,18 @@ tool_cache_hit_ratio = Gauge(
     "工具缓存当前命中率（0-1）",
 )
 
+tool_avg_latency_ms = Gauge(
+    "tool_avg_latency_ms",
+    "工具平均调用耗时（毫秒）",
+    ["tool_name"],
+)
+
+tool_max_latency_ms = Gauge(
+    "tool_max_latency_ms",
+    "工具最大调用耗时（毫秒）",
+    ["tool_name"],
+)
+
 # ── Workflow 指标 ─────────────────────────────────────────────────────────────
 # Workflow 是可审计链路，指标重点是完成/中断/超时/错误，以及是否触发 HITL。
 
@@ -141,6 +146,50 @@ rag_rewrite_variants_histogram = Histogram(
 
 # ── 端点 ──────────────────────────────────────────────────────────────────────
 
+business_request_total = Counter(
+    "business_request_total",
+    "按路由和状态统计的业务决策请求数",
+    ["route", "status"],
+)
+business_request_duration_seconds = Histogram(
+    "business_request_duration_seconds",
+    "业务请求端到端耗时（秒）",
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+)
+business_trace_step_duration_seconds = Histogram(
+    "business_trace_step_duration_seconds",
+    "业务 trace 步骤耗时（秒）",
+    ["step_type", "name", "status"],
+    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+)
+tool_call_total = Counter(
+    "tool_call_total",
+    "业务 trace 记录到的工具调用数",
+    ["tool_name", "status"],
+)
+rag_retrieval_total = Counter(
+    "rag_retrieval_total",
+    "业务 trace 记录到的 RAG 检索次数",
+    ["status"],
+)
+rag_empty_result_total = Counter("rag_empty_result_total", "没有可用证据的 RAG 检索次数")
+rag_index_rebuild_total = Counter("rag_index_rebuild_total", "RAG 索引重建次数", ["status"])
+rag_index_rebuild_duration_seconds = Histogram(
+    "rag_index_rebuild_duration_seconds",
+    "RAG 索引重建耗时（秒）",
+    buckets=[1.0, 5.0, 10.0, 30.0, 60.0, 300.0],
+)
+model_gateway_calls_total = Counter("model_gateway_calls_total", "模型网关调用次数", ["provider", "model", "status"])
+model_gateway_fallback_total = Counter("model_gateway_fallback_total", "模型网关降级次数", ["from_provider", "to_provider"])
+hitl_trigger_total = Counter("hitl_trigger_total", "HITL 人工介入触发次数", ["status"])
+workflow_interrupted_total = Counter("workflow_interrupted_total", "Workflow 中断次数", ["workflow_name"])
+memory_write_total = Counter("memory_write_total", "记忆写入次数", ["backend", "status"])
+guardrail_block_total = Counter("guardrail_block_total", "安全护栏拦截次数", ["rule"])
+prompt_injection_detected_total = Counter("prompt_injection_detected_total", "Prompt injection 命中次数", ["source"])
+data_freshness_lag_seconds = Gauge("data_freshness_lag_seconds", "数据新鲜度延迟（秒）", ["source"])
+llm_cost_total = Counter("llm_cost_total", "LLM 累计成本", ["provider", "model"])
+
+
 @router.get("/metrics")
 def metrics_endpoint() -> Response:
     """暴露 Prometheus 格式指标。
@@ -164,6 +213,39 @@ def metrics_endpoint() -> Response:
             tool_cache_hit_ratio.set(stats["hit_rate"])
         tool_cache_hits_total._value.set(stats["total_hits"])
         tool_cache_misses_total._value.set(stats["total_misses"])
+
+        from app.agents.tools.telemetry import get_tool_telemetry
+
+        for tool_name, metric in get_tool_telemetry().snapshot.items():
+            tool_calls_total.labels(tool_name=tool_name, status="success")._value.set(metric["success"])
+            tool_calls_total.labels(tool_name=tool_name, status="error")._value.set(metric["error"])
+            tool_calls_total.labels(tool_name=tool_name, status="timeout")._value.set(metric["timeout"])
+            tool_calls_total.labels(tool_name=tool_name, status="circuit_open")._value.set(metric["circuit_open"])
+            tool_calls_total.labels(tool_name=tool_name, status="permission_denied")._value.set(metric["permission_denied"])
+            tool_avg_latency_ms.labels(tool_name=tool_name).set(metric["avg_latency_ms"])
+            tool_max_latency_ms.labels(tool_name=tool_name).set(metric["max_latency_ms"])
+    except Exception:
+        pass
+
+    try:
+        from app.observability.business_trace import get_observability_metrics_snapshot
+
+        snapshot = get_observability_metrics_snapshot()
+        # 自研 trace 的实时计数先保存在进程内快照里。这里同步到 prometheus_client，
+        # 好处是业务模块不需要直接 import 指标对象，后续替换为队列/数据库也更容易。
+        for (route, status), value in snapshot.get("business_request_total", {}).items():
+            business_request_total.labels(route=route, status=status)._value.set(value)
+        for (tool_name, status), value in snapshot.get("tool_call_total", {}).items():
+            tool_call_total.labels(tool_name=tool_name, status=status)._value.set(value)
+        for (status,), value in snapshot.get("rag_retrieval_total", {}).items():
+            rag_retrieval_total.labels(status=status)._value.set(value)
+        rag_empty_result_total._value.set(snapshot.get("rag_empty_result_total", 0))
+        for (workflow_name,), value in snapshot.get("workflow_interrupted_total", {}).items():
+            workflow_interrupted_total.labels(workflow_name=workflow_name)._value.set(value)
+        for (status,), value in snapshot.get("hitl_trigger_total", {}).items():
+            hitl_trigger_total.labels(status=status)._value.set(value)
+        for (rule,), value in snapshot.get("guardrail_block_total", {}).items():
+            guardrail_block_total.labels(rule=rule)._value.set(value)
     except Exception:
         pass
 

@@ -1,3 +1,6 @@
+from datetime import datetime, timezone
+import json
+
 import pytest
 
 from app.memory.long_term import (
@@ -6,74 +9,9 @@ from app.memory.long_term import (
 )
 
 
-def test_long_term_memory_persists_across_instances(tmp_path):
-    db_path = tmp_path / "memory.sqlite3"
-    store = create_long_term_memory_store(db_path=db_path, default_ttl_days=None)
-    store.put(
-        ("sessions", "u1"),
-        "pref-1",
-        {"memory_type": "user_preference", "preference": "用户不接受替代 SKU", "_importance": 0.9},
-    )
-
-    reloaded = create_long_term_memory_store(db_path=db_path, default_ttl_days=None)
-    item = reloaded.get(("sessions", "u1"), "pref-1")
-
-    assert item is not None
-    assert item.value["preference"] == "用户不接受替代 SKU"
-
-
-def test_long_term_memory_search_uses_namespace_query_and_importance(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
-    store.put(
-        ("orders", "SO1"),
-        "low",
-        {"summary": "普通订单库存充足", "_importance": 0.1},
-    )
-    store.put(
-        ("orders", "SO1"),
-        "high",
-        {"summary": "高优先级订单缺货时需要人工复核", "_importance": 0.9},
-    )
-    store.put(
-        ("orders", "SO2"),
-        "other",
-        {"summary": "另一个订单缺货", "_importance": 1.0},
-    )
-
-    results = store.search(("orders", "SO1"), query="缺货 人工复核", limit=5)
-
-    assert [item.key for item in results][:1] == ["high"]
-    assert all(item.namespace == ("orders", "SO1") for item in results)
-
-
-def test_long_term_memory_ttl_expires_records(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
-    store.put(("sessions", "u1"), "short", {"summary": "马上过期"}, ttl=0)
-
-    assert store.get(("sessions", "u1"), "short") is None
-
-
-def test_long_term_memory_search_ignores_unrelated_high_importance(tmp_path):
-    store = create_long_term_memory_store(db_path=tmp_path / "memory.sqlite3", default_ttl_days=None)
-    store.put(
-        ("sessions", "u1"),
-        "unrelated",
-        {"summary": "客户偏好蓝色包装", "_importance": 1.0},
-    )
-    store.put(
-        ("sessions", "u1"),
-        "matched",
-        {"summary": "订单缺货时需要人工复核", "_importance": 0.4},
-    )
-
-    results = store.search(("sessions", "u1"), query="缺货 人工复核", limit=5)
-
-    assert [item.key for item in results] == ["matched"]
-
-
 def test_mysql_milvus_long_term_memory_requires_mysql_url():
     with pytest.raises(ValueError, match="MYSQL_URL|LONG_TERM_MEMORY_MYSQL_URL"):
-        create_long_term_memory_store(backend="mysql_milvus")
+        create_long_term_memory_store()
 
 
 def test_mysql_milvus_long_term_memory_factory_wires_enterprise_options(monkeypatch):
@@ -86,7 +24,6 @@ def test_mysql_milvus_long_term_memory_factory_wires_enterprise_options(monkeypa
     monkeypatch.setattr(MySQLMilvusLongTermMemoryStore, "__init__", fake_init)
 
     store = create_long_term_memory_store(
-        backend="mysql_milvus",
         mysql_url="mysql+pymysql://root:root@mysql:3306/multiship_agent",
         milvus_uri="http://milvus:19530",
         milvus_token="token",
@@ -110,6 +47,17 @@ def test_mysql_milvus_long_term_memory_factory_wires_enterprise_options(monkeypa
 
 def test_mysql_milvus_long_term_memory_exported():
     assert MySQLMilvusLongTermMemoryStore.__name__ == "MySQLMilvusLongTermMemoryStore"
+
+
+def test_mysql_milvus_embedding_dimension_mismatch_falls_back_to_text_search():
+    store = object.__new__(MySQLMilvusLongTermMemoryStore)
+    store.embedding_model = lambda text: [0.1, 0.2]
+    store.vector_dimension = 3
+
+    assert store._embedding_for("stockout manual review") is None
+
+    store.vector_dimension = 2
+    assert store._embedding_for("stockout manual review") == [0.1, 0.2]
 
 
 class _FakeBegin:
@@ -151,9 +99,6 @@ def _mysql_memory_row(
     importance: float = 0.5,
     access_count: int = 0,
 ):
-    from datetime import datetime, timezone
-    import json
-
     return {
         "id": row_id,
         "namespace": json.dumps(list(namespace), ensure_ascii=False),
@@ -181,7 +126,7 @@ def test_mysql_milvus_search_keeps_mysql_text_fallback_when_vector_hits_are_filt
         row_id=1,
         vector_id="v1",
         key="vector-only",
-        summary="客户偏好蓝色包装",
+        summary="customer prefers blue packaging",
         memory_type="user_preference",
         importance=0.95,
     )
@@ -189,7 +134,7 @@ def test_mysql_milvus_search_keeps_mysql_text_fallback_when_vector_hits_are_filt
         row_id=2,
         vector_id="v2",
         key="lexical-match",
-        summary="订单缺货时需要人工复核",
+        summary="order stockout needs manual review",
         memory_type="order_decision",
         importance=0.4,
     )
@@ -202,13 +147,13 @@ def test_mysql_milvus_search_keeps_mysql_text_fallback_when_vector_hits_are_filt
 
     results = store.search(
         ("orders", "SO1"),
-        query="缺货 人工复核",
+        query="stockout manual review",
         filter={"memory_type": "order_decision"},
         limit=5,
     )
 
     assert [item.key for item in results] == ["lexical-match"]
-    assert results[0].value["summary"] == "订单缺货时需要人工复核"
+    assert results[0].value["summary"] == "order stockout needs manual review"
     assert any("access_count=access_count+1" in sql for sql, _ in store._engine.conn.executed)
 
 

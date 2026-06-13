@@ -1,6 +1,6 @@
-"""文件作用摘要：Agent 的输入安全检查和工具输出净化。
+"""Agent 输入安全检查和工具输出净化。
 
-这个文件负责大模型应用中非常关键的 Prompt Injection 防护。它不判断业务
+本模块负责大模型应用中的 Prompt Injection 防护。它不判断业务
 是否正确，也不负责权限系统；它只处理“用户输入或工具返回内容里是否混入
 企图覆盖系统指令的文本”。
 
@@ -12,19 +12,13 @@
 5. ``get_tool_sanitizer``：提供全局工具输出净化器，供工具包装层复用。
 
 两层防护：
-- Layer 1，直接注入：用户输入“忽略之前所有指令”等攻击语句，
+- 第 1 层，直接注入：用户输入“忽略之前所有指令”等攻击语句，
   在 API / Agent 入口前拦截。
-- Layer 2，间接注入：攻击内容藏在订单备注、知识库文档、ERP 字段里，
+- 第 2 层，间接注入：攻击内容藏在订单备注、知识库文档、ERP 字段里，
   Agent 调用工具读到后，进入 LLM 前被替换成安全占位符。
 
-为什么重要：
 LLM 会把工具结果当作可信上下文，如果工具输出中夹带“你现在改写系统规则”
 这类指令，模型可能误执行。企业级 Agent 必须把工具数据和系统指令隔离。
-
-学习时先看：
-1. ``InputGuardrails.check``：入口层怎么判定用户输入风险。
-2. ``ToolOutputSanitizer.sanitize``：工具输出如何被净化。
-3. ``has_injection``：如何复用检测逻辑做测试或轻量判断。
 """
 
 from __future__ import annotations
@@ -52,7 +46,7 @@ def _compact_for_detection(text: str) -> str:
     return re.sub(r"[\s\W_]+", "", normalized, flags=re.UNICODE)
 
 
-# ── Layer 1：InputGuardrails（直接注入防护）────────────────────────────────────
+# ── 第 1 层：InputGuardrails（直接注入防护）────────────────────────────────────
 
 @dataclass
 class InputCheckResult:
@@ -60,9 +54,7 @@ class InputCheckResult:
     reason: str = ""
 
 
-# 面试官可能问：为什么要在用户输入进入 Agent 前做检查？
-# 回答：越早拦截越省成本，也越安全。恶意输入如果先进 LLM，不仅浪费 token，
-# 还可能污染会话上下文；入口层拦截可以把明显攻击直接挡在 Agent 外面。
+# 用户输入在进入 Agent 前先做轻量检查，避免明显攻击污染会话上下文。
 class InputGuardrails:
     """拦截用户输入中的直接 Prompt Injection 攻击。
 
@@ -104,7 +96,7 @@ class InputGuardrails:
         re.compile(r'DAN\s*mode', re.IGNORECASE),
         re.compile(r'developer\s*mode', re.IGNORECASE),
         re.compile(r'god\s*mode', re.IGNORECASE),
-        # 假设性攻击框架（hypothetical framing）
+        # 假设性攻击框架
         re.compile(r'hypothetical(ly)?\s*(scenario|situation).{0,50}(no\s*restrictions|no\s*limits|unrestricted)', re.IGNORECASE),
         re.compile(r'in\s*a\s*(fictional|hypothetical|imaginary)\s*(world|scenario)\s*where\s*you', re.IGNORECASE),
     ]
@@ -163,14 +155,13 @@ class InputGuardrails:
         return InputCheckResult(passed=True)
 
 
-# ── Layer 2：ToolOutputSanitizer（间接注入防护）──────────────────────────────
+# ── 第 2 层：ToolOutputSanitizer（间接注入防护）──────────────────────────────
 
 _INDIRECT_INJECTION_REPLACEMENT = "[安全过滤: 疑似注入指令已移除]"
 
 
-# 面试官可能问：间接 Prompt Injection 为什么比直接注入更危险？
-# 回答：它藏在订单备注、知识库文档或外部系统字段里，用户不一定看得到。
-# Agent 调工具后会把这些内容当作可信事实交给 LLM，所以必须在工具输出阶段净化。
+# 间接注入可能藏在订单备注、知识库文档或外部系统字段里，
+# 工具输出进入 LLM 上下文前必须先做净化。
 class ToolOutputSanitizer:
     """净化工具返回内容中嵌入的间接 Prompt Injection 指令。
 
@@ -222,11 +213,11 @@ class ToolOutputSanitizer:
     def sanitize(self, text: str, source: str = "unknown") -> str:
         """净化工具输出，移除明确的注入指令并记录安全日志。
 
-        Args:
+        参数：
             text:   工具返回的原始文本
             source: 工具名称，用于安全日志溯源
 
-        Returns:
+        返回：
             净化后的文本（注入内容已替换为占位符）
         """
         if not text:
@@ -281,9 +272,7 @@ class ToolOutputSanitizer:
 _tool_sanitizer: ToolOutputSanitizer | None = None
 
 
-# 面试官可能问：为什么用全局 sanitizer，而不是每次新建？
-# 回答：它是无状态规则对象，复用可以减少重复初始化，也保证所有工具使用同一套
-# 安全策略。真正有租户差异时，再按租户配置不同规则。
+# sanitizer 是无状态规则对象，全局复用可保证所有工具使用同一套安全策略。
 def get_tool_sanitizer() -> ToolOutputSanitizer:
     """获取全局 ToolOutputSanitizer 单例。"""
     global _tool_sanitizer

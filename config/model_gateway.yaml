@@ -18,6 +18,8 @@ default_models:
   workflow: deepseek-v4-pro
   plan_execute: deepseek-v4-pro
   supervisor: deepseek-v4-pro
+  multi_agent: deepseek-v4-pro
+  mcp: deepseek-v4-flash
   judge: deepseek-v4-pro
   workflow_finalize: deepseek-v4-flash
   structured_extract: deepseek-v4-flash
@@ -25,6 +27,226 @@ default_models:
   rag_compress: deepseek-v4-flash
   embedding: aliyun-text-embedding-v4
   reranker: aliyun-qwen3-rerank
+
+default_prompts:
+  agent: fulfillment_agent
+  supervisor: supervisor_agent
+  multi_agent: synthesizer_agent
+  plan_execute: plan_execute_planner
+  hybrid_router: hybrid_router
+  casual_chat: casual_chat
+  workflow_finalize: workflow_finalize
+  structured_extract: structured_extract
+  memory_extract: memory_extract
+  rag_rewrite: rag_rewrite
+  rag_compress: rag_compress
+  input_guardrail: input_guardrail
+
+prompt_profiles:
+  fulfillment_agent:
+    use_case: agent
+    path: ../prompts/fulfillment_agent_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  supervisor_agent:
+    use_case: supervisor
+    path: ../prompts/supervisor_agent_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: SupervisorDecision
+
+  synthesizer_agent:
+    use_case: multi_agent
+    path: ../prompts/synthesizer_agent_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  multi_inventory_agent:
+    use_case: multi_agent
+    path: ../prompts/multi_agent/inventory_agent_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  multi_fulfillment_agent:
+    use_case: multi_agent
+    path: ../prompts/multi_agent/fulfillment_agent_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  multi_risk_agent:
+    use_case: multi_agent
+    path: ../prompts/multi_agent/risk_agent_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  hybrid_router:
+    use_case: hybrid_router
+    path: ../prompts/router/hybrid_router_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: json
+
+  casual_chat:
+    use_case: casual_chat
+    path: ../prompts/router/casual_chat_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  rag_rewrite:
+    use_case: rag_rewrite
+    path: ../prompts/rag/rag_rewrite_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  rag_compress:
+    use_case: rag_compress
+    path: ../prompts/rag/rag_compress_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  rag_intent_classifier:
+    use_case: rag_rewrite
+    path: ../prompts/rag/rag_intent_classifier_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: json
+
+  structured_extract:
+    use_case: structured_extract
+    path: ../prompts/extraction/structured_extract_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: FulfillmentDecision
+
+  memory_extract:
+    use_case: memory_extract
+    path: ../prompts/extraction/memory_extract_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: ExtractedMemoryBatch
+
+  workflow_finalize:
+    use_case: workflow_finalize
+    path: ../prompts/workflow/workflow_finalize_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  input_guardrail:
+    use_case: input_guardrail
+    path: ../prompts/guardrail/input_guardrail_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: json
+
+  plan_execute_planner:
+    use_case: plan_execute
+    path: ../prompts/plan_execute/planner_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: Plan
+
+  plan_execute_replanner:
+    use_case: plan_execute
+    path: ../prompts/plan_execute/replanner_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: ReplanDecision
+
+  plan_execute_synthesizer:
+    use_case: plan_execute
+    path: ../prompts/plan_execute/synthesizer_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  plan_execute_executor:
+    use_case: plan_execute
+    path: ../prompts/plan_execute/executor_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+# 模型降级链：主模型调用失败、超时或供应商异常时，按这里的顺序尝试。
+# 注意：只有 enabled=true 且 API Key 已配置的模型才会真正进入运行时降级链。
+# 你接入降级模型时，通常只需要：
+# 1. 把下面候选模型对应的 enabled 改成 true
+# 2. 配好对应 API Key 环境变量
+# 3. 必要时调整每个 use_case 的顺序
+fallback_policy:
+  # 默认不对未知错误降级，避免认证、入参、结构化 schema 等真实缺陷被 fallback 掩盖。
+  fallback_on_unknown_error: false
+  # 只有供应商临时性问题才自动降级；业务错误和配置错误应直接暴露。
+  retryable_error_types:
+    - timeout
+    - rate_limit
+    - server_error
+    - connection_error
+
+fallback_models:
+  agent: [qwen3.7-max, kimi-chat, deepseek-chat]
+  workflow: [qwen3.7-max, kimi-chat, deepseek-chat]
+  plan_execute: [qwen3.7-max, kimi-chat, deepseek-chat]
+  supervisor: [qwen3.7-max, claude-sonnet, deepseek-chat]
+  multi_agent: [qwen3.7-max, deepseek-chat]
+  mcp: [qwen-flash, local-qwen-small, deepseek-chat]
+  judge: [claude-sonnet, deepseek-chat]
+  workflow_finalize: [qwen-flash, local-qwen-small, deepseek-chat]
+  structured_extract: [qwen-flash, local-qwen-small, deepseek-chat]
+  rag_rewrite: [qwen-flash, local-qwen-small, deepseek-chat]
+  rag_compress: [qwen-flash, local-qwen-small, deepseek-chat]
 
 models:
   - id: deepseek-v4-pro
@@ -49,7 +271,7 @@ models:
     priority: 5
     tier: strong
     deployment: cloud
-    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "judge"]
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "judge"]
 
   - id: deepseek-v4-flash
     display_name: DeepSeek V4 Flash
@@ -60,7 +282,7 @@ models:
     extra_body:
       thinking:
         type: disabled
-    streaming: true
+    streaming: false
     input_price_per_1m_tokens: 0.14
     output_price_per_1m_tokens: 0.28
     input_cache_hit_price_per_1m_tokens: 0.0028
@@ -70,7 +292,7 @@ models:
     priority: 6
     tier: small
     deployment: cloud
-    use_cases: ["workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress"]
+    use_cases: ["mcp", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress"]
 
   - id: deepseek-chat
     display_name: DeepSeek Chat
@@ -87,22 +309,21 @@ models:
     priority: 10
     tier: strong
     deployment: cloud
-    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress", "judge"]
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "mcp", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress", "judge"]
 
-  # 轻量云模型示例：适合 RAG query 改写、片段压缩、结构化抽取。
-  # 开通通义后，把 enabled 改成 true，并把 default_models.rag_rewrite / rag_compress 指到 qwen-turbo。
-  - id: qwen-turbo
-    display_name: Qwen Turbo
+  # 轻量云模型：适合 RAG query 改写、片段压缩、结构化抽取。
+  - id: qwen-flash
+    display_name: Qwen Flash
     model_type: chat
     provider: openai_compatible
-    model: qwen-turbo
+    model: qwen-flash
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key_env: QWEN_API_KEY
-    enabled: false
+    api_key_env: DASHSCOPE_API_KEY
+    enabled: true
     priority: 5
     tier: small
     deployment: cloud
-    use_cases: ["rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
+    use_cases: ["mcp", "rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
 
   # 本地开源小模型示例：vLLM / Ollama / LM Studio 都可以提供 OpenAI-compatible 接口。
   # 例如本地启动 http://localhost:8003/v1 后，将 enabled 改成 true，
@@ -119,20 +340,20 @@ models:
     priority: 1
     tier: small
     deployment: local
-    use_cases: ["rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
+    use_cases: ["mcp", "rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
 
-  - id: qwen-max
-    display_name: Qwen Max
+  - id: qwen3.7-max
+    display_name: Qwen3.7 Max
     model_type: chat
     provider: openai_compatible
-    model: qwen-max
+    model: qwen3.7-max
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key_env: QWEN_API_KEY
-    enabled: false
+    api_key_env: DASHSCOPE_API_KEY
+    enabled: true
     priority: 20
     tier: strong
     deployment: cloud
-    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "workflow_finalize"]
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "workflow_finalize"]
 
   - id: kimi-chat
     display_name: Moonshot Kimi
@@ -228,21 +449,6 @@ models:
     api_key_env: DASHSCOPE_API_KEY
     enabled: true
     priority: 15
-    tier: standard
-    deployment: cloud
-    top_k: 5
-    use_cases: ["reranker"]
-
-  # 云端 Reranker：适合不想维护本地精排模型的部署；启用时需要 JINA_API_KEY。
-  - id: jina-reranker-v2
-    display_name: Jina Reranker v2 Multilingual
-    model_type: reranker
-    provider: jina
-    model: jina-reranker-v2-base-multilingual
-    base_url: https://api.jina.ai/v1/rerank
-    api_key_env: JINA_API_KEY
-    enabled: false
-    priority: 20
     tier: standard
     deployment: cloud
     top_k: 5

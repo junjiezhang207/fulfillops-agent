@@ -1,4 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ClipboardCheck, PauseCircle, ShieldAlert } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -6,50 +6,57 @@ import { Link, useParams } from "react-router-dom";
 import { EmptyState } from "../components/EmptyState";
 import { ReviewPanel } from "../components/ReviewPanel";
 import { StatusPill } from "../components/StatusPill";
-import { resumeHybrid } from "../lib/api";
-import { mockReviewRows, riskToneFromLevel, type RiskLevel } from "../lib/mockData";
+import { getHitlStats, listPendingApprovals, resumeHybrid, type ApprovalAuditEntry } from "../lib/api";
 import { useReviewStore, type PendingReview } from "../store/reviewStore";
 
 type ReviewRow = {
   orderId: string;
-  riskLevel: RiskLevel | string;
+  riskLevel: string;
   reason: string;
   platform: string;
   action: string;
   sla: string;
-  pending?: PendingReview;
+  threadId: string;
 };
 
-function rowsFromQueue(pendingReviews: PendingReview[]): ReviewRow[] {
-  if (pendingReviews.length === 0) return mockReviewRows;
+function riskToneFromLevel(level: string) {
+  if (level === "CRITICAL" || level === "HIGH") return "danger";
+  if (level === "MEDIUM") return "warn";
+  if (level === "LOW") return "ok";
+  return "neutral";
+}
 
-  return pendingReviews.map((review) => ({
-    orderId: review.orderId,
-    riskLevel: review.interrupt.risk_level,
-    reason: review.interrupt.risk_signals?.join(" / ") || review.interrupt.prompt,
-    platform: String(review.interrupt.context.platform || "OMS"),
+function rowsFromApprovals(items: ApprovalAuditEntry[]): ReviewRow[] {
+  return items.map((item) => ({
+    orderId: item.order_id,
+    riskLevel: item.risk_level,
+    reason: item.risk_signals?.join(" / ") || item.reason || "等待人工确认",
+    platform: "OMS/WMS",
     action: "人工确认后恢复履约",
-    sla: `${Math.max(1, Math.floor((review.interrupt.timeout_seconds || 1800) / 3600))} 小时内`,
-    pending: review,
+    sla: item.requested_at ? `请求时间 ${new Date(item.requested_at).toLocaleString()}` : "待处理",
+    threadId: item.thread_id,
   }));
 }
 
 function ReviewDetail({ row }: { row?: ReviewRow }) {
-  const removePendingReview = useReviewStore((state) => state.removePendingReview);
+  const queryClient = useQueryClient();
   const [decision, setDecision] = useState<"approved" | "rejected">("approved");
   const [notes, setNotes] = useState("");
 
   const mutation = useMutation({
     mutationFn: async () => {
-      if (!row?.pending) return null;
+      if (!row) return null;
       if (!notes.trim()) throw new Error("请先填写审核备注，说明通过或暂停的原因。");
       const response = await resumeHybrid({
-        threadId: row.pending.threadId,
+        threadId: row.threadId,
         decision,
         notes: notes.trim(),
       });
-      removePendingReview(row.pending.threadId);
       return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["pending-approvals"] });
+      queryClient.invalidateQueries({ queryKey: ["hitl-stats"] });
     },
   });
 
@@ -82,12 +89,6 @@ function ReviewDetail({ row }: { row?: ReviewRow }) {
         </article>
       </div>
 
-      {!row.pending && (
-        <div className="info-box">
-          当前为兜底展示任务。真实任务会从智能履约页触发 HITL 后进入这里，并在提交时调用 `/hybrid/resume`。
-        </div>
-      )}
-
       <label className="field-label" htmlFor="notes">审核备注</label>
       <textarea
         id="notes"
@@ -109,19 +110,24 @@ function ReviewDetail({ row }: { row?: ReviewRow }) {
       {mutation.error && <div className="error-box">{mutation.error instanceof Error ? mutation.error.message : "提交失败"}</div>}
       {mutation.data && <div className="success-box">审核已提交，Hybrid 流程已恢复处理。</div>}
 
-      <button className="primary-button full-width" type="button" disabled={!row.pending || mutation.isPending} onClick={() => mutation.mutate()}>
-        {mutation.isPending ? "提交中..." : row.pending ? "提交审核结论" : "仅真实待审任务可提交"}
+      <button className="primary-button full-width" type="button" disabled={mutation.isPending} onClick={() => mutation.mutate()}>
+        {mutation.isPending ? "提交中..." : "提交审核结论"}
       </button>
     </section>
   );
 }
 
 export function ReviewQueuePage() {
-  const pendingReviews = useReviewStore((state) => state.pendingReviews);
-  const rows = useMemo(() => rowsFromQueue(pendingReviews), [pendingReviews]);
+  const pendingApprovals = useQuery({ queryKey: ["pending-approvals"], queryFn: () => listPendingApprovals() });
+  const hitlStats = useQuery({ queryKey: ["hitl-stats"], queryFn: getHitlStats });
+  const rows = useMemo(() => rowsFromApprovals(pendingApprovals.data?.data.items || []), [pendingApprovals.data]);
   const [selectedOrderId, setSelectedOrderId] = useState(rows[0]?.orderId || "");
   const selectedRow = rows.find((row) => row.orderId === selectedOrderId) || rows[0];
   const highRiskCount = rows.filter((row) => ["HIGH", "CRITICAL"].includes(row.riskLevel.toUpperCase())).length;
+  const processedCount =
+    (hitlStats.data?.data.approved_count || 0)
+    + (hitlStats.data?.data.rejected_count || 0)
+    + (hitlStats.data?.data.escalated_count || 0);
 
   return (
     <div className="page page--demo">
@@ -132,18 +138,18 @@ export function ReviewQueuePage() {
           <p>当系统遇到高风险、缺货、跨仓调拨或替代 SKU 时，会暂停自动履约，并等待人工确认后继续流程。</p>
         </div>
         <div className="demo-metric-row">
-          <article className="demo-metric"><span>真实待审</span><strong>{pendingReviews.length}</strong><small>来自 Hybrid 中断</small></article>
-          <article className="demo-metric"><span>高风险任务</span><strong>{highRiskCount}</strong><small>含兜底队列</small></article>
-          <article className="demo-metric"><span>今日已处理</span><strong>42</strong><small>通过 / 暂停</small></article>
+          <article className="demo-metric"><span>真实待审</span><strong>{rows.length}</strong><small>来自 MySQL HITL</small></article>
+          <article className="demo-metric"><span>高风险任务</span><strong>{highRiskCount}</strong><small>HIGH / CRITICAL</small></article>
+          <article className="demo-metric"><span>累计已处理</span><strong>{processedCount}</strong><small>通过 / 暂停 / 升级</small></article>
         </div>
       </header>
 
-      {pendingReviews.length === 0 && (
+      {rows.length === 0 && (
         <section className="workspace empty-callout">
           <EmptyState
             icon={ClipboardCheck}
             title="当前没有真实待审任务"
-            description="从智能履约页触发高风险订单后，真实 HITL 任务会进入这里。下方保留兜底队列，避免页面空白。"
+            description="从智能履约页触发高风险订单后，HITL 任务会写入 MySQL 并进入这里。"
             action={<Link className="secondary-button" to="/">去智能履约页</Link>}
           />
         </section>
@@ -158,6 +164,8 @@ export function ReviewQueuePage() {
             </div>
           </div>
           <div className="hitl-list">
+            {pendingApprovals.isLoading && <div className="empty-mini">正在读取待审任务...</div>}
+            {pendingApprovals.isError && <div className="error-box">待审任务加载失败，请检查后端和 MySQL 配置。</div>}
             {rows.map((row) => (
               <button className={row.orderId === selectedRow?.orderId ? "hitl-card selected" : "hitl-card"} key={row.orderId} type="button" onClick={() => setSelectedOrderId(row.orderId)}>
                 <div>

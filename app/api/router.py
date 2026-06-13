@@ -1,14 +1,7 @@
 """顶层 API 路由注册中心。
 
-文件作用摘要：
-这个文件是所有 API 子路由的“总装配点”。每个功能模块都在 ``app/api/routes/`` 下维护
-自己的 ``APIRouter``，这里统一 ``include_router``，最后由 ``app/main.py`` 把总路由挂到
-``/api/v1``。
-
-为什么不把所有接口都写在一个文件？
-1. 订单、库存、知识库、Agent、Workflow 的依赖和错误处理都不同，拆开后更容易维护。
-2. FastAPI 的 ``APIRouter`` 天然支持按模块拆分，路由 prefix、tags、依赖都可以局部管理。
-3. 面试或排查时可以按 URL 快速定位文件：例如 ``/agent/chat`` 对应 ``routes/agent.py``。
+每个功能模块都在 ``app/api/routes/`` 下维护自己的 ``APIRouter``，
+本模块统一注册子路由，最后由 ``app/main.py`` 挂载到 ``/api/v1``。
 
 新增 API 模块的步骤：
 1. 在 ``app/api/routes`` 下创建新文件，并定义 ``router = APIRouter(prefix="...")``。
@@ -27,6 +20,7 @@ from app.api.routes.knowledge import router as knowledge_router
 from app.api.routes.knowledge_mgmt import router as knowledge_mgmt_router
 from app.api.routes.metrics import router as metrics_router
 from app.api.routes.models import router as models_router
+from app.api.routes.observability import router as observability_router
 from app.api.routes.orders import router as order_router
 from app.api.routes.workflow import router as workflow_router
 
@@ -46,4 +40,5 @@ router.include_router(workflow_router, tags=["workflow"])
 router.include_router(agent_router, tags=["agent"])
 router.include_router(hybrid_router, tags=["hybrid"])
 router.include_router(models_router, tags=["models"])
+router.include_router(observability_router, tags=["observability"])
 router.include_router(metrics_router, tags=["observability"])  # 获取 /metrics 指标

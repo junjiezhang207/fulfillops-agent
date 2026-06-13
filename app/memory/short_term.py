@@ -3,22 +3,20 @@
 短期记忆 = 会话内的对话历史（多轮对话上下文）。
 
 技术选型：
-  旧版：MemorySaver（进程内存，重启丢失）
-  新版：RedisSaver（Redis 持久化，重启仍在，多实例共享）
+  RedisSaver（Redis 持久化，重启仍在，多实例共享）
 
 接入方式：
   graph.compile(checkpointer=create_redis_checkpointer())
 
-降级策略：
-  Redis 不可用时自动 fallback 到 MemorySaver，
-  服务不中断，只是重启后短期记忆会丢失。
+生产策略：
+  Redis 不可用时直接抛异常。短期记忆、工具缓存和限流都属于跨实例一致性能力，
+  不能在生产里静默降级为进程内存，否则多实例下会出现状态不一致。
 """
 
 import logging
 from typing import Optional
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.memory import MemorySaver
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +35,7 @@ def create_redis_checkpointer(
         ttl_seconds: 会话 TTL（秒），超时自动清理，默认 24 小时
 
     Returns:
-        RedisSaver（Redis 可用时）或 MemorySaver（降级）
+        RedisSaver。Redis 不可用时抛出异常。
 
     接入示例：
         checkpointer = create_redis_checkpointer("redis://localhost:6379")
@@ -45,8 +43,7 @@ def create_redis_checkpointer(
 
     """
     if not redis_url:
-        logger.info("短期记忆：未配置 Redis URL，使用 MemorySaver")
-        return MemorySaver()
+        raise RuntimeError("短期记忆必须配置 REDIS_URL，生产模式不允许降级到 MemorySaver。")
     url = redis_url or _DEFAULT_REDIS_URL
 
     try:
@@ -67,10 +64,7 @@ def create_redis_checkpointer(
         return saver
 
     except Exception as exc:
-        logger.warning(
-            "短期记忆：Redis 不可用（%s），降级使用 MemorySaver", exc
-        )
-        return MemorySaver()
+        raise RuntimeError(f"短期记忆 Redis 不可用，已拒绝降级：{exc}") from exc
 
 
 def get_session_history_from_redis(
@@ -88,7 +82,7 @@ def get_session_history_from_redis(
         redis_url:  Redis 连接地址
 
     Returns:
-        RedisChatMessageHistory（Redis 可用）或 InMemoryChatMessageHistory（降级）
+        RedisChatMessageHistory。Redis 不可用时抛出异常。
 
     接入示例：
         from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -99,8 +93,7 @@ def get_session_history_from_redis(
 
     """
     if not redis_url:
-        from langchain_core.chat_history import InMemoryChatMessageHistory
-        return InMemoryChatMessageHistory()
+        raise RuntimeError("会话历史必须配置 REDIS_URL，生产模式不允许降级到内存历史。")
     url = redis_url or _DEFAULT_REDIS_URL
 
     try:
@@ -111,6 +104,5 @@ def get_session_history_from_redis(
             ttl=86400,  # 24 小时
             key_prefix="multiship:chat:",
         )
-    except Exception:
-        from langchain_core.chat_history import InMemoryChatMessageHistory
-        return InMemoryChatMessageHistory()
+    except Exception as exc:
+        raise RuntimeError(f"Redis 会话历史不可用，已拒绝降级：{exc}") from exc

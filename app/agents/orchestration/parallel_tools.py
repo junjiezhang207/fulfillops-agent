@@ -1,8 +1,8 @@
-"""文件作用摘要：让多个互不依赖的 Agent 工具并发执行。
+"""Agent 工具并发执行支持。
 
 ReAct Agent 默认往往是串行调用工具：先查订单，再查库存，再查知识库。
 但有些工具之间没有依赖关系，例如同时查库存和查规则，串行会浪费等待时间。
-这个文件提供并发执行能力，目标是降低端到端延迟。
+本模块提供并发执行能力，目标是降低端到端延迟。
 
 主要做的事：
 1. ``ParallelToolRunner.run_parallel``：异步并发执行多个 LangChain 工具。
@@ -14,11 +14,6 @@ ReAct Agent 默认往往是串行调用工具：先查订单，再查库存，�
 两种使用方式：
 - 外部并行：业务代码提前知道要查哪些工具，直接用 ``ParallelToolRunner``。
 - Agent 主动并行：把 ``parallel_query`` 注册给 Agent，让模型自己决定并行查什么。
-
-学习时先看：
-1. ``ParallelToolRunner.run_parallel``：asyncio 并发主流程。
-2. ``run_parallel_sync``：同步入口如何复用 async-native 工具并发。
-3. ``make_parallel_query_tool``：元工具的参数格式和返回格式。
 """
 
 from __future__ import annotations
@@ -34,9 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ── 模式 A：外部并行执行器 ────────────────────────────────────────────────────
 
-# 面试官可能问：Agent 工具为什么需要并行执行？
-# 回答：有些工具互不依赖，比如查库存和查规则可以同时做。并行执行能减少
-# 总等待时间，尤其在工具访问外部系统时，比串行 ReAct 一步步查更快。
+# 互不依赖的工具可以并发执行，尤其适合访问外部系统时降低总等待时间。
 class ParallelToolRunner:
     """在 Agent 之外并行执行多个工具，结果注入会话上下文。
 
@@ -92,9 +85,7 @@ class ParallelToolRunner:
 
 # ── 模式 B：并行元工具（Agent 主动调用）──────────────────────────────────────
 
-# 面试官可能问：parallel_query 元工具有什么风险？
-# 回答：它让模型一次触发多个工具，提升效率，但也可能增加下游压力。
-# 所以生产上要限制可并行工具白名单、最大并发数和参数校验，避免模型滥用。
+# parallel_query 会放大下游压力，生产环境应限制工具白名单、最大并发数和参数校验。
 def make_parallel_query_tool(tools_registry: dict[str, BaseTool]) -> StructuredTool:
     """创建 parallel_query 元工具，让 Agent 主动并发调用多个工具。
 

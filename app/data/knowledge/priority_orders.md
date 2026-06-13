@@ -1,3 +1,13 @@
+---
+category: priority_rule
+title: 高优先级订单履约规范
+owner: fulfillment-ops
+version: v1
+effective_date: 2026-01-01
+business_scope: [优先级, 大促, 会员订单]
+region: all
+---
+
 # 高优先级订单履约规范
 
 高优先级订单通常包括大促核心订单、会员高价值订单、平台时效敏感订单。

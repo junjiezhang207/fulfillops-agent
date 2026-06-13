@@ -1,7 +1,6 @@
 """固定业务工作流 API。
 
-文件作用摘要：
-这个文件暴露 ``WorkflowService`` 的 HTTP 入口。与 ReAct Agent 不同，Workflow 是一条
+本模块暴露 ``WorkflowService`` 的 HTTP 入口。与 ReAct Agent 不同，Workflow 是一条
 固定履约链路：订单分析 → 库存判断 → 知识检索/人工审批 → 最终答案。
 
 端点：
@@ -9,14 +8,8 @@
     POST /api/v1/workflow/run/stream   — SSE 流式执行（每个节点完成即推送）
     POST /api/v1/workflow/run/timeout  — 带超时的异步执行（超过 N 秒返回 408）
 
-学习重点：
-1. Workflow 适合确定性强、可审计、业务节点固定的链路。
-2. Agent 适合开放问题，Workflow 适合 SOP 流程。
-3. API 层在这里额外做了限流和超时保护，避免商家端重复点击把后端打满。
-
-面试官可能问：Workflow 和 Agent 为什么都要有？
-回答：真实企业系统里不是所有问题都适合交给 Agent 自由发挥。固定履约链路需要稳定、
-可追踪、可回放；Agent 则用于复杂追问和跨工具推理。两者组合比单独依赖 Agent 更稳。
+Workflow 适合确定性强、可审计、业务节点固定的 SOP 链路；
+Agent 适合开放追问和跨工具推理。API 层在这里额外做限流和超时保护。
 """
 
 import json
@@ -69,12 +62,42 @@ def run_workflow(request: WorkflowRunRequest, http_request: Request) -> ApiRespo
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except OrderNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     return ApiResponse(
         success=True,
         message="工作流执行完成。",
         data=result.model_dump(mode="json"),
     )
+
+
+@router.get("/approvals/pending", response_model=ApiResponse)
+def list_pending_approvals(risk_level: str | None = Query(None)) -> ApiResponse:
+    """查询 MySQL 中待人工审核的 HITL 工单。"""
+    rows = _workflow_service.list_pending_approvals(risk_level)
+    return ApiResponse(
+        success=True,
+        message=f"共 {len(rows)} 条待审核任务。",
+        data={"items": [row.model_dump(mode="json") for row in rows]},
+    )
+
+
+@router.get("/approvals/history/{order_id}", response_model=ApiResponse)
+def get_approval_history(order_id: str) -> ApiResponse:
+    """查询某个订单的人工审核历史。"""
+    rows = _workflow_service.get_approval_history(order_id)
+    return ApiResponse(
+        success=True,
+        message=f"共 {len(rows)} 条审核历史。",
+        data={"items": [row.model_dump(mode="json") for row in rows]},
+    )
+
+
+@router.get("/approvals/stats", response_model=ApiResponse)
+def get_hitl_stats() -> ApiResponse:
+    """查询 HITL 审核统计。"""
+    return ApiResponse(success=True, message="HITL 统计完成。", data=_workflow_service.get_hitl_stats())
 
 
 # ── 端点 2：SSE 流式执行（每个节点完成即推送）──────────────────────────────────

@@ -8,20 +8,15 @@ from app.comparison.framework import (
     PathType,
 )
 from app.core.config import get_settings
+from app.core.service_registry import (
+    get_inventory_analysis_service,
+    get_knowledge_retrieval_service,
+    get_order_analysis_service,
+)
 from app.infrastructure.llm.chat_adapter import LLMFactory
-from app.repositories.file_system_knowledge_repository import (
-    FileSystemKnowledgeRepository,
-)
-from app.repositories.in_memory_inventory_repository import (
-    InMemoryInventoryRepository,
-)
-from app.repositories.in_memory_order_repository import InMemoryOrderRepository
 from app.schemas.workflow import WorkflowRunRequest
 from app.agents.runtime.agent_service import AgentService
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
-from app.domain.inventory.analysis import InventoryAnalysisService
-from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
-from app.domain.orders.analysis import OrderAnalysisService
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
 from app.domain.inventory.warehouse_service import WarehouseService
 from app.application.workflow.workflow_service import WorkflowService
@@ -33,21 +28,10 @@ class ComparisonExecutor:
     def __init__(self):
         settings = get_settings()
 
-        # 初始化所有服务
-        order_repo = InMemoryOrderRepository()
-        self.order_service = OrderAnalysisService(order_repo)
-
-        inventory_repo = InMemoryInventoryRepository()
-        self.inventory_service = InventoryAnalysisService(
-            inventory_repository=inventory_repo,
-            order_analysis_service=self.order_service,
-        )
-
-        knowledge_repo = FileSystemKnowledgeRepository(settings.knowledge_dir)
-        self.knowledge_service = KnowledgeRetrievalService(
-            knowledge_repository=knowledge_repo,
-            inventory_analysis_service=self.inventory_service,
-        )
+        # 初始化生产服务。对比执行器不再构造 demo 内存数据，避免评估结果脱离真实数据源。
+        self.order_service = get_order_analysis_service()
+        self.inventory_service = get_inventory_analysis_service()
+        self.knowledge_service = get_knowledge_retrieval_service()
 
         # 固定工作流
         self.workflow_service = WorkflowService(

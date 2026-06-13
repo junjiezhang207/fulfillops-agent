@@ -13,9 +13,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-import time
 import uuid
 from typing import AsyncIterator
 
@@ -35,6 +33,7 @@ from app.schemas.workflow import (
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.domain.orders.analysis import OrderAnalysisService
+from app.application.workflow.hitl_store import MySQLHitlStore, RedisWorkflowIdempotencyStore
 
 
 class WorkflowTimeoutError(Exception):
@@ -70,46 +69,6 @@ def _safe_serialize(obj: object) -> object:
         return str(obj)
 
 
-# ── 幂等性存储（内存 TTL 缓存）────────────────────────────────────────────────
-
-class _IdempotencyStore:
-    """相同请求在 TTL 内直接返回缓存结果，避免重复执行。
-
-    key 由 (order_id + question + sorted(filter_categories)) 的 SHA-256 决定。
-    生产环境替换为 Redis SET + EXPIRE 即可，接口不变。
-    """
-
-    def __init__(self, ttl: float = 300.0) -> None:
-        self._store: dict[str, tuple[WorkflowRunResult, float]] = {}
-        self._ttl = ttl
-
-    @staticmethod
-    def make_key(request: WorkflowRunRequest) -> str:
-        """为一次业务请求生成幂等 key。
-
-        注意 categories 排序后再参与 hash，这样 ["a", "b"] 和 ["b", "a"]
-        会命中同一个缓存，避免无意义重复执行。
-        """
-        content = (
-            f"{request.order_id}:{request.question or ''}:"
-            f"{sorted(request.filter_categories or [])}"
-        )
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-
-    def get(self, key: str) -> WorkflowRunResult | None:
-        """按 key 读取幂等缓存；过期则删除。"""
-        entry = self._store.get(key)
-        if entry and time.monotonic() - entry[1] < self._ttl:
-            return entry[0]
-        if entry:
-            del self._store[key]
-        return None
-
-    def set(self, key: str, result: WorkflowRunResult) -> None:
-        """写入幂等缓存。"""
-        self._store[key] = (result, time.monotonic())
-
-
 class WorkflowService:
     """固定 workflow 外观服务。
 
@@ -117,8 +76,6 @@ class WorkflowService:
       - ``self._nodes``：带业务 service 依赖的节点集合。
       - ``self._graph``：LangGraph 编译后的可运行图。
     """
-
-    _idempotency = _IdempotencyStore(ttl=300.0)
 
     @staticmethod
     def _extract_pending_interrupt(state_snapshot) -> dict:
@@ -184,6 +141,8 @@ class WorkflowService:
         from app.memory import create_long_term_memory_store
 
         settings = get_settings()
+        self._idempotency = RedisWorkflowIdempotencyStore(settings.redis_url, ttl_seconds=300)
+        self._hitl_store = MySQLHitlStore(settings.mysql_url)
         # 如果没有显式传 chat_model，就从模型网关/配置创建 workflow_finalize 用模型。
         effective_chat_model = (
             chat_model if chat_model is not None
@@ -197,13 +156,10 @@ class WorkflowService:
             knowledge_service=knowledge_service,
             chat_model=effective_chat_model,
         )
-        memory_embed_model = None
-        # 长期记忆使用向量后端时，需要 embedding 模型；这里懒加载，减少启动压力。
-        long_term_backend = settings.long_term_memory_backend.strip().lower()
-        if long_term_backend in {"mysql_milvus", "mysql+milvus", "mysql", "milvus"}:
-            from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
+        from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
 
-            memory_embed_model = create_lazy_embed_model(settings)
+        memory_embed_model = create_lazy_embed_model(settings)
+        # 长期记忆使用向量后端时，需要 embedding 模型；这里懒加载，减少启动压力。
         # build_workflow 会把节点、短期 checkpointer、长期 store 编译成 LangGraph。
         self._graph = build_workflow(
             self._nodes,
@@ -212,8 +168,6 @@ class WorkflowService:
                 ttl_seconds=settings.short_term_memory_ttl_seconds,
             ),
             store=create_long_term_memory_store(
-                db_path=settings.long_term_memory_db_path,
-                backend=settings.long_term_memory_backend,
                 mysql_url=settings.long_term_memory_mysql_url or settings.mysql_url,
                 milvus_uri=settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}",
                 milvus_token=settings.milvus_token,
@@ -233,15 +187,13 @@ class WorkflowService:
     # =========================================================================
 
     def run(self, request: WorkflowRunRequest) -> WorkflowRunResult:
-        """驱动一次完整工作流执行（含幂等性检查，自动批准 HITL 检查点）。
+        """驱动一次完整工作流执行（含 Redis 幂等性检查）。
 
         幂等性：相同 (order_id + question + categories) 在 5 分钟内直接返回缓存，
                 不重复触发 LLM 调用，防止网络重试、重复点击导致重复执行。
 
-        同步模式的设计取舍：
-          为了兼容普通 HTTP 请求，它不会把 HITL 中断暴露给用户，
-          而是遇到中断后一律用 approved 自动恢复。
-          需要真实审批体验时，应使用 run_stream/resume。
+        生产模式不再自动批准 HITL。遇到人工审核中断时会写入 MySQL 待审表，
+        然后要求调用方使用 run_stream/resume 或 Hybrid resume 完成人工决策。
         """
         idem_key = self._idempotency.make_key(request)
         cached = self._idempotency.get(idem_key)
@@ -264,12 +216,25 @@ class WorkflowService:
         # graph.invoke() 一次性跑完整张图，返回最终 state。
         final_state: dict = self._graph.invoke(initial_state, config)
 
-        # 自动处理 HITL 中断（同步模式一律自动批准）。
-        # get_state(config).next 非空，说明图停在某个 interrupt 之后，还有后续节点没跑。
         state_snapshot = self._graph.get_state(config)
-        while state_snapshot and state_snapshot.next:
-            final_state = self._graph.invoke(Command(resume="approved"), config)
-            state_snapshot = self._graph.get_state(config)
+        if state_snapshot and state_snapshot.next:
+            interrupt_info = self._extract_pending_interrupt(state_snapshot)
+            interrupt_event = InterruptEvent(
+                type=interrupt_info.get("type", "unknown"),
+                node=interrupt_info.get("node", "unknown"),
+                prompt=interrupt_info.get("prompt", ""),
+                context=interrupt_info.get("context", {}),
+                options=interrupt_info.get("options", ["approved", "rejected", "escalate"]),
+                thread_id=thread_id,
+                risk_level=interrupt_info.get("risk_level", "HIGH"),
+                risk_signals=interrupt_info.get("risk_signals", []),
+                timeout_seconds=interrupt_info.get("timeout_seconds", 1800),
+            )
+            self._hitl_store.upsert_task(order_id=request.order_id, interrupt=interrupt_event)
+            raise RuntimeError(
+                "Workflow 触发 HITL 人工审核，生产模式禁止同步接口自动批准；"
+                "请使用流式执行或 /hybrid/resume 完成人工决策。"
+            )
 
         result = WorkflowRunResult(
             order_id=request.order_id,
@@ -364,6 +329,7 @@ class WorkflowService:
                 risk_signals=interrupt_info.get("risk_signals", []),
                 timeout_seconds=interrupt_info.get("timeout_seconds", 1800),
             )
+            self._hitl_store.upsert_task(order_id=request.order_id, interrupt=interrupt_event)
             yield {"type": "interrupted", "interrupt": interrupt_event.model_dump()}
             return
 
@@ -457,6 +423,7 @@ class WorkflowService:
         if state_snapshot and state_snapshot.next:
             # next 非空表示图没有走完，通常是 interrupt 等待人工决策。
             interrupt_info = self._extract_pending_interrupt(state_snapshot)
+            partial_state = getattr(state_snapshot, "values", {}) or {}
             event = InterruptEvent(
                 type=interrupt_info.get("type", "unknown"),
                 node=interrupt_info.get("node", "unknown"),
@@ -468,7 +435,14 @@ class WorkflowService:
                 risk_signals=interrupt_info.get("risk_signals", []),
                 timeout_seconds=interrupt_info.get("timeout_seconds", 1800),
             )
-            return {"status": "interrupted", "result": None, "interrupt": event}
+            self._hitl_store.upsert_task(order_id=request.order_id, interrupt=event)
+            return {
+                "status": "interrupted",
+                "result": None,
+                "interrupt": event,
+                "trace": partial_state.get("trace") or [],
+                "errors": partial_state.get("errors") or [],
+            }
 
         return self._build_completed_result(request, final_state)
 
@@ -488,6 +462,12 @@ class WorkflowService:
           因为 LangGraph 要靠 thread_id 找回之前停住的 state。
         """
         config = {"configurable": {"thread_id": thread_id}}
+        self._hitl_store.record_decision(
+            thread_id=thread_id,
+            decision=approval.decision,
+            reason=approval.reason,
+            approver_id=approval.approver_id,
+        )
 
         try:
             # Command(resume=...) 是 LangGraph HITL 标准 API。
@@ -513,6 +493,8 @@ class WorkflowService:
                 risk_signals=interrupt_info.get("risk_signals", []),
                 timeout_seconds=interrupt_info.get("timeout_seconds", 1800),
             )
+            values = getattr(state_snapshot, "values", {}) or {}
+            self._hitl_store.upsert_task(order_id=values.get("order_id", ""), interrupt=event)
             return {"status": "interrupted", "result": None, "interrupt": event}
 
         return self._build_completed_result(None, final_state)
@@ -522,13 +504,13 @@ class WorkflowService:
     # =========================================================================
 
     def list_pending_approvals(self, risk_level: str | None = None) -> list[ApprovalAuditEntry]:
-        """查询当前待审批工单列表（TODO: 接入 MySQL）。"""
-        return []
+        """查询当前待审批工单列表。生产版从 MySQL 查询。"""
+        return self._hitl_store.list_pending(risk_level)
 
     def get_approval_history(self, order_id: str) -> list[ApprovalAuditEntry]:
-        """查询订单审批历史（TODO: 接入 MySQL）。"""
-        return []
+        """查询订单审批历史。生产版从 MySQL 查询。"""
+        return self._hitl_store.history(order_id)
 
     def get_hitl_stats(self) -> dict:
-        """HITL 统计（TODO: 接入 MySQL）。"""
-        return {"pending_count": 0, "total_decisions": 0, "approval_rate": 0.0}
+        """HITL 统计。生产版从 MySQL 聚合。"""
+        return self._hitl_store.stats()

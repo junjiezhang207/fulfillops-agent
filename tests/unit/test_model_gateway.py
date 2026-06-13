@@ -1,6 +1,82 @@
 from types import SimpleNamespace
+from typing import Any
 
-from app.infrastructure.llm.model_gateway import ModelGateway
+import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import Runnable
+
+import app.infrastructure.llm.model_gateway as model_gateway_module
+from app.infrastructure.llm.model_gateway import FallbackChatModel, ModelGateway
+
+
+class _FailingChatModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "failing-test-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        raise RuntimeError("primary down")
+
+
+class _AuthFailingChatModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "auth-failing-test-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        raise RuntimeError("401 unauthorized api key")
+
+
+class _UnknownFailingChatModel(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "unknown-failing-test-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        raise RuntimeError("vendor exploded in a surprising way")
+
+
+class _StaticChatModel(BaseChatModel):
+    text: str
+
+    @property
+    def _llm_type(self) -> str:
+        return "static-test-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=self.text))])
+
+
+class _FailingRunnable(Runnable[Any, Any]):
+    def __init__(self, message: str):
+        self.message = message
+
+    def invoke(self, input: Any, config=None, **kwargs: Any) -> Any:
+        raise RuntimeError(self.message)
+
+
+class _StaticRunnable(Runnable[Any, Any]):
+    def __init__(self, value: Any):
+        self.value = value
+
+    def invoke(self, input: Any, config=None, **kwargs: Any) -> Any:
+        return self.value
+
+
+class _ToolBindingChatModel(BaseChatModel):
+    bound_runnable: Any
+
+    @property
+    def _llm_type(self) -> str:
+        return "tool-binding-test-chat"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="unused"))])
+
+    def bind_tools(self, tools, *, tool_choice: str | None = None, **kwargs: Any):
+        return self.bound_runnable
 
 
 def test_model_gateway_lists_public_model_metadata_without_secret(tmp_path, monkeypatch):
@@ -147,6 +223,172 @@ models:
     assert gateway.resolve_profile(use_case="rag_rewrite").id == "small-rewriter"
 
 
+def test_model_gateway_resolves_configured_fallback_chain(tmp_path):
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        """
+default_models:
+  agent: primary-agent
+fallback_models:
+  agent: [backup-agent, ignored-disabled]
+models:
+  - id: primary-agent
+    display_name: Primary
+    provider: openai_compatible
+    model: primary
+    api_key_env: TEST_LLM_KEY
+    enabled: true
+    priority: 10
+    use_cases: ["agent"]
+  - id: backup-agent
+    display_name: Backup
+    provider: openai_compatible
+    model: backup
+    api_key_env: TEST_BACKUP_KEY
+    enabled: true
+    priority: 20
+    use_cases: ["agent"]
+  - id: ignored-disabled
+    display_name: Disabled
+    provider: openai_compatible
+    model: disabled
+    api_key_env: TEST_DISABLED_KEY
+    enabled: false
+    priority: 30
+    use_cases: ["agent"]
+""",
+        encoding="utf-8",
+    )
+
+    gateway = ModelGateway(SimpleNamespace(model_gateway_config_path=str(config), default_llm_model_id=""))
+    chain = gateway.resolve_profile_chain(use_case="agent")
+    active = gateway.active_model(use_case="agent")
+
+    assert [profile.id for profile in chain] == ["primary-agent", "backup-agent"]
+    assert active["id"] == "primary-agent"
+    assert active["fallback_model_ids"] == ["backup-agent"]
+
+
+def test_fallback_chat_model_uses_backup_when_primary_fails():
+    model = FallbackChatModel(
+        models=[_FailingChatModel(), _StaticChatModel(text="backup ok")],
+        model_ids=["primary", "backup"],
+        use_case="agent",
+    )
+
+    result = model.invoke("hello")
+
+    assert result.content == "backup ok"
+    assert model.fallback_model_ids == ["backup"]
+
+
+def test_fallback_chat_model_does_not_fallback_for_auth_error():
+    model = FallbackChatModel(
+        models=[_AuthFailingChatModel(), _StaticChatModel(text="backup ok")],
+        model_ids=["primary", "backup"],
+        use_case="agent",
+    )
+
+    with pytest.raises(RuntimeError, match="401 unauthorized"):
+        model.invoke("hello")
+
+
+def test_fallback_chat_model_keeps_unknown_error_strict_by_default():
+    model = FallbackChatModel(
+        models=[_UnknownFailingChatModel(), _StaticChatModel(text="backup ok")],
+        model_ids=["primary", "backup"],
+        use_case="agent",
+    )
+
+    with pytest.raises(RuntimeError, match="surprising way"):
+        model.invoke("hello")
+
+
+def test_fallback_chat_model_can_fallback_for_unknown_error_when_configured():
+    model = FallbackChatModel(
+        models=[_UnknownFailingChatModel(), _StaticChatModel(text="backup ok")],
+        model_ids=["primary", "backup"],
+        use_case="agent",
+        fallback_on_unknown_error=True,
+    )
+
+    result = model.invoke("hello")
+
+    assert result.content == "backup ok"
+
+
+def test_bound_tool_runnable_uses_retryable_fallback_policy():
+    model = FallbackChatModel(
+        models=[
+            _ToolBindingChatModel(bound_runnable=_FailingRunnable("503 service unavailable")),
+            _ToolBindingChatModel(bound_runnable=_StaticRunnable("backup ok")),
+        ],
+        model_ids=["primary", "backup"],
+        use_case="agent",
+    )
+
+    bound = model.bind_tools([])
+    result = bound.invoke("hello")
+
+    assert result == "backup ok"
+    assert bound.fallback_model_ids == ["backup"]
+
+
+def test_bound_tool_runnable_does_not_fallback_for_auth_error():
+    model = FallbackChatModel(
+        models=[
+            _ToolBindingChatModel(bound_runnable=_FailingRunnable("401 unauthorized api key")),
+            _ToolBindingChatModel(bound_runnable=_StaticRunnable("backup ok")),
+        ],
+        model_ids=["primary", "backup"],
+        use_case="agent",
+    )
+
+    bound = model.bind_tools([])
+
+    with pytest.raises(RuntimeError, match="401 unauthorized"):
+        bound.invoke("hello")
+
+
+def test_model_gateway_skips_unconfigured_primary_and_builds_backup(tmp_path, monkeypatch):
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        """
+default_models:
+  agent: primary-agent
+fallback_models:
+  agent: [backup-agent]
+models:
+  - id: primary-agent
+    display_name: Primary
+    provider: openai_compatible
+    model: primary
+    api_key_env: MISSING_PRIMARY_KEY
+    enabled: true
+    use_cases: ["agent"]
+  - id: backup-agent
+    display_name: Backup
+    provider: openai_compatible
+    model: backup
+    api_key_env: BACKUP_KEY
+    enabled: true
+    use_cases: ["agent"]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BACKUP_KEY", "backup-secret")
+    monkeypatch.setattr(
+        model_gateway_module,
+        "_build_chat_model",
+        lambda **_kwargs: _StaticChatModel(text="backup ready"),
+    )
+
+    gateway = ModelGateway(SimpleNamespace(model_gateway_config_path=str(config), default_llm_model_id=""))
+    model = gateway.create_chat_model(use_case="agent")
+
+    assert model.invoke("hello").content == "backup ready"
+
+
 def test_model_gateway_marks_local_model_configured_without_api_key(tmp_path):
     config = tmp_path / "models.yaml"
     config.write_text(
@@ -249,6 +491,133 @@ models:
 
     assert chat_model.extra_body == {"thinking": {"type": "disabled"}}
     assert chat_model.streaming is True
+
+
+def test_model_gateway_parses_fallback_policy_and_passes_it_to_chat_wrapper(tmp_path, monkeypatch):
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        """
+default_models:
+  agent: primary-agent
+fallback_policy:
+  fallback_on_unknown_error: true
+  retryable_error_types: [timeout]
+fallback_models:
+  agent: [backup-agent]
+models:
+  - id: primary-agent
+    display_name: Primary
+    provider: openai_compatible
+    model: primary
+    api_key_env: TEST_LLM_KEY
+    enabled: true
+    use_cases: ["agent"]
+  - id: backup-agent
+    display_name: Backup
+    provider: openai_compatible
+    model: backup
+    api_key_env: TEST_LLM_KEY
+    enabled: true
+    use_cases: ["agent"]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEST_LLM_KEY", "secret-value")
+    monkeypatch.setattr(
+        model_gateway_module,
+        "_build_chat_model",
+        lambda **_kwargs: _StaticChatModel(text="ready"),
+    )
+
+    gateway = ModelGateway(SimpleNamespace(model_gateway_config_path=str(config), default_llm_model_id=""))
+    chat_model = gateway.create_chat_model(use_case="agent")
+
+    assert isinstance(chat_model, FallbackChatModel)
+    assert chat_model.fallback_on_unknown_error is True
+    assert chat_model.retryable_error_types == ["timeout"]
+
+
+def test_model_gateway_loads_prompt_by_use_case(tmp_path):
+    prompt_file = tmp_path / "agent_prompt.yaml"
+    prompt_file.write_text(
+        """
+version: "test-v1"
+name: agent_prompt
+description: Test prompt
+system: |
+  你是测试 Agent。
+""",
+        encoding="utf-8",
+    )
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        f"""
+default_prompts:
+  agent: agent_prompt
+prompt_profiles:
+  agent_prompt:
+    use_case: agent
+    path: {prompt_file.name}
+    version: test-v1
+    fallback_builtin: true
+models: []
+""",
+        encoding="utf-8",
+    )
+
+    gateway = ModelGateway(SimpleNamespace(model_gateway_config_path=str(config), default_llm_model_id=""))
+    prompt = gateway.load_prompt(use_case="agent")
+
+    assert prompt.id == "agent_prompt"
+    assert prompt.source == "yaml"
+    assert prompt.version == "test-v1"
+    assert "测试 Agent" in prompt.system
+
+
+def test_model_gateway_prompt_falls_back_to_builtin_when_file_missing(tmp_path):
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        """
+default_prompts:
+  agent: fulfillment_agent
+prompt_profiles:
+  fulfillment_agent:
+    use_case: agent
+    path: missing.yaml
+    fallback_builtin: true
+models: []
+""",
+        encoding="utf-8",
+    )
+
+    gateway = ModelGateway(SimpleNamespace(model_gateway_config_path=str(config), default_llm_model_id=""))
+    prompt = gateway.load_prompt(use_case="agent")
+
+    assert prompt.source == "builtin"
+    assert "履约" in prompt.system
+
+
+def test_project_model_gateway_config_covers_known_use_cases():
+    gateway = ModelGateway(SimpleNamespace(model_gateway_config_path="config/model_gateway.yaml", default_llm_model_id=""))
+    report = gateway.validate_use_case_coverage()
+
+    assert report["missing_default_models"] == []
+    assert report["missing_supported_profiles"] == []
+    assert report["unknown_default_use_cases"] == []
+    assert report["unknown_fallback_use_cases"] == []
+    assert report["unknown_profile_use_cases"] == []
+    assert report["unknown_model_refs"] == []
+    assert report["default_model_use_case_mismatches"] == []
+    assert report["fallback_model_use_case_mismatches"] == []
+    assert report["disabled_default_models"] == []
+    assert report["missing_default_prompts"] == []
+    assert report["missing_prompt_profiles"] == []
+    assert report["unknown_default_prompt_use_cases"] == []
+    assert report["unknown_prompt_profile_use_cases"] == []
+    assert report["unknown_prompt_refs"] == []
+    assert report["prompt_use_case_mismatches"] == []
+    assert report["prompt_file_missing"] == []
+    assert report["prompt_variable_mismatches"] == []
 
 
 def test_model_gateway_falls_back_to_legacy_env_config_when_yaml_missing():

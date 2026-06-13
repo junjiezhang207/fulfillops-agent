@@ -1,30 +1,16 @@
-"""文件作用摘要：Plan-and-Execute Agent，先规划再执行。
+"""Plan-and-Execute Agent 编排。
 
-这个文件实现一种不同于 ReAct 的 Agent 执行模式。普通 ReAct 是“走一步看一步”，
-每一步根据当前观察决定下一个工具；Plan-and-Execute 是先生成全局计划，再按
-计划逐步执行，执行后由 Replanner 判断是否还需要调整计划。
+本模块实现“先生成计划，再按步骤执行，并在每步后重新评估计划”的
+LangGraph 流程。它适合有明确步骤依赖的复杂履约分析。
 
-主要做的事：
-1. ``Plan``：Planner 输出的结构化计划，包含按顺序执行的步骤。
-2. ``PlanExecuteState``：LangGraph 图里的状态，记录计划、已执行步骤和最终答案。
-3. ``_make_planner_node``：根据用户问题生成初始计划。
-4. ``_make_executor_node``：用子 Agent 执行当前计划步骤。
-5. ``_make_replanner_node``：根据执行结果判断剩余步骤或直接结束。
-6. ``_make_synthesizer_node``：把所有步骤结果汇总成最终答案。
-7. ``build_plan_execute_agent``：组装 Planner -> Executor -> Replanner -> Synthesizer 图。
+图结构：
+    planner -> executor -> replanner -> executor/synthesizer
 
-适用场景：
-- 需要先查订单，再查库存，再找替代品，最后生成履约方案。
-- 用户要求“完整分析”“列出所有可行路径”“按步骤给方案”。
-
-不适合场景：
-- 简单单步查询，普通 ReAct 更轻。
-- 多领域专家并行讨论，Multi-Agent Supervisor 更合适。
-
-学习时先看：
-1. ``PlanExecuteState``：计划执行图里保存什么。
-2. ``build_plan_execute_agent``：整张图怎么循环。
-3. Planner / Executor / Replanner 三个节点：理解计划如何被执行和修正。
+主要节点：
+1. ``Planner``：生成结构化执行计划。
+2. ``Executor``：用子 ReAct Agent 执行当前步骤。
+3. ``Replanner``：根据已完成结果更新剩余步骤。
+4. ``Synthesizer``：汇总最终答案。
 """
 
 from __future__ import annotations
@@ -39,18 +25,17 @@ from langchain_core.messages import HumanMessage, filter_messages, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import BaseTool
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, Field
+
+from app.infrastructure.llm.model_gateway import get_model_gateway
 
 logger = logging.getLogger(__name__)
 
 # ── Pydantic 结构化输出模型 ───────────────────────────────────────────────────
 
-# 面试官可能问：Plan-and-Execute 为什么要让 Planner 输出结构化 Plan？
-# 回答：结构化计划比自由文本更容易让程序读取和控制循环。Executor 可以按
-# steps 逐条执行，Replanner 也能明确判断还剩哪些步骤，而不是解析一段随意文本。
+# Planner 使用结构化输出，避免后续节点解析自由文本计划。
 class Plan(BaseModel):
     """LLM 生成的执行计划。"""
     steps: list[str] = Field(
@@ -70,9 +55,8 @@ class ReplanDecision(BaseModel):
 
 # ── 状态定义 ─────────────────────────────────────────────────────────────────
 
-# 面试官可能问：PlanExecuteState 里为什么要保存 past_steps？
-# 回答：past_steps 让 Replanner 知道哪些步骤已经做过、结果是什么，避免重复执行；
-# 最终 Synthesizer 也需要基于完整步骤结果生成有依据的综合答案。
+# past_steps 保存已执行步骤和结果，供 Replanner 避免重复执行，
+# 也供 Synthesizer 生成有依据的综合答案。
 class PlanExecuteState(TypedDict, total=False):
     """Plan-and-Execute 工作流共享状态。
 
@@ -90,18 +74,10 @@ class PlanExecuteState(TypedDict, total=False):
 
 # ── Prompt 定义 ───────────────────────────────────────────────────────────────
 
-_PLANNER_SYSTEM = """\
-你是供应链履约专家，负责将用户的复杂问题分解为有序的执行步骤。
-
-步骤设计原则：
-1. 按依赖关系排序（必须先查订单信息，才能查对应的库存）
-2. 每步明确说明调用哪个工具、查询什么
-3. 最多 5 步（避免过度分解）
-4. 步骤间传递上下文（如"根据上一步查到的缺货 SKU，查找替代品"）
-
-可用工具：analyze_order / check_inventory / search_warehouse_inventory /
-         find_substitute_sku / generate_fulfillment_plan / retrieve_knowledge
-"""
+_PLANNER_SYSTEM = get_model_gateway().prompt_system(
+    use_case="plan_execute",
+    prompt_id="plan_execute_planner",
+)
 
 _PLANNER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", _PLANNER_SYSTEM),
@@ -109,11 +85,7 @@ _PLANNER_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 _REPLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", (
-        "你是供应链履约专家。根据用户目标和已执行步骤的结果，判断是否还需要继续执行更多步骤。\n"
-        "如果已有足够信息可以给出最终答复，返回空列表。\n"
-        "如果仍需继续，只保留真正必要的剩余步骤（删除已被之前结果覆盖的步骤）。"
-    )),
+    ("system", get_model_gateway().prompt_system(use_case="plan_execute", prompt_id="plan_execute_replanner")),
     ("human", (
         "用户目标: {input}\n\n"
         "已完成步骤及结果:\n{past_steps_text}\n\n"
@@ -123,17 +95,13 @@ _REPLANNER_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 _SYNTHESIZER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", (
-        "你是供应链履约专家。根据各执行步骤收集到的数据，"
-        "生成最终的综合答复。要求：简洁（不超过 300 字）、准确、可操作，"
-        "包含关键数据和明确建议。"
-    )),
+    ("system", get_model_gateway().prompt_system(use_case="plan_execute", prompt_id="plan_execute_synthesizer")),
     ("human", "用户问题: {input}\n\n各步骤结果:\n{past_steps_text}"),
 ])
 
-_EXECUTOR_SYSTEM = (
-    "你是供应链履约执行助手。根据给定的具体任务，调用相应工具获取信息并返回结果。"
-    "只需完成当前任务，不要超出范围。结果要包含具体数据（数字、SKU、仓库名等）。"
+_EXECUTOR_SYSTEM = get_model_gateway().prompt_system(
+    use_case="plan_execute",
+    prompt_id="plan_execute_executor",
 )
 
 
@@ -280,9 +248,7 @@ def _make_route_fn(max_iterations: int):
 
 # ── 图组装 ────────────────────────────────────────────────────────────────────
 
-# 面试官可能问：什么时候用 Plan-and-Execute，不用普通 ReAct？
-# 回答：当问题有明显前后依赖、需要先规划再执行时使用，比如完整履约方案分析。
-# 普通 ReAct 更适合开放追问和局部决策，简单问题用 Plan-and-Execute 会显得重。
+# Plan-and-Execute 适合有前后依赖的复杂任务；简单查询仍优先使用普通 ReAct。
 def build_plan_execute_agent(
     llm: BaseChatModel,
     tools: list[BaseTool],
@@ -296,16 +262,17 @@ def build_plan_execute_agent(
         llm:            LLM 模型（用于 Planner / Replanner / Synthesizer）
         tools:          工具列表（Executor 子 Agent 使用）
         max_iterations: 最大执行轮次（防死循环，默认 5）
-        checkpointer:   状态持久化（默认 MemorySaver）
+        checkpointer:   Redis 状态持久化（生产模式必传）
     """
-    _checkpointer = checkpointer or MemorySaver()
+    if checkpointer is None:
+        raise RuntimeError("Plan-and-Execute 必须显式传入 Redis checkpointer。")
 
     # Executor 使用的子 Agent（mini ReAct，执行单个步骤）
     sub_agent_kwargs = {
         "model": llm,
         "tools": tools,
         "system_prompt": _EXECUTOR_SYSTEM,
-        "checkpointer": _checkpointer,
+        "checkpointer": checkpointer,
     }
     if store is not None:
         sub_agent_kwargs["store"] = store
@@ -330,7 +297,7 @@ def build_plan_execute_agent(
     )
     graph.add_edge("synthesizer", END)
 
-    compile_kwargs = {"checkpointer": _checkpointer}
+    compile_kwargs = {"checkpointer": checkpointer}
     if store is not None:
         compile_kwargs["store"] = store
     return graph.compile(**compile_kwargs)

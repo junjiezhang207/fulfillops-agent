@@ -21,6 +21,7 @@ class IntentLevel(Enum):
     MEDIUM = "medium"  # 中等分析 → Agent
     COMPLEX = "complex"  # 复杂决策 → Agent
     MULTI_DOMAIN = "multi_domain"  # 跨领域复杂问题 → Multi-Agent
+    CASUAL = "casual"  # 非业务日常对话 → 普通聊天
 
 
 @dataclass
@@ -45,6 +46,19 @@ class IntentClassifier:
     """
 
     def __init__(self):
+        # 日常闲聊/非业务问题。前端虽然带着 order_id 进来，但这类问题不应该消耗履约 Workflow。
+        self.casual_keywords = {
+            "你好": 1.0,
+            "hello": 1.0,
+            "hi": 1.0,
+            "谢谢": 0.9,
+            "你是谁": 0.9,
+            "介绍一下": 0.8,
+            "讲个笑话": 0.9,
+            "天气": 0.8,
+            "闲聊": 0.8,
+        }
+
         # 简单查询关键词：更适合固定 Workflow。
         self.simple_keywords = {
             "查询": 1.0,
@@ -64,6 +78,9 @@ class IntentClassifier:
             "sop": 0.9,
             "知识库": 0.9,
             "依据": 0.8,
+            "标准": 0.8,
+            "流程": 0.7,
+            "操作规范": 0.9,
             "售后": 0.8,
             "退货": 0.8,
             "补发": 0.8,
@@ -103,6 +120,8 @@ class IntentClassifier:
             "替代品": 0.6,
             "成本": 0.5,
             "时间": 0.4,
+            "时效": 0.5,
+            "风险": 0.5,
         }
 
         # 跨领域关键词 — 同时跨库存、风险、履约等多个领域
@@ -120,6 +139,7 @@ class IntentClassifier:
             "跨仓": 0.65,
             "调配": 0.6,
             "协同": 0.5,
+            "多方案": 0.6,
         }
 
         # 领域标记词 — 用于判断问题跨了几个领域
@@ -151,6 +171,14 @@ class IntentClassifier:
         # 中文不受 lower 影响，但英文关键词可以统一小写匹配。
         text = user_input.lower()
 
+        if self._is_casual(text):
+            return IntentClassificationResult(
+                level=IntentLevel.CASUAL,
+                score=0.9,
+                primary_keywords=self._matched(text, self.casual_keywords)[:3],
+                reasoning="CASUAL: 未命中供应链业务信号，按日常对话处理",
+            )
+
         # 计算各等级的匹配分数。
         simple_score = self._calculate_score(text, self.simple_keywords)
         rag_score = self._calculate_score(text, self.rag_keywords)
@@ -163,12 +191,34 @@ class IntentClassifier:
         # 领域覆盖度：问题跨了几个领域。
         domain_count = self._count_domains(text)
 
+        fixed_workflow_question = self._is_fixed_workflow_question(text)
+        explicit_rag_question = self._is_explicit_rag_question(text)
+        explicit_plan_question = self._is_plan_or_advice_question(text)
+
         # 综合评分：复杂度不仅看关键词，也看是否需要多工具。
         final_complex = complex_score + multi_tool_score * 0.3
         final_medium = medium_score
         final_simple = simple_score
         final_rag = rag_score
         final_multi = multi_domain_score + multi_tool_score * 0.2 + domain_count * 0.3
+
+        # 规则 0: “库存够不够 / 能不能发 / 是否缺货”是确定性状态判断，优先 Workflow。
+        if fixed_workflow_question and not explicit_rag_question and not explicit_plan_question:
+            return IntentClassificationResult(
+                level=IntentLevel.SIMPLE,
+                score=0.9,
+                primary_keywords=self._fixed_workflow_keywords(text),
+                reasoning="SIMPLE: 命中固定履约状态判断，应走可审计 Workflow",
+            )
+
+        # 规则 0.5: 明确问规则/制度/SOP/依据，优先 RAG。
+        if explicit_rag_question and not explicit_plan_question and domain_count <= 2:
+            return IntentClassificationResult(
+                level=IntentLevel.RAG,
+                score=max(0.88, min(0.75 + rag_score * 0.2, 1.0)),
+                primary_keywords=self._get_matched_keywords(text, IntentLevel.RAG),
+                reasoning="RAG: 明确询问规则、SOP、政策或依据",
+            )
 
         # 规则 1: 跨 3 个以上领域 + 有复杂关键词 → 必定 MULTI_DOMAIN
         if domain_count >= 3 and (complex_score > 0 or multi_domain_score > 0):
@@ -217,15 +267,6 @@ class IntentClassifier:
             level = IntentLevel.RAG
             score = max(score, min(0.75 + rag_score * 0.2, 1.0))
 
-        # 规则 3.6: “库存够不够 / 是否缺货 / 能不能发”属于固定履约判断，优先走 Workflow。
-        fixed_workflow_question = (
-            any(word in text for word in ["库存", "缺货", "发货", "履约"])
-            and any(word in text for word in ["够吗", "充足", "足够", "能否", "可以发", "能不能发"])
-        )
-        if fixed_workflow_question and level != IntentLevel.RAG and complex_score == 0:
-            level = IntentLevel.SIMPLE
-            score = max(score, 0.8)
-
         # 规则 4: 如果提到"替代品"和"仓库"，必定是复杂
         if "替代" in text and ("仓库" in text or "仓" in text):
             # 替代 + 仓库通常要同时查库存、仓库、替代 SKU。
@@ -233,10 +274,13 @@ class IntentClassifier:
             score = min(score + 0.2, 1.0)
 
         # 规则 5: "方案"、"履约"、"生成" 总是复杂
-        if any(word in text for word in ["方案", "履约", "生成完整"]):
+        if any(word in text for word in ["方案", "生成完整"]):
             # 方案类问题通常不是单纯查字段。
             level = IntentLevel.COMPLEX
             score = 0.95
+        elif explicit_plan_question and level == IntentLevel.SIMPLE:
+            level = IntentLevel.COMPLEX
+            score = max(score, 0.82)
 
         # 收集匹配的关键词，生成解释。
         primary_keywords = self._get_matched_keywords(text, level)
@@ -262,6 +306,65 @@ class IntentClassifier:
 
         # 除以关键词数量做归一化，避免关键词表越大分数越容易爆。
         return min(total_score / len(keywords), 1.0)
+
+    def _matched(self, text: str, keywords: dict) -> list[str]:
+        return [keyword for keyword in keywords if keyword in text]
+
+    def _has_business_signal(self, text: str) -> bool:
+        business_keywords = set().union(
+            self.simple_keywords,
+            self.rag_keywords,
+            self.medium_keywords,
+            self.complex_keywords,
+            self.multi_tool_signals,
+            self.multi_domain_keywords,
+            *self.domain_markers.values(),
+        )
+        return any(keyword.lower() in text for keyword in business_keywords)
+
+    def _is_casual(self, text: str) -> bool:
+        if self._has_business_signal(text):
+            return False
+        return bool(self._matched(text, self.casual_keywords)) or len(text.strip()) <= 8
+
+    @staticmethod
+    def _is_fixed_workflow_question(text: str) -> bool:
+        domain = any(word in text for word in ["库存", "缺货", "发货", "履约", "订单"])
+        status_question = any(
+            word in text
+            for word in [
+                "够吗",
+                "够不够",
+                "充足",
+                "足够",
+                "能否",
+                "能不能发",
+                "可以发",
+                "可发",
+                "是否缺货",
+                "能履约",
+                "可履约",
+                "能不能履约",
+            ]
+        )
+        return domain and status_question
+
+    @staticmethod
+    def _is_explicit_rag_question(text: str) -> bool:
+        rule_words = ["规则", "政策", "制度", "sop", "知识库", "依据", "标准", "规范"]
+        ask_words = ["什么", "有哪些", "怎么规定", "如何规定", "依据", "查一下", "说明"]
+        return any(word in text for word in rule_words) and (
+            any(word in text for word in ask_words) or "规则" in text or "sop" in text
+        )
+
+    @staticmethod
+    def _is_plan_or_advice_question(text: str) -> bool:
+        return any(word in text for word in ["方案", "建议", "怎么处理", "怎么办", "分析", "评估", "生成", "推荐"])
+
+    @staticmethod
+    def _fixed_workflow_keywords(text: str) -> list[str]:
+        candidates = ["库存", "缺货", "发货", "履约", "够吗", "够不够", "能否", "可以发", "能不能发", "是否缺货"]
+        return [item for item in candidates if item in text][:3]
 
     def _calculate_raw_score(self, text: str, keywords: dict) -> float:
         """计算文本与关键词集合的原始匹配分数（不归一化）。
@@ -300,6 +403,8 @@ class IntentClassifier:
         """获取匹配到的关键词。"""
         if level == IntentLevel.SIMPLE:
             keyword_dict = self.simple_keywords
+        elif level == IntentLevel.CASUAL:
+            keyword_dict = self.casual_keywords
         elif level == IntentLevel.RAG:
             keyword_dict = self.rag_keywords
         elif level == IntentLevel.MEDIUM:

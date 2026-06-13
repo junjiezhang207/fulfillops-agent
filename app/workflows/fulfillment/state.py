@@ -1,21 +1,13 @@
 """LangGraph 工作流状态对象（GraphState）。
 
-为什么用 TypedDict 而不是 Pydantic BaseModel？
-    1. LangGraph 1.0+ 官方推荐 TypedDict 做状态。
-    2. 节点返回的是"增量 dict"，TypedDict 天然契合这种写法。
-    3. TypedDict 的字段可以用 Annotated 注册 reducer，Pydantic 不行。
-    4. 避免每次节点返回时触发一次完整 Pydantic 校验，性能更合理。
+状态对象使用 TypedDict：LangGraph 节点返回的是增量 dict，TypedDict 更契合
+这种渐进式合并模型；字段也可以用 Annotated 注册 reducer，避免每次节点返回时
+触发完整 Pydantic 校验。
 
 字段分三类：
     入参字段：order_id / question / filter_categories
     中间结果字段：*_result + fulfillment_branch
     可观察字段：trace / errors / final_answer
-
-学习重点：
-    LangGraph 的节点通常不是“返回最终结果”，而是“返回一小块 state 更新”。
-    比如 order_analysis 节点只返回 {"order_result": ...}，inventory_analysis 节点
-    再返回 {"inventory_result": ..., "fulfillment_branch": ...}。
-    框架会把这些增量合并成完整 GraphState。
 """
 
 from operator import add
@@ -82,6 +74,6 @@ class GraphState(TypedDict, total=False):
 
     # trace / errors 使用 operator.add 作为 reducer：
     # 每个节点返回的 list 会被"累加"到 state 里，而不是覆盖。
-    # 这是 LangGraph 状态合并机制最核心的一个用法，要特别理解。
+    # 这是 LangGraph 状态合并机制中用于追加事件流的标准写法。
     trace: Annotated[list[TraceEvent], add]
     errors: Annotated[list[ErrorEvent], add]

@@ -1,30 +1,11 @@
-"""文件作用摘要：Multi-Agent Supervisor 扩展链路。
+"""Multi-Agent Supervisor 编排链路。
 
-这个文件实现“一个 Supervisor 调度多个专家 Agent”的复杂任务处理模式。
-它不是项目第一主线；第一主线是普通 ReAct Agent、Workflow 和 RAG。
-本文件更适合用来回答面试里的扩展问题：如果一个订单问题同时涉及库存、
-履约、风险多个领域，如何让不同专家并行分析，再由总控汇总。
+本模块实现由 Supervisor 调度库存、履约、风险三个专家 Agent 的 LangGraph 流程。
+第一轮可并行收集多领域事实，后续由 Supervisor 判断是否追问或汇总。
 
-主要做的事：
-1. 定义 ``MultiAgentState``：保存问题、专家结果、轮次、最终答案等状态。
-2. ``make_supervisor_node``：让 Supervisor 判断下一步派给谁，是否继续追问。
-3. ``make_specialist_agent_node``：创建库存、履约、风险等专家 Agent 节点。
-4. ``make_barrier_node``：等待一轮并行专家结果都返回，再交回 Supervisor。
-5. ``make_synthesizer_node``：把多个专家结论汇总成最终答复。
-6. ``MultiAgentOrchestrator``：组装整张 LangGraph 多 Agent 图并提供运行入口。
-
-图结构可以这样记：
-START -> supervisor -> 并行专家 -> barrier -> supervisor
-                      -> synthesizer -> END
-
-和普通 ReAct Agent 的区别：
-- ReAct：一个模型自己决定调哪些工具。
-- Multi-Agent：多个专家各看一个领域，Supervisor 负责调度、补问和结束条件。
-
-学习时先看：
-1. ``MultiAgentState``：多 Agent 图里流动的数据长什么样。
-2. ``make_supervisor_node`` 和 ``route_from_supervisor``：调度逻辑在哪里。
-3. ``MultiAgentOrchestrator._build_graph``：整张图怎么连起来。
+图结构：
+    START -> supervisor -> 专家节点/parallel -> barrier -> supervisor
+                          -> synthesizer -> END
 """
 
 from __future__ import annotations
@@ -41,22 +22,15 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, filter_messages
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, Field
 
-from app.agents.tools.factory import (
-    make_fulfillment_plan_tool,
-    make_inventory_tool,
-    make_knowledge_tool,
-    make_order_tool,
-    make_substitute_tool,
-    make_warehouse_tool,
-)
+from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.domain.inventory.analysis import InventoryAnalysisService
+from app.infrastructure.llm.model_gateway import get_model_gateway
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.domain.orders.analysis import OrderAnalysisService
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
@@ -74,21 +48,9 @@ ROUTABLE_NODES = (*SPECIALISTS, "synthesizer")
 # 多 Agent 不是让多个 Agent 都做同一件事，而是让它们各自负责一个稳定边界：
 # 库存、履约规划、风险规则。边界越清楚，汇总时越不容易互相打架。
 SYSTEM_PROMPTS: dict[SpecialistName, str] = {
-    "inventory_agent": (
-        "你是库存专家 Agent。使用 check_inventory 检查订单库存，"
-        "使用 search_warehouse_inventory 查找跨仓库可用量。"
-        "给出简洁的库存状况摘要：库存是否充足、缺货 SKU、可用仓库。"
-    ),
-    "fulfillment_agent": (
-        "你是履约规划专家 Agent。使用 generate_fulfillment_plan 生成方案，"
-        "使用 find_substitute_sku 查找替代品。"
-        "给出具体可执行的履约建议：发货仓库、替代品、预计时间。"
-    ),
-    "risk_agent": (
-        "你是风险评估专家 Agent。使用 analyze_order 分析订单风险，"
-        "使用 retrieve_knowledge 检索相关规则。"
-        "给出风险等级评估和需要遵循的关键规则。"
-    ),
+    "inventory_agent": get_model_gateway().prompt_system(use_case="multi_agent", prompt_id="multi_inventory_agent"),
+    "fulfillment_agent": get_model_gateway().prompt_system(use_case="multi_agent", prompt_id="multi_fulfillment_agent"),
+    "risk_agent": get_model_gateway().prompt_system(use_case="multi_agent", prompt_id="multi_risk_agent"),
 }
 QUESTION_KEYWORDS = {
     "inventory_agent": ("库存", "现货", "仓库", "可发", "发货"),
@@ -98,9 +60,7 @@ QUESTION_KEYWORDS = {
 SKU_RE = re.compile(r"\bSKU[-_A-Z0-9]+\b", re.IGNORECASE)
 
 
-# 面试官可能问：SupervisorDecision 为什么要结构化输出？
-# 回答：Supervisor 是调度器，必须明确返回下一步派给谁、追问什么、为什么这么派。
-# 用 Pydantic 结构化输出能避免从自由文本里猜路由结果，降低多 Agent 编排不确定性。
+# Supervisor 输出结构化路由决策，避免从自然语言中解析下一跳。
 class SupervisorDecision(BaseModel):
     """Supervisor 的结构化路由结果。
 
@@ -121,9 +81,7 @@ def _merge_rounds(old: dict[str, int], new: dict[str, int]) -> dict[str, int]:
     return merged
 
 
-# 面试官可能问：MultiAgentState 为什么要记录 agent_results？
-# 回答：多专家并行后需要 fan-in 汇总。这个字段保存每个专家的回答、工具调用和问题，
-# barrier 与 synthesizer 都依赖它来判断是否还要追问，以及最终如何综合。
+# agent_results 汇总各专家输出，供 barrier、supervisor 和 synthesizer 做 fan-in 后判断。
 class MultiAgentState(TypedDict, total=False):
     """LangGraph 在各节点之间传递的共享状态。
 
@@ -146,9 +104,16 @@ class MultiAgentState(TypedDict, total=False):
 
 
 def _prompt(name: str) -> str:
-    from app.core.prompt_registry import get_prompt_registry
+    from app.infrastructure.llm.model_gateway import get_model_gateway
 
-    return get_prompt_registry().get(name)
+    prompt_use_cases = {
+        "supervisor_agent": "supervisor",
+        "synthesizer_agent": "multi_agent",
+    }
+    return get_model_gateway().prompt_system(
+        use_case=prompt_use_cases.get(name, "multi_agent"),
+        prompt_id=name,
+    )
 
 
 def _supervisor_prompt(max_rounds: int) -> ChatPromptTemplate:
@@ -218,9 +183,7 @@ def _supervisor_update(next_agent: str, follow_up: str, reason: str, log: str) -
     }
 
 
-# 面试官可能问：Supervisor 节点解决什么问题？
-# 回答：它不是业务专家，而是调度器：决定下一轮派给哪个专家、是否并行、
-# 是否已经足够汇总。这样专家 Agent 可以保持领域单一，整体流程更可控。
+# Supervisor 只负责调度，不直接处理业务事实。
 def make_supervisor_node(
     llm: BaseChatModel | None,
     max_rounds_per_agent: int = 2,
@@ -274,9 +237,7 @@ def make_supervisor_node(
     return supervisor
 
 
-# 面试官可能问：为什么需要 barrier 节点？
-# 回答：并行 Send 后多个专家结果会分别回来，barrier 负责把一轮结果收齐再交给
-# Supervisor 判断下一步，避免 Supervisor 在信息不完整时提前决策。
+# barrier 是并行专家 fan-in 同步点，确保一轮结果收齐后再回到 Supervisor。
 def make_barrier_node() -> Callable[[MultiAgentState], dict]:
     """fan-in 同步点：只标记第一轮并行结束，不改任何业务结果。
 
@@ -414,8 +375,10 @@ def make_specialist_agent_node(
         "model": llm,
         "tools": tools,
         "system_prompt": system_prompt,
-        "checkpointer": checkpointer or MemorySaver(),
+        "checkpointer": checkpointer,
     }
+    if checkpointer is None:
+        raise RuntimeError("Multi-Agent 专家 Agent 必须显式传入 Redis checkpointer。")
     if store is not None:
         specialist_kwargs["store"] = store
     specialist = create_agent(**specialist_kwargs) if llm else None
@@ -498,9 +461,7 @@ def make_synthesizer_node(llm: BaseChatModel | None) -> Callable[[MultiAgentStat
     return synthesizer
 
 
-# 面试官可能问：什么时候用 Multi-Agent，而不是普通 Agent？
-# 回答：当问题明显跨多个领域并且可以并行收集事实时使用，例如库存、履约、风险
-# 同时分析。普通单 Agent 更简单，简单问题不应该硬上 Multi-Agent。
+# Multi-Agent 适合跨多个领域且可并行收集事实的问题。
 class MultiAgentOrchestrator:
     """对外的多 Agent 编排器。
 
@@ -523,7 +484,9 @@ class MultiAgentOrchestrator:
     ):
         self.llm = llm
         self.max_rounds_per_agent = max_rounds_per_agent
-        self._checkpointer = checkpointer or MemorySaver()
+        if checkpointer is None:
+            raise RuntimeError("Multi-Agent 编排器必须显式传入 Redis checkpointer。")
+        self._checkpointer = checkpointer
         self._store = store
         self._graph = self._build_graph(
             order_service,
@@ -551,10 +514,31 @@ class MultiAgentOrchestrator:
         3. 专家 -> barrier -> supervisor：专家结果回流后再次判断是否需要补问。
         """
         graph = StateGraph(MultiAgentState)
+        tool_services = ToolServiceBundle(
+            order_service=order_svc,
+            inventory_service=inv_svc,
+            knowledge_service=know_svc,
+            warehouse_service=wh_svc,
+            substitute_service=sub_svc,
+            fulfillment_service=ful_svc,
+        )
+        tool_registry = get_tool_registry()
         tools_by_agent = {
-            "inventory_agent": [make_inventory_tool(inv_svc), make_warehouse_tool(wh_svc)],
-            "fulfillment_agent": [make_fulfillment_plan_tool(ful_svc), make_substitute_tool(sub_svc)],
-            "risk_agent": [make_order_tool(order_svc), make_knowledge_tool(know_svc)],
+            "inventory_agent": tool_registry.build_tools(
+                services=tool_services,
+                use_case="multi_agent",
+                group="multi_agent.inventory_agent",
+            ),
+            "fulfillment_agent": tool_registry.build_tools(
+                services=tool_services,
+                use_case="multi_agent",
+                group="multi_agent.fulfillment_agent",
+            ),
+            "risk_agent": tool_registry.build_tools(
+                services=tool_services,
+                use_case="multi_agent",
+                group="multi_agent.risk_agent",
+            ),
         }
 
         graph.add_node("supervisor", make_supervisor_node(self.llm, self.max_rounds_per_agent))

@@ -1,21 +1,14 @@
 """企业数据接入 API。
 
-文件作用摘要：
-这个文件模拟真实企业项目里的 ERP/OMS/WMS 数据接入层，负责登记数据源、导入订单、
+本模块模拟 ERP/OMS/WMS 数据接入层，负责登记数据源、导入订单、
 导入库存，以及查询企业数据接入后的结果。
 
-学习重点：
-1. ``sources`` 表示数据来源，例如 ERP、OMS、WMS、Excel 导入或第三方平台。
-2. ``orders/import`` 和 ``inventory/import`` 是批量导入入口，适合前端上传或脚本调用。
-3. ``replace_source`` 用来控制是否替换同一来源的旧数据，避免重复导入造成脏数据。
-4. 这里不直接参与 Agent 推理，但它会改变订单/库存服务能看到的数据。
-
-面试官可能问：为什么要有企业数据接入层？
-回答：Agent 项目如果只用写死 demo 数据，业务价值会很弱。接入层让订单和库存可以来自
-真实企业系统，后面的 Agent、Workflow、RAG 才能围绕真实业务数据做决策。
+``sources`` 表示数据来源，例如 ERP、OMS、WMS、Excel 导入或第三方平台。
+``orders/import`` 和 ``inventory/import`` 是批量导入入口，``replace_source``
+用于控制是否替换同一来源的旧数据。
 """
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.core.service_registry import get_enterprise_data_repository
 from app.schemas.common import ApiResponse
@@ -48,10 +41,7 @@ def upsert_source(request: EnterpriseDataSourceCreate) -> ApiResponse:
 
 @router.get("/sources", response_model=ApiResponse)
 def list_sources() -> ApiResponse:
-    """列出所有已登记的数据源。
-
-    学习时可以把它理解成“系统知道哪些外部数据源已经接进来了”。
-    """
+    """列出所有已登记的数据源。"""
     repository = get_enterprise_data_repository()
     sources = [source.model_dump(mode="json") for source in repository.list_sources()]
     return ApiResponse(
@@ -147,6 +137,21 @@ def get_enterprise_order(order_id: str) -> ApiResponse:
         success=True,
         message="企业订单查询完成。",
         data={"order": order.model_dump(mode="json")},
+    )
+
+
+@router.get("/orders", response_model=ApiResponse)
+def list_enterprise_orders(limit: int = Query(default=100, ge=1, le=500)) -> ApiResponse:
+    """查询企业订单列表。
+
+    前端运营台使用这个接口展示真实订单；没有数据时返回空列表，不再提供 demo 订单。
+    """
+    repository = get_enterprise_data_repository()
+    orders = repository.list_orders(limit=limit)
+    return ApiResponse(
+        success=True,
+        message=f"共 {len(orders)} 条企业订单。",
+        data={"orders": [order.model_dump(mode="json") for order in orders]},
     )
 
 

@@ -1,13 +1,8 @@
 """LangGraph 工作流节点函数集合。
 
-为什么把节点组织在一个类里？
-    LangGraph 的节点本质是"接受 state，返回 state 增量"的函数。
-    但节点需要调用已有 service（订单/库存/知识/LLM），
-    最自然的做法就是把 service 作为类成员，节点是类方法。
-    这样：
-      1. service 依赖只在构造时注入一次
-      2. 每个方法都是天然的闭包，天生适配 graph.add_node
-      3. 单元测试时只需 mock service 属性即可
+节点组织在类中，便于在构造时注入订单、库存、知识库和 LLM 等服务。
+每个 public 方法都是可注册到 LangGraph 的节点函数，单元测试时也可以直接
+mock 对应 service 成员。
 
 节点实现约束（全文件统一）：
     1. 只接受 `state: GraphState`，只返回 dict 增量。
@@ -15,7 +10,7 @@
        （dispatch_node 的参数缺失例外，它会直接抛 ValueError 让上层挡住）。
     3. 每个节点无论成功失败，都必须写一条 TraceEvent。
 
-学习时可以把每个节点看成“流水线上的工位”：
+节点职责：
     dispatch             只检查入参、记录启动。
     order_analysis       查订单事实。
     inventory_analysis   查库存，并决定快路径/缺货路径；必要时触发人工审批。
@@ -33,6 +28,7 @@ from langgraph.types import Command, interrupt
 from app.workflows.fulfillment.risk_evaluator import RiskEvaluator
 from app.workflows.fulfillment.state import GraphState
 from app.workflows.fulfillment.trace import ErrorEvent, build_trace_event
+from app.infrastructure.llm.model_gateway import get_model_gateway
 from app.schemas.workflow import FinalAnswer
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
@@ -47,10 +43,7 @@ from app.domain.orders.analysis import (
 _FINALIZE_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "你是一个供应链履约决策助手。"
-        "你会收到订单信息、库存状态和可参考的履约规则，"
-        "请根据这些信息用 2~3 句话给出简洁、可操作的履约结论和首要建议。"
-        "不要重复输入内容，直接给出结论。",
+        get_model_gateway().prompt_system(use_case="workflow_finalize"),
     ),
     ("human", "{context}"),
 ])
@@ -214,9 +207,8 @@ class WorkflowNodes:
           把 fulfillment_branch 字段写入 state。
           它不是业务结果的一部分，而是给"条件边"读的"路由指示灯"。
 
-        为什么在这个节点写分支字段，而不是在条件边函数里算？
-          1. 条件边函数应保持极简（只读 state、返回节点名）。
-          2. 把业务判定语义放在节点内部，方便测试和单独复用。
+        分支字段在节点内写入，条件边函数只读取 state 并返回节点名。
+        这样业务判定留在节点内，路由函数保持轻量且容易测试。
 
         输入依赖：order_result / order_id
         产出字段：inventory_result / fulfillment_branch / risk_level / risk_signals
@@ -468,7 +460,7 @@ class WorkflowNodes:
     def finalize(self, state: GraphState) -> dict:
         """汇总节点：把三个中间结果整合成最终答复。
 
-        教学重点：
+        设计说明：
           finalize 是“读 state、组织答案”的出口节点，不重新查订单、不重新查库存、
           也不自己做 RAG。这样可以保证最终答案的依据都能回溯到前面节点的 trace。
 
@@ -636,9 +628,8 @@ class WorkflowNodes:
     ) -> str:
         """把三个模块的结果组织成带结构标签的 LLM 输入文本。
 
-        为什么要加【标签】？
-            让模型清楚地知道"这段是订单信息"、"这段是库存状态"、"这段是规则参考"，
-            避免把三段内容当成无结构的流水文本处理，输出质量更稳定。
+        结构标签用于区分订单信息、库存状态和规则参考，
+        避免模型把多段事实当成无结构文本处理。
         """
         parts: list[str] = []
         if order_result is not None:

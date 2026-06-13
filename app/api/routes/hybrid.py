@@ -1,9 +1,8 @@
-"""混合策略 API 路由 — Agent + Workflow + Multi-Agent 的智能路由。
+"""混合策略 API 路由。
 
-文件作用摘要：
-这个文件是项目里“多种智能链路并存”的展示入口。它把固定 Workflow、RAG 知识检索、
+本模块提供 Agent、Workflow、RAG、Multi-Agent 等多条智能链路的统一入口。它把固定 Workflow、RAG 知识检索、
 自由 ReAct Agent、多 Agent Supervisor、并行 Workflow、高级规则引擎都放到同一个 ``/hybrid`` 路由组下，
-方便你对比不同方案的边界和效果。
+便于前端按策略自动选择执行路径。
 
 核心端点：
   POST /api/v1/hybrid/run              — 自动选择 Workflow / RAG / Agent / Multi-Agent
@@ -12,15 +11,8 @@
   POST /api/v1/hybrid/parallel/run     — LangGraph fan-out/fan-in 并行工作流
   POST /api/v1/hybrid/multi-agent/run  — Supervisor 调度多个专家 Agent
 
-学习重点：
-1. Workflow：稳定、可审计、适合固定 SOP。
-2. Agent：灵活、能开放追问、适合问题表达不固定。
-3. Multi-Agent：适合库存、履约、风险等多领域并行分析。
-4. Hybrid：不是一种 Agent，而是一个“路由策略”，决定什么时候用哪条链路。
-
-面试官可能问：为什么不所有问题都交给 Agent？
-回答：Agent 灵活但成本和不确定性更高。商家系统里大量问题其实是固定流程，用 Workflow
-更快、更便宜、更可控；只有复杂开放问题才需要 Agent 或 Multi-Agent。
+Hybrid 不是一种 Agent，而是执行路径选择策略：固定流程优先走 Workflow，
+开放问题走 Agent，跨领域复杂分析可走 Multi-Agent。
 """
 
 import logging
@@ -28,11 +20,7 @@ from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from app.agents.tools.factory import (
-    make_fulfillment_plan_tool,
-    make_substitute_tool,
-    make_warehouse_tool,
-)
+from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
 from app.core.config import get_settings
 from app.core.service_registry import (
     get_inventory_analysis_service,
@@ -56,6 +44,8 @@ from app.application.routing.hybrid_service import HybridService
 from app.application.memory.session_memory_service import (
     get_session_service,
 )
+from app.observability.audit_log import record_audit_event
+from app.observability.business_trace import snapshot_current_trace, update_current_trace
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
 from app.domain.inventory.warehouse_service import WarehouseService
 from app.application.workflow.workflow_service import WorkflowService
@@ -97,11 +87,23 @@ _fulfillment_service = FulfillmentPlanService(
     substitute_service=_substitute_service,
 )
 
-_extra_tools = [
-    make_warehouse_tool(_warehouse_service),
-    make_substitute_tool(_substitute_service),
-    make_fulfillment_plan_tool(_fulfillment_service),
-]
+_tool_services = ToolServiceBundle(
+    order_service=_order_analysis_service,
+    inventory_service=_inventory_analysis_service,
+    knowledge_service=_knowledge_retrieval_service,
+    warehouse_service=_warehouse_service,
+    substitute_service=_substitute_service,
+    fulfillment_service=_fulfillment_service,
+)
+_extra_tools = get_tool_registry().build_tools(
+    services=_tool_services,
+    use_case="agent",
+    include_names=(
+        "search_warehouse_inventory",
+        "find_substitute_sku",
+        "generate_fulfillment_plan",
+    ),
+)
 
 _chat_model = LLMFactory.create_chat_model(_settings, use_case="agent")
 _supervisor_model = LLMFactory.create_chat_model(_settings, use_case="supervisor")
@@ -240,14 +242,14 @@ class HybridRunRequest:
     如果以后改成 JSON body，可以把它迁移成 Pydantic BaseModel。
     """
 
-    order_id: str
+    order_id: str | None
     question: str = None
     filter_categories: list = None
 
 
 @router.post("/run", response_model=ApiResponse)
 def hybrid_run(
-    order_id: str = Query(...),
+    order_id: str | None = Query(None),
     question: str = Query(None),
     filter_categories: list = Query(None),
     thread_id: str = Query(None),
@@ -283,12 +285,6 @@ def hybrid_run(
             detail="Hybrid service unavailable.",
         )
 
-    if not order_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="order_id is required",
-        )
-
     try:
         # process 内部会完成：意图判断 -> 路径选择 -> 执行 -> 缓存/会话更新。
         # 路由层不关心具体选了 workflow 还是 agent，只负责统一响应。
@@ -304,7 +300,39 @@ def hybrid_run(
             detail=f"Error processing request: {exc}",
         ) from exc
 
+    update_current_trace(
+        order_id=result.order_id or order_id,
+        session_id=result.thread_id or thread_id,
+        route=f"hybrid:{result.path_used}",
+        status=result.status,
+        metadata={
+            "intent_level": result.intent_level,
+            "confidence": result.confidence,
+            "tools_called": result.tools_called,
+            "data_freshness": {
+                "order_data_version": "runtime",
+                "inventory_data_version": "runtime",
+                "stale": False,
+            },
+        },
+    )
+    record_audit_event(
+        event_type="order_ai_query",
+        action="hybrid_run",
+        actor_type="user",
+        status=result.status,
+        order_id=result.order_id or order_id,
+        summary=f"Hybrid 通过 {result.path_used} 生成回答",
+        metadata={
+            "path_used": result.path_used,
+            "intent_level": result.intent_level,
+            "confidence": result.confidence,
+            "ai_recommendation_summary": result.final_answer,
+        },
+    )
+
     response_data = asdict(result)
+    response_data["business_trace"] = snapshot_current_trace()
 
     # 生成响应消息
     if result.status == "interrupted":
@@ -389,7 +417,25 @@ def hybrid_resume(
             detail=f"Error resuming workflow: {exc}",
         ) from exc
 
+    update_current_trace(
+        order_id=result.order_id,
+        session_id=result.thread_id or thread_id,
+        route="hybrid:resume",
+        status=result.status,
+        metadata={"hitl_decision": decision},
+    )
+    record_audit_event(
+        event_type="hitl_decision",
+        action=decision,
+        actor_type="user",
+        status=result.status,
+        order_id=result.order_id,
+        summary=f"人工审核已提交：{decision}",
+        metadata={"thread_id": thread_id, "notes": notes},
+    )
+
     response_data = asdict(result)
+    response_data["business_trace"] = snapshot_current_trace()
 
     if result.status == "interrupted":
         message = (

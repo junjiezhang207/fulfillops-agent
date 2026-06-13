@@ -60,7 +60,7 @@ _DROPPED_FIELDS = {"raw_prompt", "raw_messages", "authorization", "cookie"}
 class MemoryStoreLike(Protocol):
     """长期记忆 Store 的最小接口。
 
-    SQLiteLongTermMemoryStore 和 MySQLMilvusLongTermMemoryStore 都符合这个接口。
+    MySQLMilvusLongTermMemoryStore 符合这个接口。
     治理层只依赖 search/put，可以避免和具体存储实现强绑定。
     """
 
@@ -164,9 +164,7 @@ def _redact_text(text: str) -> tuple[str, list[str]]:
 def _sanitize(value: Any, flags: list[str]) -> Any:
     """递归清洗即将进入长期记忆的 value。
 
-    学习重点：
-    - 短期记忆可以保留完整上下文。
-    - 长期记忆会跨会话复用，所以必须更严格。
+    长期记忆会跨会话复用，清洗策略比短期上下文更严格。
     """
     if isinstance(value, str):
         redacted, found = _redact_text(value)

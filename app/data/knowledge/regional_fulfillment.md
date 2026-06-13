@@ -1,3 +1,13 @@
+---
+category: regional_strategy
+title: 区域仓配策略
+owner: fulfillment-ops
+version: v1
+effective_date: 2026-01-01
+business_scope: [区域仓配, 跨区域履约]
+region: all
+---
+
 # 区域仓配策略
 
 区域仓配策略用于辅助判断订单的最佳履约路径。

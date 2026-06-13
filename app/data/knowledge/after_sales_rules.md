@@ -1,3 +1,13 @@
+---
+category: after_sales_rule
+title: 售后与补发履约规则
+owner: fulfillment-ops
+version: v1
+effective_date: 2026-01-01
+business_scope: [售后, 补发, 退货, 质检]
+region: all
+---
+
 # 售后与补发履约规则
 
 售后场景下的履约规则与正常下单有所不同，需要单独处理。

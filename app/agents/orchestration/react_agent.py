@@ -1,24 +1,14 @@
-"""文件作用摘要：ReAct Agent 的创建入口和轻量质量门。
+"""ReAct Agent 创建入口与轻量质量门。
 
-这个文件是 ``app/agents/orchestration`` 目录里的 Agent 底座，负责把模型、工具、系统
-提示词和 LangGraph checkpointer 交给 LangChain，创建一个可多轮对话、
-可自主调用工具的 ReAct Agent。它不直接处理 HTTP 请求，也不直接访问
-订单、库存、知识库等业务数据；这些都由 ``AgentService`` 和工具层负责。
+本模块负责把模型、工具、系统提示词、checkpointer 和长期记忆 store
+交给 LangChain，创建可多轮对话、可自主调用工具的 ReAct Agent。
+HTTP 请求、订单、库存、知识库等业务访问由服务层和工具层处理。
 
-主要做的事：
-1. ``build_agent``：调用 LangChain ``create_agent``，生成标准 ReAct Agent。
-2. ``_run_config``：为每次运行生成 LangGraph 配置，核心是 thread_id 和 callbacks。
-3. ``ReflectiveAgentRunner``：在标准 Agent 外面包一层可选的答案质量检查。
-4. ``_reflect_on_answer``：按工具调用、相关性、具体性三类信号给回答打分。
-
-ReAct 主流程可以这样理解：
-用户问题 -> LLM 判断是否需要工具 -> 调用工具 -> LLM 读取工具结果
--> 继续调用工具或生成最终答案。
-
-学习时先看：
-1. ``build_agent``：理解 Agent 是怎么创建的。
-2. ``ReflectiveAgentRunner.arun``：理解普通 Agent 外层如何做低质量重试。
-3. ``_reflect_on_answer``：理解项目里“反思”不是玄学，而是规则化质量门。
+主要组成：
+1. ``build_agent``：创建标准 ReAct Agent。
+2. ``_run_config``：生成 LangGraph 运行配置。
+3. ``ReflectiveAgentRunner``：提供可选的回答质量门与重试包装。
+4. ``_reflect_on_answer``：基于工具、相关性和证据支撑进行规则评分。
 """
 
 import re
@@ -29,7 +19,6 @@ from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
-from langgraph.checkpoint.memory import MemorySaver
 
 
 def _run_config(session_id: str, callbacks: list[Any] | None = None) -> dict:
@@ -48,10 +37,7 @@ def _run_config(session_id: str, callbacks: list[Any] | None = None) -> dict:
     return config
 
 
-# 面试官可能问：为什么这里用 LangChain create_agent，而不是自己手写 ReAct 循环？
-# 回答：ReAct 循环本身不是项目核心价值，自己手写容易在工具调用、消息格式、
-# 多轮记忆、callbacks、LangGraph 状态管理上踩坑。这里把标准 Agent 循环交给
-# LangChain，项目代码专注业务工具、记忆、RAG、Guardrails 和结果整理。
+# ReAct 循环交给 LangChain 维护，项目侧只负责业务工具、记忆、RAG、安全与结果整理。
 def build_agent(
     chat_model: BaseChatModel,
     tools: list[BaseTool],
@@ -60,27 +46,27 @@ def build_agent(
 ):
     """构建带记忆的标准 ReAct Agent。
 
-    你可以把这个函数看成 LangChain Agent 的工厂函数：
+    该函数作为 LangChain Agent 的工厂入口：
     - ``chat_model``：负责生成文本和决定工具调用。
     - ``tools``：Agent 能使用的外部能力，比如查订单、查库存、检索知识库。
     - ``system_prompt``：给 Agent 定角色、边界和回答风格。
     - ``checkpointer``：保存每个 session 的消息历史。
 
-    System Prompt 从 PromptRegistry 读取（降级链：Langfuse → YAML → 内置）：
-      - Langfuse 已配置时：自动拉取 "fulfillment-agent" prompt，trace 自动关联版本
+    System Prompt 从模型网关读取（降级链：YAML → 内置）：
       - 本地开发时：从 prompts/fulfillment_agent_v1.yaml 读取
       - 兜底：内置 hardcoded（服务不中断）
 
     Args:
         chat_model:   LLM 模型
         tools:        工具列表
-        checkpointer: Checkpointer（默认尝试 Redis，降级 MemorySaver）
+        checkpointer: Redis Checkpointer（生产模式必传）
         store:        长期记忆 Store（预留接口）
     """
-    from app.core.prompt_registry import get_prompt_registry
-    system_prompt = get_prompt_registry().get("fulfillment_agent")
+    from app.infrastructure.llm.model_gateway import get_model_gateway
+    system_prompt = get_model_gateway().prompt_system(use_case="agent")
 
-    _checkpointer = checkpointer or MemorySaver()
+    if checkpointer is None:
+        raise RuntimeError("ReAct Agent 必须显式传入 Redis checkpointer，生产模式不允许使用 MemorySaver。")
 
     # create_agent 返回的是一个可 invoke/ainvoke/stream/astream 的 LangGraph 编译图。
     # 之后 AgentService 调用它时，只需要传 {"messages": [...]} 和 config。
@@ -88,7 +74,7 @@ def build_agent(
         "model": chat_model,
         "tools": tools,
         "system_prompt": system_prompt,
-        "checkpointer": _checkpointer,
+        "checkpointer": checkpointer,
     }
     if store is not None:
         kwargs["store"] = store
@@ -96,12 +82,10 @@ def build_agent(
 
 
 # ============================================================================
-# 自反思循环
+# 回答质量门
 # ============================================================================
 
-# 面试官可能问：为什么反思结果不用 LLM 自己随口评价，而是拆成多个分数？
-# 回答：面试时要强调“反思不是玄学”。这里把质量拆成工具调用、问题相关性、
-# 具体性三个维度，能解释为什么重试，也方便后续把阈值和权重调成业务策略。
+# 质量门使用规则分数而不是额外 LLM 评审，降低成本并保证重试原因可解释。
 @dataclass
 class ReflectionResult:
     """单次反思评估结果。
@@ -127,10 +111,9 @@ class ReflectionResult:
 class ToolObservation:
     """本轮工具调用结果，用于判断答案里的事实是否有证据支撑。
 
-    为什么要保存工具结果？
-    以前只知道 Agent 调用了 ``check_inventory``，但不知道工具返回了什么。
-    这样答案哪怕编造一个 SKU，也可能因为“调过工具”而通过。
-    现在把 ToolMessage 的文本保存下来，就能做简单证据比对。
+    保存工具结果用于证据比对。仅记录工具是否被调用不够，答案仍可能编造
+    工具结果里不存在的 SKU、仓库或数量。这里把 ToolMessage 文本保留下来，
+    供后续质量门做轻量校验。
     """
 
     tool_name: str
@@ -209,7 +192,6 @@ def _extract_business_entities(text: str) -> set[str]:
 def _extract_meaningful_numbers(text: str) -> set[str]:
     """抽取业务数字，尽量忽略列表序号这类格式噪声。
 
-    为什么要忽略 1、2、3 这类序号？
     Agent 经常用列表回答，如果把列表序号当作业务数量，就会误判“答案有数字”。
     这里保留库存数量、件数、百分比这类更可能有业务含义的数字。
     """
@@ -264,10 +246,8 @@ def _looks_actionable(answer: str) -> bool:
     return bool(re.search(r"建议|优先|需要|可以|应|处理|方案|风险|结论|下一步|发货|调拨|替代", answer))
 
 
-# 面试官可能问：反思质量门主要检查什么？
-# 回答：它检查回答有没有调用必要工具、有没有沿用工具证据、有没有覆盖用户问题
-# 里的订单号/SKU/数量等关键实体，并判断答案是否具体可执行。它不是替代人工评审，
-# 而是在 Agent 低质量输出时做轻量兜底。
+# 质量门检查必要工具调用、工具证据、关键实体和答案可执行性。
+# 它只作为低质量输出兜底，不替代人工审核或完整评测。
 def _reflect_on_answer(
     question: str,
     answer: str,
@@ -411,16 +391,14 @@ _REFLECTION_RETRY_TEMPLATE = """\
 """
 
 
-# 面试官可能问：为什么 ReflectiveAgentRunner 放在标准 Agent 外面，而不是改 Agent 内部？
-# 回答：这样能保持标准 ReAct Agent 不被侵入。关闭反思时就是普通 Agent；
-# 开启反思时只是外层多跑质量检查和必要重试，架构上更容易回退和对比效果。
+# 反思包装器保持标准 Agent 图不变，仅在外层根据规则评分决定是否带反馈重试。
 class ReflectiveAgentRunner:
     """带自反思循环的 Agent 运行器。
 
     它使用装饰器思路：不改 LangChain Agent 内部图，只在外面包一层
     “执行 -> 评分 -> 必要时重试”的循环。
 
-    为什么不直接把反思写进 prompt？
+    设计取舍：
       - 写进 prompt 不容易测试，也不容易知道具体哪里失败。
       - 外层评分器能返回结构化分数和 reason，方便日志、评测和调试。
       - 开关更简单：生产环境想省 token 时可以不用反思。
@@ -605,6 +583,8 @@ class ReflectiveAgentRunner:
 def build_reflective_agent(
     chat_model: BaseChatModel,
     tools: list[BaseTool],
+    checkpointer,
+    store=None,
     max_retries: int = 2,
     threshold: float = 0.6,
 ) -> ReflectiveAgentRunner:
@@ -618,11 +598,13 @@ def build_reflective_agent(
     Args:
         chat_model: LLM 模型
         tools:      Agent 可用工具列表
+        checkpointer: Redis Checkpointer（生产模式必传）
+        store:      长期记忆 Store
         max_retries: 最大重试次数（默认 2）
         threshold:   质量门阈值 0-1（默认 0.6）
 
     Returns:
         ReflectiveAgentRunner，调用 .run(session_id, message) 使用
     """
-    agent = build_agent(chat_model, tools)
+    agent = build_agent(chat_model, tools, checkpointer=checkpointer, store=store)
     return ReflectiveAgentRunner(agent, max_retries=max_retries, threshold=threshold)

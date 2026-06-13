@@ -11,6 +11,44 @@ def test_vector_store_factory_uses_local_fallback_when_configured():
     assert create_vector_store(settings) is None
 
 
+def test_vector_store_factory_builds_chroma_store_when_configured(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeChromaClient:
+        def __init__(self, path):
+            captured["path"] = path
+
+        def get_or_create_collection(self, name):
+            captured["collection_name"] = name
+            return {"name": name}
+
+    class FakeChromaVectorStore:
+        def __init__(self, chroma_collection):
+            captured["chroma_collection"] = chroma_collection
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "chromadb":
+            return SimpleNamespace(PersistentClient=FakeChromaClient)
+        if name == "llama_index.vector_stores.chroma":
+            return SimpleNamespace(ChromaVectorStore=FakeChromaVectorStore)
+        return real_import(name, globals, locals, fromlist, level)
+
+    real_import = __import__
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    settings = SimpleNamespace(
+        vector_store_type="chroma",
+        chroma_persist_dir=str(tmp_path / "chroma"),
+        chroma_collection="knowledge_dev",
+    )
+
+    store = create_vector_store(settings)
+
+    assert isinstance(store, FakeChromaVectorStore)
+    assert captured["path"] == str(tmp_path / "chroma")
+    assert captured["collection_name"] == "knowledge_dev"
+    assert captured["chroma_collection"] == {"name": "knowledge_dev"}
+
+
 def test_vector_store_factory_builds_milvus_store_with_enterprise_defaults(monkeypatch):
     captured = {}
     pymilvus_calls = []
@@ -122,6 +160,66 @@ def test_vector_store_factory_raises_when_milvus_import_missing_and_strict(monke
 
     with pytest.raises(RuntimeError, match="Milvus"):
         create_vector_store(settings)
+
+
+def test_vector_store_factory_falls_back_to_chroma_when_milvus_unavailable(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeConnections:
+        def connect(self, **kwargs):
+            raise RuntimeError("milvus is down")
+
+    class FakeChromaClient:
+        def __init__(self, path):
+            captured["path"] = path
+
+        def get_or_create_collection(self, name):
+            captured["collection_name"] = name
+            return {"name": name}
+
+    class FakeChromaVectorStore:
+        def __init__(self, chroma_collection):
+            captured["chroma_collection"] = chroma_collection
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "pymilvus":
+            return SimpleNamespace(
+                connections=FakeConnections(),
+                db=SimpleNamespace(),
+                utility=SimpleNamespace(),
+                Collection=object,
+            )
+        if name == "chromadb":
+            return SimpleNamespace(PersistentClient=FakeChromaClient)
+        if name == "llama_index.vector_stores.chroma":
+            return SimpleNamespace(ChromaVectorStore=FakeChromaVectorStore)
+        return real_import(name, globals, locals, fromlist, level)
+
+    real_import = __import__
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    settings = SimpleNamespace(
+        vector_store_type="milvus",
+        vector_store_fallback="chroma",
+        vector_store_fallback_to_local=True,
+        milvus_uri="http://localhost:19530",
+        milvus_collection="knowledge_base",
+        milvus_dim=512,
+        milvus_overwrite=False,
+        milvus_upsert_mode=True,
+        milvus_batch_size=10,
+        milvus_token="",
+        milvus_database="default",
+        milvus_alias="rag_knowledge_base",
+        milvus_timeout_seconds=1,
+        chroma_persist_dir=str(tmp_path / "chroma"),
+        chroma_collection="knowledge_fallback",
+    )
+
+    store = create_vector_store(settings)
+
+    assert isinstance(store, FakeChromaVectorStore)
+    assert captured["path"] == str(tmp_path / "chroma")
+    assert captured["collection_name"] == "knowledge_fallback"
 
 
 def test_vector_store_factory_uses_pymilvus_to_load_existing_collection(monkeypatch):

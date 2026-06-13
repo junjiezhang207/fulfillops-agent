@@ -2,7 +2,7 @@
 
 Learning notes:
 - Settings loads .env values through pydantic-settings.
-- Model gateway, Milvus, Redis, memory and Langfuse settings are centralized here.
+- Model gateway, Milvus, Redis and memory settings are centralized here.
 - Business code should call get_settings() instead of reading environment variables directly.
 """
 
@@ -36,6 +36,21 @@ class Settings(BaseSettings):
     app_version: str = Field(default="0.1.0")
     api_v1_prefix: str = Field(default="/api/v1")
     debug: bool = Field(default=True)
+    app_env: str = Field(
+        default="production",
+        description="运行环境：production 会强制依赖 Redis/MySQL/Milvus，不允许静默降级。",
+    )
+    allow_infra_fallback: bool = Field(
+        default=False,
+        description="是否允许基础设施降级。生产模式必须保持 false，避免故障被本地内存/文件掩盖。",
+    )
+    allow_demo_data: bool = Field(
+        default=False,
+        description="是否允许使用内置 demo 订单和库存。生产模式必须保持 false。",
+    )
+    require_redis: bool = Field(default=True, description="启动与运行时是否强制要求 Redis 可用。")
+    require_milvus: bool = Field(default=True, description="启动与运行时是否强制要求 Milvus 可用。")
+    require_mysql: bool = Field(default=True, description="启动与运行时是否强制要求 MySQL 可用。")
     log_level: str = Field(default="INFO")
     frontend_cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",
@@ -50,20 +65,12 @@ class Settings(BaseSettings):
         default=86400,
         description="短期会话记忆 TTL，默认 24 小时。",
     )
-    long_term_memory_db_path: str = Field(
-        default=str(Path("storage") / "long_term_memory.sqlite3"),
-        description="长期记忆 SQLite 落盘路径。",
-    )
-    long_term_memory_backend: str = Field(
-        default="sqlite",
-        description="长期记忆后端：sqlite | mysql_milvus。mysql_milvus 使用 MySQL + Milvus。",
-    )
     long_term_memory_mysql_url: str = Field(
         default="",
         description="长期记忆 MySQL 连接串；留空时复用 MYSQL_URL。",
     )
     long_term_memory_vector_dimension: int = Field(
-        default=512,
+        default=1024,
         description="长期记忆 Milvus 向量维度，需要和模型网关 embedding 模型输出维度一致。",
     )
     long_term_memory_ttl_days: int | None = Field(
@@ -71,7 +78,7 @@ class Settings(BaseSettings):
         description="长期记忆默认 TTL 天数；None 表示不过期。",
     )
     long_term_memory_milvus_collection: str = Field(
-        default="long_term_memory_vectors",
+        default="long_term_memory_vectors_1024",
         description="长期记忆 Milvus collection；与 RAG 知识库 collection 分开，避免索引污染。",
     )
     long_term_memory_milvus_alias: str = Field(
@@ -83,8 +90,20 @@ class Settings(BaseSettings):
     knowledge_dir: str = Field(
         default=str(Path("app") / "data" / "knowledge")
     )
+    knowledge_extra_dirs: str = Field(
+        default="knowledge_base",
+        description="逗号分隔的附加只读知识目录；默认把根目录 knowledge_base 纳入 RAG。",
+    )
+    knowledge_recursive: bool = Field(
+        default=True,
+        description="是否递归扫描知识目录，便于接入按主题分层的知识库。",
+    )
     knowledge_index_cache_dir: str = Field(
         default=str(Path("storage") / "knowledge_index")
+    )
+    knowledge_warmup_on_startup: bool = Field(
+        default=True,
+        description="启动时是否预热 RAG 索引，避免第一次用户提问时触发全量建库。",
     )
     enterprise_data_dir: str = Field(
         default=str(Path("storage") / "enterprise_data"),
@@ -126,7 +145,6 @@ class Settings(BaseSettings):
     qwen_api_key: str = Field(default="", description="通义千问 API Key。")
     dashscope_api_key: str = Field(default="", description="阿里云百炼 DashScope API Key，用于 Embedding / Reranker。")
     kimi_api_key: str = Field(default="", description="Moonshot Kimi API Key。")
-    jina_api_key: str = Field(default="", description="Jina AI Reranker API Key。")
     local_llm_api_key: str = Field(default="", description="本地 OpenAI-compatible 服务可选 API Key。")
 
     # ------------------------------------------------------------------
@@ -141,14 +159,8 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # 向量存储配置（RAG 索引后端）
     # ------------------------------------------------------------------
-    # vector_store_type 决定 RAG 向量索引存储在哪里：
-    #   milvus — Milvus 向量数据库（默认，生产推荐）
-    #   local  — 本地文件系统（无外部服务时的开发兜底）
-    vector_store_type: str = Field(default="milvus", description="RAG 向量存储后端：milvus | local")
-    vector_store_fallback_to_local: bool = Field(
-        default=True,
-        description="Milvus 不可用时是否自动回退本地向量存储；生产环境建议设为 false。",
-    )
+    # vector_store_type 决定 RAG 向量索引存储在哪里。生产模式固定使用 Milvus/Zilliz。
+    vector_store_type: str = Field(default="milvus", description="RAG 向量存储后端：milvus | zilliz")
     milvus_uri: str = Field(
         default="",
         description="Milvus URI；优先级高于 host/port，例如 http://localhost:19530 或 Milvus Cloud URI。",
@@ -157,17 +169,18 @@ class Settings(BaseSettings):
     milvus_database: str = Field(default="default", description="Milvus database 名称；本地单库可保持 default。")
     milvus_alias: str = Field(default="", description="pymilvus 连接别名；留空时按 collection 自动生成。")
     # Milvus 集合名称（vector_store_type=milvus 时生效）
-    milvus_collection: str = Field(default="knowledge_base", description="Milvus 集合名称")
+    milvus_collection: str = Field(default="knowledge_base_1024", description="Milvus 集合名称")
     milvus_upsert_mode: bool = Field(default=True, description="写入 Milvus 时使用 upsert，避免重复 chunk。")
     milvus_overwrite: bool = Field(default=False, description="启动时是否覆盖 Milvus 集合；生产环境应保持 false。")
     milvus_batch_size: int = Field(default=100, description="Milvus 批量写入大小。")
-    milvus_timeout_seconds: float = Field(default=10.0, description="pymilvus 连接和 collection 检查超时时间。")
+    milvus_timeout_seconds: float = Field(default=1.0, description="pymilvus 连接和 collection 检查超时时间。")
     milvus_similarity_metric: str = Field(default="COSINE", description="Milvus 向量相似度指标。")
     milvus_consistency_level: str = Field(default="Session", description="Milvus 一致性级别。")
-    # 向量维度，需与 embed_model 输出维度一致：
-    #   BAAI/bge-small-zh-v1.5 → 512
-    #   text-embedding-3-small  → 1536
-    milvus_dim: int = Field(default=512, description="向量维度（需与 embed_model 匹配）")
+    # 向量维度，需与当前默认 embedding 输出维度一致：
+    #   text-embedding-v4       → 1024（当前默认）
+    #   BAAI/bge-small-zh-v1.5 → 512（本地候选）
+    #   text-embedding-3-small  → 1536（OpenAI 候选）
+    milvus_dim: int = Field(default=1024, description="向量维度（需与当前 embedding 模型匹配）")
 
     # ------------------------------------------------------------------
     # Embedding 配置（RAG 向量检索，默认使用本地 BGE 模型）
@@ -176,17 +189,6 @@ class Settings(BaseSettings):
     embed_provider: str = Field(default="local", description="Embedding 提供方。")
     # 本地模型名（embed_provider=local 时使用），建议 BAAI/bge-small-zh-v1.5（中文优化）
     embed_model_name: str = Field(default="BAAI/bge-small-zh-v1.5", description="Embedding 模型名。")
-
-    # ------------------------------------------------------------------
-    # Langfuse 可观测性配置（可选，留空时自动跳过）
-    # ------------------------------------------------------------------
-    # 从 Langfuse 项目设置 → API Keys 获取
-    langfuse_public_key: str = Field(default="", description="Langfuse Public Key。")
-    langfuse_secret_key: str = Field(default="", description="Langfuse Secret Key。")
-    # 自托管时填写，使用 cloud.langfuse.com 时留空
-    langfuse_host: str = Field(default="", description="Langfuse 服务地址（自托管时填写）。")
-    # 兼容 Langfuse / OpenTelemetry 常见命名；优先级低于 LANGFUSE_HOST
-    langfuse_base_url: str = Field(default="", description="Langfuse 服务地址别名。")
 
     @field_validator("debug", mode="before")
     @classmethod

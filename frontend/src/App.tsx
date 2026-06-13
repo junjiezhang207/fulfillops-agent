@@ -3,8 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { Shell } from "./components/Shell";
 import { DataImportPage } from "./pages/DataImportPage";
 import { OperationsDashboard } from "./pages/OperationsDashboard";
-import { ReviewQueuePage, StandaloneReviewPage } from "./pages/ReviewPage";
-import { SystemPage } from "./pages/SystemPage";
+import { TraceCenterPage } from "./pages/TraceCenterPage";
 
 export function App() {
   return (
@@ -12,10 +11,9 @@ export function App() {
       <Route path="/" element={<Shell />}>
         <Route index element={<OperationsDashboard />} />
         <Route path="data" element={<DataImportPage />} />
-        <Route path="reviews" element={<ReviewQueuePage />} />
-        <Route path="system" element={<SystemPage />} />
+        <Route path="traces" element={<TraceCenterPage />} />
+        <Route path="traces/:traceId" element={<TraceCenterPage />} />
       </Route>
-      <Route path="/review/:threadId" element={<StandaloneReviewPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

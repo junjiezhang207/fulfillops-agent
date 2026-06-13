@@ -25,10 +25,8 @@ dependencies = [
     "langchain-mcp-adapters>=0.0.1",
     "langchain-community>=0.4.1",
     "llama-index-retrievers-bm25>=0.5.2",
-    "langgraph-checkpoint-sqlite>=3.0.3",
     "langgraph-checkpoint-redis>=0.4.1",
     # ── Agent Evaluation ──────────────────────────────────────────────
-    "langfuse>=2.36.0,<4.0.0", # LLM 可观测性 + LLM-as-judge 评分（3.x callback API）
     "ragas>=0.2.0",            # RAG 质量指标（faithfulness / answer_relevancy）
     "deepeval>=2.0.0",         # CI 回归测试框架（AnswerRelevancy / GEval）
     "datasets>=3.0.0",         # Ragas 依赖的 HuggingFace datasets
@@ -38,6 +36,9 @@ dependencies = [
     "pyyaml>=6.0.3",
     "prometheus-client>=0.25.0",
     "llama-index-vector-stores-milvus>=0.8.7",
+    "pdfplumber>=0.11.5",
+    "python-docx>=1.1.2",
+    "charset-normalizer>=3.4.0",
 ]
 
 [tool.pytest.ini_options]

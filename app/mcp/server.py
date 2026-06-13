@@ -19,9 +19,10 @@ MCP Server 三种能力类型：
 
 本 Server 暴露的能力：
   Tools：
-    check_order_inventory    — 检查订单库存状态
-    search_warehouse_sku     — 跨仓库搜索 SKU 可用量
-    query_fulfillment_rules  — 检索履约规则知识库
+    analyze_order             — 查询订单结构化详情
+    check_inventory           — 检查订单库存状态
+    search_warehouse_inventory — 跨仓库搜索 SKU 可用量
+    retrieve_knowledge        — 检索履约规则知识库
     find_substitute_sku      — 查找替代 SKU
     generate_fulfillment_plan — 生成完整履约方案
 
@@ -40,6 +41,7 @@ MCP Server 三种能力类型：
   python app/mcp/server.py --transport streamable-http --host 0.0.0.0 --port 9000
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -52,9 +54,17 @@ from mcp.server.fastmcp import FastMCP
 from app.core.config import get_settings
 from app.core.service_registry import (
     get_inventory_analysis_service,
-    get_knowledge_retrieval_service,
     get_order_analysis_service,
+    get_knowledge_retrieval_service,
 )
+from app.agents.tools.contracts import (
+    DEFAULT_AGENT_TOOL_PERMISSIONS,
+    ToolRuntimeContext,
+    error_envelope,
+    tool_runtime_context,
+)
+from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
+from app.agents.tools.wrapper import wrap_tool_with_resilience
 from app.domain.inventory.warehouse_service import WarehouseService
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
@@ -70,15 +80,15 @@ mcp = FastMCP(
 你正在使用 MultiShip 供应链履约 MCP Server。
 
 该 Server 提供以下能力：
-  1. 订单和库存查询（check_order_inventory, search_warehouse_sku）
-  2. 知识库检索（query_fulfillment_rules）
+  1. 订单和库存查询（analyze_order, check_inventory, search_warehouse_inventory）
+  2. 知识库检索（retrieve_knowledge）
   3. 替代品和履约方案（find_substitute_sku, generate_fulfillment_plan）
   4. 仓库数据读取（inventory://warehouses, inventory://summary）
   5. 知识库文件访问（knowledge://categories, knowledge://file/{filename}）
 
 典型工作流：
-  1. check_order_inventory → 了解库存状态
-  2. query_fulfillment_rules → 查找相关规则
+  1. check_inventory → 了解库存状态
+  2. retrieve_knowledge → 查找相关规则
   3. generate_fulfillment_plan → 生成最优方案
 """,
 )
@@ -107,12 +117,154 @@ def _get_knowledge_svc():
     return get_knowledge_retrieval_service()
 
 
+def _csv_env(name: str, default: list[str]) -> list[str]:
+    """读取逗号分隔的 MCP 运行时配置。
+
+    MCP Server 经常以 subprocess 或 HTTP 服务方式启动，不一定能像内部 Agent
+    一样拿到完整的会话对象。这里用环境变量提供一个轻量入口，让部署方可以
+    为外部 MCP 客户端设置租户、用户和权限；没有配置时使用项目默认的只读/规划权限。
+    """
+    raw = os.getenv(name, "")
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    return values or list(default)
+
+
+def _mcp_runtime_context() -> ToolRuntimeContext:
+    """构造外部 MCP 调用进入内部工具层时使用的权限上下文。
+
+    关键点是：MCP tool 本身只是协议适配器，真正的权限判断仍然交给
+    ``authorize_tool_call``。这样内部 Agent 和外部 MCP 调用看到的是同一套
+    ``ToolManifest.required_permissions``，不会出现两套安全规则各管各的情况。
+    """
+    return ToolRuntimeContext(
+        tenant_id=os.getenv("MCP_TENANT_ID", "default"),
+        user_id=os.getenv("MCP_USER_ID", "mcp-client"),
+        roles=_csv_env("MCP_TOOL_ROLES", ["mcp_client"]),
+        permissions=_csv_env("MCP_TOOL_PERMISSIONS", DEFAULT_AGENT_TOOL_PERMISSIONS),
+        request_id=os.getenv("MCP_REQUEST_ID", ""),
+    )
+
+
+def _build_mcp_tool_map():
+    """从 ToolRegistry 构建 MCP Server 要暴露的业务工具。
+
+    以前 MCP Server 在本文件里手写业务函数，因此它和内部 Agent 工具有两套
+    名称、错误格式和可观测性。现在这里直接复用 registry 的定义：
+
+    1. ``ToolRegistry`` 决定有哪些工具、manifest 是什么、需要哪些 service。
+    2. ``factory.py`` 负责把 service 包装成 LangChain ``StructuredTool``。
+    3. ``wrap_tool_with_resilience`` 统一加权限、错误 envelope、缓存、熔断和 telemetry。
+    4. MCP 函数只把协议参数转成 dict，再调用这些包装后的工具。
+
+    这层拆分的好处是：以后新增内部 Agent 工具时，只要在 registry 里标记
+    ``use_case="mcp"``，MCP 侧就能复用同一套治理能力。
+    """
+    services = ToolServiceBundle(
+        order_service=_order_svc,
+        inventory_service=_inv_svc,
+        knowledge_service=_get_knowledge_svc(),
+        warehouse_service=_warehouse_svc,
+        substitute_service=_substitute_svc,
+        fulfillment_service=_fulfillment_svc,
+    )
+    registry = get_tool_registry()
+    tools = {}
+    for definition in registry.definitions(use_case="mcp"):
+        base_tool = definition.builder(services)
+        tools[definition.name] = wrap_tool_with_resilience(
+            base_tool,
+            enable_cache=definition.cache_enabled,
+            enable_circuit_breaker=True,
+        )
+    return tools
+
+
+_TOOL_REGISTRY = get_tool_registry()
+_MCP_TOOL_MAP = _build_mcp_tool_map()
+
+
+def _tool_description(tool_name: str) -> str:
+    """把 ToolManifest 展开成 MCP 客户端可读的工具说明。
+
+    MCP 客户端主要通过工具名、描述和参数 schema 让模型决定何时调用工具。
+    描述文本直接来自 registry manifest，可以避免 MCP 和 Agent 两边文案漂移。
+    """
+    definition = _TOOL_REGISTRY.get(tool_name)
+    if definition is None:
+        return ""
+    manifest = definition.manifest
+    permissions = ", ".join(manifest.required_permissions) or "none"
+    return (
+        f"{manifest.description}\n"
+        f"Owner: {manifest.owner}; risk: {manifest.risk_level.value}; "
+        f"permissions: {permissions}; freshness: {manifest.data_freshness}."
+    )
+
+
+def _tool_meta(tool_name: str) -> dict:
+    """给 MCP tool 附带机器可读治理元数据。
+
+    不是所有 MCP 客户端都会展示 ``meta``，但把 manifest 放进去有两个价值：
+    调试工具发现结果时能看到权限/风险/缓存策略；未来如果接入网关或审计系统，
+    也可以直接读取这些字段，而不用再反查 Python 代码。
+    """
+    definition = _TOOL_REGISTRY.get(tool_name)
+    if definition is None:
+        return {}
+    return {
+        "tool_registry": definition.metadata(),
+        "exposed_via": "mcp",
+    }
+
+
+def _invoke_registry_tool(tool_name: str, arguments: dict) -> str:
+    """执行 registry 工具并保持统一 envelope。
+
+    这里故意不捕获并改写正常的工具返回值，因为 ``factory.py`` 和
+    ``wrapper.py`` 已经保证结果是 ``ToolEnvelope`` JSON 字符串。MCP 只需要
+    在找不到工具这种适配层错误时返回同样的 error envelope。
+    """
+    tool = _MCP_TOOL_MAP.get(tool_name)
+    if tool is None:
+        return error_envelope(
+            "mcp_tool_not_registered",
+            f"MCP tool {tool_name} is not registered in ToolRegistry.",
+            retryable=False,
+            details={"tool_name": tool_name},
+        )
+    with tool_runtime_context(_mcp_runtime_context()):
+        return str(tool.invoke(arguments))
+
+
 # ============================================================================
 # Tools（LLM 可调用的函数）
 # ============================================================================
 
-@mcp.tool()
-def check_order_inventory(order_id: str) -> str:
+# 这一组 MCP tools 的函数体都很薄：它们只负责把 MCP 协议传进来的参数整理成
+# dict，然后交给 ``_invoke_registry_tool``。真正的业务逻辑、权限检查、错误
+# envelope、缓存、熔断和 telemetry 都在 ToolRegistry / wrapper 那条链路里。
+
+
+@mcp.tool(
+    name="analyze_order",
+    description=_tool_description("analyze_order"),
+    meta=_tool_meta("analyze_order"),
+)
+def analyze_order(order_id: str) -> str:
+    """查询订单结构化详情。
+
+    Args:
+        order_id: 订单 ID，格式如 SO202502140001。
+    """
+    return _invoke_registry_tool("analyze_order", {"order_id": order_id})
+
+
+@mcp.tool(
+    name="check_inventory",
+    description=_tool_description("check_inventory"),
+    meta=_tool_meta("check_inventory"),
+)
+def check_inventory(order_id: str) -> str:
     """检查订单的库存状态，判断能否全量履约。
 
     返回信息包含：
@@ -123,15 +275,15 @@ def check_order_inventory(order_id: str) -> str:
     Args:
         order_id: 订单 ID，格式如 SO202502140001
     """
-    try:
-        result = _inv_svc.analyze_inventory(order_id)
-        return result.summary
-    except Exception as e:
-        return f"库存查询失败: {e}"
+    return _invoke_registry_tool("check_inventory", {"order_id": order_id})
 
 
-@mcp.tool()
-def search_warehouse_sku(sku_id: str) -> str:
+@mcp.tool(
+    name="search_warehouse_inventory",
+    description=_tool_description("search_warehouse_inventory"),
+    meta=_tool_meta("search_warehouse_inventory"),
+)
+def search_warehouse_inventory(sku_id: str) -> str:
     """在全国所有仓库中搜索某个 SKU 的可用库存分布。
 
     返回信息包含：
@@ -142,47 +294,35 @@ def search_warehouse_sku(sku_id: str) -> str:
     Args:
         sku_id: 商品 SKU 编码，格式如 SKU-IPHONE-CASE-001
     """
-    try:
-        result = _warehouse_svc.search_sku_inventory(sku_id)
-        lines = [result.summary]
-        for wh in result.warehouse_list:
-            lines.append(
-                f"  {wh.warehouse_name}: {wh.available_quantity} 件可用"
-                f"（预留 {wh.reserved_quantity} 件）"
-            )
-        return "\n".join(lines)
-    except Exception as e:
-        return f"仓库搜索失败: {e}"
+    return _invoke_registry_tool("search_warehouse_inventory", {"sku_id": sku_id})
 
 
-@mcp.tool()
-def query_fulfillment_rules(query: str, categories: str = "") -> str:
+@mcp.tool(
+    name="retrieve_knowledge",
+    description=_tool_description("retrieve_knowledge"),
+    meta=_tool_meta("retrieve_knowledge"),
+)
+def retrieve_knowledge(question: str, order_id: str = "", categories: str = "") -> str:
     """检索履约规则知识库，获取与问题相关的业务规则和处理建议。
 
     知识库包含：缺货处理、优先级规则、区域调度、售后处理、拆合单规则。
 
     Args:
-        query:      检索问题，如"VIP 客户缺货时应如何处理？"
+        order_id:   订单 ID，可选；不传时只检索知识库文档。
+        question:   检索问题，如"VIP 客户缺货时应如何处理？"
         categories: 逗号分隔的类别过滤（可选），如 "stockout,priority"
     """
-    try:
-        svc = _get_knowledge_svc()
-        filter_cats = [c.strip() for c in categories.split(",") if c.strip()]
-        result = svc.retrieve(
-            order_id="",
-            question=query,
-            filter_categories=filter_cats,
-        )
-        if result.answer_summary:
-            rules = "\n".join(f"  - {r}" for r in result.answer_summary.key_rules)
-            actions = "\n".join(f"  - {a}" for a in result.answer_summary.suggested_actions)
-            return f"命中规则：\n{rules}\n\n建议动作：\n{actions}"
-        return f"找到 {len(result.hits)} 条相关记录，但未生成摘要。"
-    except Exception as e:
-        return f"知识检索失败: {e}"
+    return _invoke_registry_tool(
+        "retrieve_knowledge",
+        {"order_id": order_id, "question": question, "categories": categories},
+    )
 
 
-@mcp.tool()
+@mcp.tool(
+    name="find_substitute_sku",
+    description=_tool_description("find_substitute_sku"),
+    meta=_tool_meta("find_substitute_sku"),
+)
 def find_substitute_sku(sku_id: str) -> str:
     """查询 SKU 缺货时的替代方案。
 
@@ -194,14 +334,14 @@ def find_substitute_sku(sku_id: str) -> str:
     Args:
         sku_id: 原始 SKU 编码，如 SKU-IPHONE-CASE-001
     """
-    try:
-        result = _substitute_svc.search_substitutes(sku_id)
-        return result.summary
-    except Exception as e:
-        return f"替代方案查询失败: {e}"
+    return _invoke_registry_tool("find_substitute_sku", {"sku_id": sku_id})
 
 
-@mcp.tool()
+@mcp.tool(
+    name="generate_fulfillment_plan",
+    description=_tool_description("generate_fulfillment_plan"),
+    meta=_tool_meta("generate_fulfillment_plan"),
+)
 def generate_fulfillment_plan(order_id: str) -> str:
     """为订单生成完整的履约方案，包括库存配置、替代方案和发货策略。
 
@@ -214,20 +354,7 @@ def generate_fulfillment_plan(order_id: str) -> str:
     Args:
         order_id: 订单 ID，格式如 SO202502140001
     """
-    try:
-        plan = _fulfillment_svc.generate_plan(order_id)
-        lines = [plan.summary, "\n详细履约动作："]
-        for action in plan.actions:
-            lines.append(f"  - {action.product_name}（{action.quantity}件）→ {action.action_type}")
-            if action.warehouse_name:
-                lines.append(f"    从 {action.warehouse_name} 发货")
-            if action.substitute_product:
-                lines.append(f"    用 {action.substitute_product} 替代")
-            if action.estimated_days:
-                lines.append(f"    预计 {action.estimated_days} 天")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"履约方案生成失败: {e}"
+    return _invoke_registry_tool("generate_fulfillment_plan", {"order_id": order_id})
 
 
 # ============================================================================
@@ -347,10 +474,10 @@ def fulfillment_analysis(order_id: str) -> str:
     return f"""请对订单 {order_id} 进行完整的履约分析，按以下步骤进行：
 
 **第 1 步：库存核查**
-调用 check_order_inventory(order_id="{order_id}") 了解当前库存状态。
+调用 check_inventory(order_id="{order_id}") 了解当前库存状态。
 
 **第 2 步：规则检索**
-如果有缺货，调用 query_fulfillment_rules(query="缺货处理规则") 获取处理规范。
+如果有缺货，调用 retrieve_knowledge(order_id="{order_id}", question="缺货处理规则") 获取处理规范。
 
 **第 3 步：替代方案**
 对每个缺货 SKU，调用 find_substitute_sku(sku_id="...") 查找替代品。
@@ -377,10 +504,10 @@ def stockout_handling(sku_id: str, order_id: str = "") -> str:
 调用 find_substitute_sku(sku_id="{sku_id}")
 
 **2. 搜索其他仓库**
-调用 search_warehouse_sku(sku_id="{sku_id}") 查看是否有其他仓库有货
+调用 search_warehouse_inventory(sku_id="{sku_id}") 查看是否有其他仓库有货
 
 **3. 检索处理规则**
-调用 query_fulfillment_rules(query="缺货时客户优先级处理规则", categories="stockout,priority")
+调用 retrieve_knowledge(order_id="{order_id or 'MCP-ADHOC'}", question="缺货时客户优先级处理规则", categories="stockout,priority")
 
 **4. 给出决策**
 基于以上信息，建议选择以下处理方式之一：

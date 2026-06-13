@@ -18,13 +18,14 @@
 
 这个文件同时服务两条链路：
   - RAG 文档检索：KnowledgeRetrievalService 构建 VectorStoreIndex 时使用。
-  - 长期记忆检索：MySQL + Milvus 后端
-    需要把记忆文本转成向量。默认 SQLite 长期记忆不强依赖 embedding。
+  - 长期记忆检索：MySQL + Milvus 后端需要把记忆文本转成向量。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 from llama_index.core.embeddings import BaseEmbedding
@@ -46,6 +47,9 @@ class OpenAICompatibleEmbedding(BaseEmbedding):
     api_base: str = Field(default="")
     dimensions: int | None = Field(default=None)
     timeout: float = Field(default=60.0)
+    batch_size: int = Field(default=8)
+    retry_attempts: int = Field(default=3)
+    retry_backoff_seconds: float = Field(default=0.8)
 
     def _endpoint(self) -> str:
         return f"{self.api_base.rstrip('/')}/embeddings"
@@ -62,15 +66,26 @@ class OpenAICompatibleEmbedding(BaseEmbedding):
     def _embed_batch(self, inputs: list[str]) -> list[list[float]]:
         import httpx
 
-        response = httpx.post(
-            self._endpoint(),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=self._payload(inputs),
-            timeout=self.timeout,
-        )
+        response = None
+        for attempt in range(1, max(1, self.retry_attempts) + 1):
+            try:
+                response = httpx.post(
+                    self._endpoint(),
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=self._payload(inputs),
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                break
+            except Exception as exc:
+                if not self._should_retry_embedding_error(exc, attempt):
+                    raise
+                time.sleep(self.retry_backoff_seconds * attempt)
+        if response is None:
+            raise RuntimeError("Embedding request did not return a response.")
         response.raise_for_status()
         payload = response.json()
         items = sorted(payload.get("data") or [], key=lambda item: int(item.get("index", 0)))
@@ -83,14 +98,25 @@ class OpenAICompatibleEmbedding(BaseEmbedding):
         import httpx
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                self._endpoint(),
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=self._payload(inputs),
-            )
+            response = None
+            for attempt in range(1, max(1, self.retry_attempts) + 1):
+                try:
+                    response = await client.post(
+                        self._endpoint(),
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=self._payload(inputs),
+                    )
+                    response.raise_for_status()
+                    break
+                except Exception as exc:
+                    if not self._should_retry_embedding_error(exc, attempt):
+                        raise
+                    await asyncio.sleep(self.retry_backoff_seconds * attempt)
+        if response is None:
+            raise RuntimeError("Embedding request did not return a response.")
         response.raise_for_status()
         payload = response.json()
         items = sorted(payload.get("data") or [], key=lambda item: int(item.get("index", 0)))
@@ -112,10 +138,25 @@ class OpenAICompatibleEmbedding(BaseEmbedding):
         return (await self._aembed_batch([text]))[0]
 
     def _get_text_embeddings(self, texts: list[str]) -> list[list[float]]:
-        return self._embed_batch(texts)
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), max(1, self.batch_size)):
+            embeddings.extend(self._embed_batch(texts[start : start + self.batch_size]))
+        return embeddings
 
     async def _aget_text_embeddings(self, texts: list[str]) -> list[list[float]]:
-        return await self._aembed_batch(texts)
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), max(1, self.batch_size)):
+            embeddings.extend(await self._aembed_batch(texts[start : start + self.batch_size]))
+        return embeddings
+
+    def _should_retry_embedding_error(self, exc: Exception, attempt: int) -> bool:
+        if attempt >= max(1, self.retry_attempts):
+            return False
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code is not None and status_code < 500:
+            return False
+        logger.warning("Embedding batch 调用失败，准备重试：attempt=%d error=%s", attempt, exc)
+        return True
 
 
 class LazyEmbeddingModel:

@@ -5,7 +5,7 @@
 
 设计理念："结构化输入 + 结构化输出 + 全程 trace 可见"。
 
-学习时可以按数据流理解：
+数据流：
   WorkflowRunRequest  -> API 接收用户请求
   GraphState          -> LangGraph 节点之间传递中间状态
   FinalAnswer         -> finalize 节点生成最终业务结论
@@ -90,7 +90,7 @@ class InterruptEvent(BaseModel):
     # 新增：风险信息
     risk_level: str = Field(default="HIGH", description="风险等级：LOW/MEDIUM/HIGH/CRITICAL")
     risk_signals: list[str] = Field(default_factory=list, description="触发的风险规则名称")
-    timeout_seconds: int = Field(default=1800, description="超时秒数，到期后自动降级处理")
+    timeout_seconds: int = Field(default=1800, description="审批超时秒数，到期后进入人工升级或告警")
 
 
 class ApprovalRequest(BaseModel):

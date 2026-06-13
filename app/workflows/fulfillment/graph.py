@@ -20,7 +20,6 @@
   - Agent 是动态路径：LLM 自己决定下一步调哪个工具，更灵活但更难预测。
 """
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -45,22 +44,20 @@ def build_workflow(
 
     Args:
         nodes:        已注入 service 依赖的节点集合。
-        checkpointer: 短期记忆 Checkpointer（默认 MemorySaver）。
-                      实际服务层会优先传 Redis checkpointer；Redis 不可用时再降级。
+        checkpointer: 短期记忆 Checkpointer。生产模式必须由服务层传入 Redis checkpointer。
         store:        长期记忆 Store（默认 None）。
-                      可由 create_long_term_memory_store() 创建，具体后端取决于配置：
-                      sqlite / mysql_milvus。
+                      可由 create_long_term_memory_store() 创建，当前固定使用 MySQL + Milvus。
 
     接入示例：
         from app.memory import create_redis_checkpointer, create_long_term_memory_store
         graph = build_workflow(
             nodes,
             checkpointer=create_redis_checkpointer("redis://localhost:6379"),
-            store=create_long_term_memory_store(),
+            store=create_long_term_memory_store(mysql_url="mysql+pymysql://root:root@localhost:3306/multiship_agent"),
         )
     """
     if checkpointer is None:
-        checkpointer = MemorySaver()
+        raise RuntimeError("Workflow 必须显式传入 Redis checkpointer，生产模式不允许使用 MemorySaver。")
 
     # GraphState 是 TypedDict。LangGraph 不要求节点返回完整 state，
     # 每个节点只返回自己新增/更新的字段，框架会自动合并到共享 state。

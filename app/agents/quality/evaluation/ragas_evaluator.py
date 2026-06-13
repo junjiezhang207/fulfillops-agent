@@ -1,6 +1,6 @@
-"""文件作用摘要：用 Ragas 评估 RAG 回答质量。
+"""Ragas RAG 质量评估封装。
 
-这个文件专门服务于 RAG 质量评测。它不负责检索文档，也不负责生成业务答案；
+本模块专门服务于 RAG 质量评测。它不负责检索文档，也不负责生成业务答案；
 它拿到 question、answer、contexts 后，调用 Ragas 指标判断回答是否忠实于上下文、
 是否真正回答问题、检索上下文是否有用。
 
@@ -9,7 +9,7 @@
 2. ``RagasEvaluator.evaluate_single``：评估一条 question / answer / contexts。
 3. ``evaluate_batch``：批量评估多条样例，适合离线回归。
 4. 无可用 LLM / embeddings 时降级返回错误信息，不影响主流程。
-5. 和 Golden Dataset、Langfuse 导出数据配合，观察 RAG 质量变化。
+5. 和 Golden Dataset、线上业务 Trace 抽样配合，观察 RAG 质量变化。
 
 核心指标：
 - ``faithfulness``：答案是否忠实于检索上下文，主要防幻觉。
@@ -20,11 +20,6 @@
 1. Prompt 修改前后对比 RAG 质量。
 2. Reranker 或 Embedding 切换后做回归。
 3. 从线上 trace 抽样，定期评估 faithfulness 和 relevancy。
-
-学习时先看：
-1. ``RagasScore``：评测结果字段。
-2. ``evaluate_single``：单条评测主流程。
-3. ``evaluate_batch``：批量汇总逻辑。
 """
 
 from __future__ import annotations
@@ -35,9 +30,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
-# 面试官可能问：RagasScore 为什么允许 None？
-# 回答：Ragas 评测依赖 LLM / Embedding，有些本地或 CI 环境未配置模型。
-# 允许 None 可以让评测器优雅降级，把错误写进 error，而不是中断整个测试流程。
+# Ragas 依赖 LLM / Embedding，本地或 CI 未配置模型时分数字段允许为空。
 @dataclass
 class RagasScore:
     faithfulness: float | None = None       # 0-1，越高越不幻觉
@@ -46,9 +39,7 @@ class RagasScore:
     error: str = ""
 
 
-# 面试官可能问：为什么 RAG 需要单独评测，而不是只看用户满意度？
-# 回答：RAG 的核心风险是“看起来回答很好，但不忠实于检索上下文”。Ragas 的
-# faithfulness / relevancy 能把这个问题量化，适合做 prompt、检索、reranker 的回归。
+# RAG 评估重点关注答案是否忠实于检索上下文，以及是否真正回答问题。
 class RagasEvaluator:
     """封装 Ragas 评测逻辑，支持单条和批量评测。
 

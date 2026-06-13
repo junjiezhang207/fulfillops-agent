@@ -1,4 +1,11 @@
-from app.agents.runtime.agent_service import AgentService
+from app.agents.runtime.agent_service import AgentService, ExtractedMemory, ExtractedMemoryBatch
+from app.schemas.agent import ToolCallDetail
+
+
+def _service_for_memory_extractor() -> AgentService:
+    service = object.__new__(AgentService)
+    service._memory_extractor_model_id = "deepseek-v4-flash"
+    return service
 
 
 def test_memory_candidates_ignore_low_value_chitchat():
@@ -58,3 +65,106 @@ def test_memory_candidates_promote_preference_to_session_and_customer_scope():
     assert ("sessions", "s1", "preferences") in namespaces
     assert ("customers", "C-VIP-001", "preferences") in namespaces
     assert all(item.key.startswith("pref-") for item in preference_candidates)
+
+
+def test_llm_memory_candidate_maps_customer_preference():
+    service = _service_for_memory_extractor()
+    candidate = service._memory_candidate_from_extracted(
+        session_id="s1",
+        message="客户 C-VIP-001 以后优先走 DHL。",
+        reply="已记录偏好。",
+        tools_called=[],
+        has_tool_observation=False,
+        memory=ExtractedMemory(
+            memory_type="user_preference",
+            scope="customer",
+            preference="客户偏好优先使用 DHL 承运商",
+            customer_id="C-VIP-001",
+            memory_facts={"preferred_carrier": "DHL"},
+            evidence="客户 C-VIP-001 以后优先走 DHL。",
+            confidence=0.86,
+            importance=0.8,
+        ),
+    )
+
+    assert candidate is not None
+    assert candidate.namespace == ("customers", "C-VIP-001", "preferences")
+    assert candidate.value["source"] == "llm_memory_extractor"
+    assert candidate.value["extractor_model"] == "deepseek-v4-flash"
+    assert candidate.value["memory_facts"] == {"preferred_carrier": "DHL"}
+
+
+def test_llm_order_decision_requires_tool_observation():
+    service = _service_for_memory_extractor()
+    memory = ExtractedMemory(
+        memory_type="order_decision",
+        scope="order",
+        order_id="SO202502140001",
+        summary="订单库存不足，建议人工复核并通知客户延期。",
+        evidence="工具返回库存不足，助手建议人工复核。",
+        confidence=0.82,
+        importance=0.85,
+    )
+
+    without_observation = service._memory_candidate_from_extracted(
+        session_id="s1",
+        message="SO202502140001 库存不足怎么办？",
+        reply="建议人工复核并通知客户延期。",
+        tools_called=["check_inventory"],
+        has_tool_observation=False,
+        memory=memory,
+    )
+    with_observation = service._memory_candidate_from_extracted(
+        session_id="s1",
+        message="SO202502140001 库存不足怎么办？",
+        reply="建议人工复核并通知客户延期。",
+        tools_called=["check_inventory"],
+        has_tool_observation=True,
+        memory=memory,
+    )
+
+    assert without_observation is None
+    assert with_observation is not None
+    assert with_observation.namespace == ("orders", "SO202502140001")
+    assert with_observation.value["write_reason"] == "llm_tool_grounded_order_decision"
+
+
+async def test_llm_memory_extractor_output_becomes_candidates():
+    class FakeMemoryExtractor:
+        async def ainvoke(self, payload):
+            self.payload = payload
+            return ExtractedMemoryBatch(
+                memories=[
+                    ExtractedMemory(
+                        memory_type="conversation_summary",
+                        scope="session",
+                        summary="用户正在处理缺货订单，关注人工复核和延期通知。",
+                        evidence="用户询问缺货处理，助手建议人工复核。",
+                        confidence=0.72,
+                        importance=0.7,
+                    )
+                ]
+            )
+
+    service = _service_for_memory_extractor()
+    service._memory_extractor = FakeMemoryExtractor()
+
+    candidates = await service._build_llm_memory_candidates(
+        session_id="s1",
+        message="SO202502140001 缺货怎么办？",
+        reply="建议人工复核并通知客户延期。",
+        tools_called=["check_inventory"],
+        tool_call_details=[
+            ToolCallDetail(
+                tool_name="check_inventory",
+                input_args={"order_id": "SO202502140001"},
+                output='{"status":"ok","summary":"库存不足"}',
+                order=1,
+            )
+        ],
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].namespace == ("sessions", "s1")
+    assert candidates[0].value["source"] == "llm_memory_extractor"
+    assert candidates[0].value["extractor_model"] == "deepseek-v4-flash"

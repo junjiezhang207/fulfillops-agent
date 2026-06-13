@@ -1,6 +1,6 @@
-"""文件作用摘要：控制多轮对话上下文长度，防止 prompt 超过模型窗口。
+"""多轮对话上下文窗口管理。
 
-这个文件负责 Agent 的上下文裁剪。多轮对话会不断累积消息，如果不控制，
+本模块负责 Agent 的上下文裁剪。多轮对话会不断累积消息，如果不控制，
 prompt 会越来越长，导致成本上升、响应变慢，甚至超过模型上下文限制。
 本文件借助 LangChain ``trim_messages`` 和模型自身的
 ``get_num_tokens_from_messages``，在接近阈值时保留最近且格式合法的消息。
@@ -14,11 +14,6 @@ prompt 会越来越长，导致成本上升、响应变慢，甚至超过模型�
 
 这个文件不保存历史消息。真正的会话历史由 LangGraph checkpointer 保存；
 这里只负责“历史太长时怎么裁掉一部分”。
-
-学习时先看：
-1. ``ContextWindowConfig``：项目默认上下文控制策略。
-2. ``ContextWindowManager.trim_if_needed``：什么时候裁剪、怎么裁剪。
-3. ``estimate_tokens``：没有真实 tokenizer 时如何兜底。
 """
 
 from dataclasses import dataclass
@@ -78,9 +73,7 @@ class TrimResult:
 # 上下文管理器（基于 LangChain trim_messages）
 # ============================================================================
 
-# 面试官可能问：为什么 Agent 需要上下文裁剪？
-# 回答：多轮对话会让历史消息越来越长，导致 prompt 成本上升、响应变慢，
-# 甚至超过模型上下文窗口。这里用模型自身 token 计数和 LangChain trim_messages，
+# 上下文裁剪使用模型自身 token 计数和 LangChain trim_messages，
 # 保留最近且格式合法的消息，避免手写裁剪破坏消息结构。
 class ContextWindowManager:
     """使用 LangChain trim_messages() 管理对话历史。

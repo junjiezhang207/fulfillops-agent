@@ -14,16 +14,26 @@
   RetrievalInputs，其中包含库存分析结果、识别意图、业务检索上下文和过滤条件。
 """
 
+import json
+import logging
+import re
 from dataclasses import dataclass
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 
 from app.schemas.inventory import InventoryAnalysisResult
 from app.schemas.knowledge import QueryIntent, QueryIntentType
 from app.domain.inventory.analysis import InventoryAnalysisService
+from app.infrastructure.llm.model_gateway import get_model_gateway
 from app.rag.query_rewriter import QueryRewriter
+
+logger = logging.getLogger(__name__)
 
 
 # 轻量规则意图识别关键词。
-# 当前不用 LLM 分类，是为了保证本地演示稳定、便宜、可解释。
+# 小模型意图识别负责语义判断，规则分类作为稳定 fallback 和业务硬信号修正。
 # 后续如果换成小模型分类，可以保留这些关键词作为 fallback。
 INTENT_KEYWORDS = {
     QueryIntentType.STOCKOUT_HANDLING: ["缺货", "库存不足", "延迟发货", "调拨", "人工介入"],
@@ -44,11 +54,33 @@ INTENT_QUERY_EXPANSIONS = {
     QueryIntentType.GENERAL: ["通用履约规则"],
 }
 
+_INTENT_CLASSIFIER_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        get_model_gateway().prompt_system(use_case="rag_rewrite", prompt_id="rag_intent_classifier"),
+    ),
+    (
+        "human",
+        "用户问题：{question}\n"
+        "库存是否可全量履约：{fulfillment_ready}\n"
+        "库存不足 SKU：{insufficient_skus}\n"
+        "请分类。",
+    ),
+])
+
 
 def unique_nonempty(items: list[str]) -> list[str]:
     """去除空字符串并保持原顺序去重。"""
     # dict.fromkeys 在 Python 3.7+ 会保留插入顺序。
     return list(dict.fromkeys(item.strip() for item in items if item.strip()))
+
+
+def _intent_from_value(value: str) -> QueryIntentType | None:
+    """把 LLM 返回的字符串安全映射到枚举。"""
+    try:
+        return QueryIntentType(value.strip())
+    except Exception:
+        return None
 
 
 @dataclass
@@ -65,6 +97,7 @@ class RetrievalInputs:
     inventory_result: InventoryAnalysisResult
     intent: QueryIntent
     retrieval_context: str
+    has_order_context: bool = True
 
 
 class RAGQueryPlanner:
@@ -79,11 +112,19 @@ class RAGQueryPlanner:
         self,
         inventory_analysis_service: InventoryAnalysisService,
         query_rewriter: QueryRewriter | None = None,
+        intent_classifier_model: BaseChatModel | None = None,
     ) -> None:
         # 库存分析用于把订单状态加入检索计划。
         self.inventory_analysis_service = inventory_analysis_service
         # 可选 LLM 改写器；没配置也不影响规则扩展。
         self.query_rewriter = query_rewriter
+        # 可选小模型意图分类；规则分类仍作为 fallback，保证本地可运行。
+        self.intent_classifier_model = intent_classifier_model
+        self._intent_classifier_chain = (
+            _INTENT_CLASSIFIER_PROMPT | intent_classifier_model | StrOutputParser()
+            if intent_classifier_model is not None
+            else None
+        )
 
     def prepare(
         self,
@@ -113,7 +154,7 @@ class RAGQueryPlanner:
             intent=intent,
         )
         # active_filters 是调用方指定的知识类别过滤，没有就用空列表。
-        return RetrievalInputs(filter_categories or [], inventory_result, intent, retrieval_context)
+        return RetrievalInputs(filter_categories or [], inventory_result, intent, retrieval_context, True)
 
     def build_queries(self, question: str, prepared: RetrievalInputs) -> list[str]:
         """构建同步检索 query 列表。
@@ -130,7 +171,7 @@ class RAGQueryPlanner:
             return rule_queries
         # 有 LLM rewriter 时，把模型改写和规则扩展合并去重。
         return unique_nonempty([
-            *self.query_rewriter.rewrite(question, n=3),
+            *self.query_rewriter.rewrite(question, n=1),
             *rule_queries,
         ])
 
@@ -140,7 +181,7 @@ class RAGQueryPlanner:
         if self.query_rewriter is None:
             return rule_queries
         # 异步调用 LLM 改写器，避免阻塞上层 async API。
-        rewritten = await self.query_rewriter.arewrite(question, n=3)
+        rewritten = await self.query_rewriter.arewrite(question, n=1)
         return unique_nonempty([*rewritten, *rule_queries])
 
     def rule_expanded_queries(self, question: str, prepared: RetrievalInputs) -> list[str]:
@@ -156,6 +197,7 @@ class RAGQueryPlanner:
             insufficient_skus=inventory_result.insufficient_skus,
             fulfillment_ready=inventory_result.fulfillment_ready,
             intent=prepared.intent,
+            include_inventory_scenario=prepared.has_order_context,
         )
 
     def recognize_intent(
@@ -169,6 +211,36 @@ class RAGQueryPlanner:
 
         例如只要存在 insufficient_skus，即使用户没说“缺货”，也会提高缺货处理意图分。
         """
+        rule_intent = self._recognize_intent_by_rules(
+            question=question,
+            insufficient_skus=insufficient_skus,
+            fulfillment_ready=fulfillment_ready,
+        )
+        model_intent = self._recognize_intent_by_model(
+            question=question,
+            insufficient_skus=insufficient_skus,
+            fulfillment_ready=fulfillment_ready,
+        )
+        if model_intent is None:
+            return rule_intent
+        if model_intent.confidence < 0.55 and rule_intent.primary_intent != QueryIntentType.GENERAL:
+            return rule_intent
+
+        # 库存事实是硬信号：存在缺货 SKU 时，至少把缺货处理纳入候选意图。
+        if (
+            insufficient_skus
+            and model_intent.primary_intent != QueryIntentType.STOCKOUT_HANDLING
+            and QueryIntentType.STOCKOUT_HANDLING not in model_intent.secondary_intents
+        ):
+            model_intent.secondary_intents.insert(0, QueryIntentType.STOCKOUT_HANDLING)
+            model_intent.secondary_intents = model_intent.secondary_intents[:2]
+            model_intent.reasoning = f"{model_intent.reasoning}；库存不足 SKU 触发缺货处理修正。"
+        return model_intent
+
+    def _recognize_intent_by_rules(
+        self, question: str, insufficient_skus: list[str], fulfillment_ready: bool
+    ) -> QueryIntent:
+        """使用关键词和库存硬信号做可解释 fallback 分类。"""
         # 统一小写后做关键词匹配，中文不受大小写影响，英文 SKU/词也能兼容。
         normalized = question.lower()
         # 统计每个意图类别命中了几个关键词。
@@ -203,6 +275,54 @@ class RAGQueryPlanner:
             reasoning=f"命中 {primary.value} 相关术语，并结合库存状态修正。",
             secondary_intents=[t for t, _ in scored[1:3]],
         )
+
+    def _recognize_intent_by_model(
+        self, question: str, insufficient_skus: list[str], fulfillment_ready: bool
+    ) -> QueryIntent | None:
+        """用小模型做意图分类；失败时由规则分类接管。"""
+        if self._intent_classifier_chain is None:
+            return None
+        try:
+            raw = self._intent_classifier_chain.invoke(
+                {
+                    "question": question,
+                    "fulfillment_ready": str(fulfillment_ready),
+                    "insufficient_skus": "、".join(insufficient_skus) or "无",
+                }
+            )
+            payload = self._parse_intent_json(raw)
+            primary = _intent_from_value(str(payload.get("primary_intent", "")))
+            if primary is None:
+                return None
+            secondary = [
+                item
+                for item in (
+                    _intent_from_value(str(value))
+                    for value in payload.get("secondary_intents", [])
+                )
+                if item is not None and item != primary
+            ][:2]
+            confidence = float(payload.get("confidence", 0.0))
+            return QueryIntent(
+                primary_intent=primary,
+                confidence=max(0.0, min(round(confidence, 2), 1.0)),
+                reasoning=str(payload.get("reasoning") or "模型意图分类。"),
+                secondary_intents=secondary,
+            )
+        except Exception as exc:
+            logger.warning("RAG 意图模型分类失败，回退规则分类：%s", exc)
+            return None
+
+    @staticmethod
+    def _parse_intent_json(raw: str) -> dict:
+        """容忍模型包裹代码块或混入少量文本，只抽取 JSON 对象。"""
+        text = raw.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        if not text.startswith("{"):
+            match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            text = match.group(0) if match else text
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
 
     def build_retrieval_context(
         self,
@@ -239,6 +359,7 @@ class RAGQueryPlanner:
         insufficient_skus: list[str],
         fulfillment_ready: bool,
         intent: QueryIntent,
+        include_inventory_scenario: bool = True,
     ) -> list[str]:
         """生成最终的规则扩展 query 列表。
 
@@ -254,12 +375,13 @@ class RAGQueryPlanner:
         for secondary_intent in intent.secondary_intents:
             # 次意图也加入扩展，避免跨领域问题漏召回。
             queries.extend(INTENT_QUERY_EXPANSIONS.get(secondary_intent, []))
-        if insufficient_skus:
+        if include_inventory_scenario and insufficient_skus:
             # 缺货场景补充具体 SKU，让检索更贴近当前订单。
             queries.append(f"库存不足 SKU：{'、'.join(insufficient_skus)}，优先检索缺货处理与跨仓规则")
-        if fulfillment_ready:
-            queries.append("库存充足场景下的区域优先发货策略")
-        else:
-            queries.append("库存不足时跨仓调拨、跨区域履约和拆单建议")
+        if include_inventory_scenario:
+            if fulfillment_ready:
+                queries.append("库存充足场景下的区域优先发货策略")
+            else:
+                queries.append("库存不足时跨仓调拨、跨区域履约和拆单建议")
         # 去重并去掉空字符串。
         return unique_nonempty(queries)
