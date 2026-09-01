@@ -109,22 +109,20 @@ class MultiAgentService:
         from app.memory import create_long_term_memory_store
 
         settings = get_settings()
-        # 多 Agent 的专家节点也会写短期状态，生产模式统一落 Redis。
+        # 多 Agent 的专家节点也会写短期状态，生产模式统一落 PostgreSQL。
         checkpointer = create_checkpointer(
-            settings.redis_url,
+            settings.effective_database_url,
             ttl_seconds=settings.short_term_memory_ttl_seconds,
         )
         memory_embed_model = create_lazy_embed_model(settings)
-        # 跨专家、跨会话可复用的长期记忆固定落 MySQL + Milvus。
+        # 跨专家、跨会话可复用的长期记忆默认落 PostgreSQL + PGVector。
         memory_store = create_long_term_memory_store(
-            mysql_url=settings.long_term_memory_mysql_url or settings.mysql_url,
-            milvus_uri=settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}",
-            milvus_token=settings.milvus_token,
-            milvus_database=settings.milvus_database,
-            milvus_collection=settings.long_term_memory_milvus_collection,
-            milvus_alias=settings.long_term_memory_milvus_alias,
-            milvus_timeout_seconds=settings.milvus_timeout_seconds,
-            milvus_similarity_metric=settings.milvus_similarity_metric,
+            database_url=(
+                settings.long_term_memory_database_url
+                or settings.effective_database_url
+            ),
+            vector_store_type=settings.long_term_memory_vector_store_type,
+            pgvector_table=settings.long_term_memory_pgvector_table,
             embedding_model=memory_embed_model,
             vector_dimension=settings.long_term_memory_vector_dimension,
             default_ttl_days=settings.long_term_memory_ttl_days,

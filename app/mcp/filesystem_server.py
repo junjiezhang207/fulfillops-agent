@@ -29,8 +29,8 @@ from app.core.config import get_settings
 from app.mcp.runtime import run_mcp_server
 
 mcp = FastMCP(
-    "multiship-knowledge-filesystem",
-    instructions="用于读取 MultiShip 供应链知识库的文件系统 MCP Server。",
+    "fulfillops-knowledge-filesystem",
+    instructions="用于读取 fulfillops-agent 电商履约知识库的文件系统 MCP Server。",
 )
 
 _settings = get_settings()

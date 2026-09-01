@@ -3,7 +3,7 @@
 ``GET /health`` 是整个后端最轻量的探活接口。React 前端、部署平台、
 反向代理或监控脚本都可以用它判断 FastAPI 进程是否启动成功。
 
-健康检查不初始化 LLM、Milvus、Redis、MySQL 等重依赖。它只证明应用进程
+健康检查不初始化 LLM、PostgreSQL、PGVector 等重依赖。它只证明应用进程
 和路由系统可用，不代表所有下游服务健康。
 """
 
@@ -23,7 +23,7 @@ def health_check() -> ApiResponse:
     """
 
     # 这里只读取配置对象里的静态字段，不触发模型或数据库初始化。
-    # 这样即使 LLM/Milvus/MySQL 没配好，健康检查也能告诉你“后端程序本身是活的”。
+    # 这样即使 LLM/PostgreSQL/PGVector 没配好，健康检查也能告诉你“后端程序本身是活的”。
     settings = get_settings()
     payload = HealthResponse(
         status="ok",

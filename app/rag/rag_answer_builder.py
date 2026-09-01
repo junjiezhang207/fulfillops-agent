@@ -37,6 +37,11 @@ MATCH_TERMS = [
     "补发",
     "退货",
     "售后",
+    "优秀案例",
+    "历史案例",
+    "相似案例",
+    "案例",
+    "复盘",
 ]
 
 
@@ -185,6 +190,8 @@ class RAGAnswerBuilder:
         if "regional_strategy" in matched_categories:
             # 命中了区域策略知识，就补充仓配路径建议。
             actions.append("结合区域仓配策略选择最优发货路径")
+        if "excellent_case" in matched_categories:
+            actions.append("参考相似优秀案例的关键条件，确认当前订单是否满足同样执行前提")
         # 去重并限制数量，避免建议过长。
         return list(dict.fromkeys(actions))[:5]
 

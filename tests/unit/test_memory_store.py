@@ -4,57 +4,66 @@ import json
 import pytest
 
 from app.memory.long_term import (
-    MySQLMilvusLongTermMemoryStore,
+    PostgreSQLPGVectorLongTermMemoryStore,
     create_long_term_memory_store,
 )
 
 
-def test_mysql_milvus_long_term_memory_requires_mysql_url():
-    with pytest.raises(ValueError, match="MYSQL_URL|LONG_TERM_MEMORY_MYSQL_URL"):
+def test_pgvector_long_term_memory_requires_database_url():
+    with pytest.raises(ValueError, match="DATABASE_URL|LONG_TERM_MEMORY_DATABASE_URL"):
         create_long_term_memory_store()
 
 
-def test_mysql_milvus_long_term_memory_factory_wires_enterprise_options(monkeypatch):
+def test_long_term_memory_factory_defaults_to_pgvector(monkeypatch):
     captured = {}
 
-    def fake_init(self, mysql_url, **kwargs):
-        captured["mysql_url"] = mysql_url
+    def fake_init(self, database_url, **kwargs):
+        captured["database_url"] = database_url
         captured.update(kwargs)
 
-    monkeypatch.setattr(MySQLMilvusLongTermMemoryStore, "__init__", fake_init)
+    monkeypatch.setattr(PostgreSQLPGVectorLongTermMemoryStore, "__init__", fake_init)
 
     store = create_long_term_memory_store(
-        mysql_url="mysql+pymysql://root:root@mysql:3306/multiship_agent",
-        milvus_uri="http://milvus:19530",
-        milvus_token="token",
-        milvus_database="memory_prod",
-        milvus_collection="ltm_vectors",
-        milvus_alias="ltm-prod",
-        milvus_timeout_seconds=3,
-        milvus_similarity_metric="COSINE",
+        database_url="postgresql+psycopg://fulfillops:secret@postgres:5432/fulfillops_agent",
+        pgvector_table="ltm_vectors",
         vector_dimension=1024,
         default_ttl_days=365,
     )
 
-    assert isinstance(store, MySQLMilvusLongTermMemoryStore)
-    assert captured["mysql_url"] == "mysql+pymysql://root:root@mysql:3306/multiship_agent"
-    assert captured["milvus_uri"] == "http://milvus:19530"
-    assert captured["milvus_database"] == "memory_prod"
-    assert captured["milvus_collection"] == "ltm_vectors"
+    assert isinstance(store, PostgreSQLPGVectorLongTermMemoryStore)
+    assert captured["database_url"] == "postgresql+psycopg://fulfillops:secret@postgres:5432/fulfillops_agent"
+    assert captured["pgvector_table"] == "ltm_vectors"
     assert captured["vector_dimension"] == 1024
     assert captured["policy"].default_ttl_days == 365
 
 
-def test_mysql_milvus_long_term_memory_exported():
-    assert MySQLMilvusLongTermMemoryStore.__name__ == "MySQLMilvusLongTermMemoryStore"
+def test_long_term_memory_factory_rejects_non_pgvector_backend(monkeypatch):
+    captured = {}
+
+    def fake_init(self, database_url, **kwargs):
+        captured["database_url"] = database_url
+        captured.update(kwargs)
+
+    monkeypatch.setattr(PostgreSQLPGVectorLongTermMemoryStore, "__init__", fake_init)
+
+    with pytest.raises(RuntimeError, match="不支持的长期记忆向量后端"):
+        create_long_term_memory_store(
+            database_url="postgresql+psycopg://fulfillops:secret@postgres:5432/fulfillops_agent",
+            vector_store_type="legacy_vector_store",
+        )
 
 
-def test_mysql_milvus_embedding_dimension_mismatch_falls_back_to_text_search():
-    store = object.__new__(MySQLMilvusLongTermMemoryStore)
+def test_pgvector_long_term_memory_exported():
+    assert PostgreSQLPGVectorLongTermMemoryStore.__name__ == "PostgreSQLPGVectorLongTermMemoryStore"
+
+
+def test_pgvector_embedding_dimension_mismatch_fails_closed():
+    store = object.__new__(PostgreSQLPGVectorLongTermMemoryStore)
     store.embedding_model = lambda text: [0.1, 0.2]
     store.vector_dimension = 3
 
-    assert store._embedding_for("stockout manual review") is None
+    with pytest.raises(RuntimeError, match="维度不匹配"):
+        store._embedding_for("stockout manual review")
 
     store.vector_dimension = 2
     assert store._embedding_for("stockout manual review") == [0.1, 0.2]
@@ -88,7 +97,7 @@ class _FakeConn:
         return self
 
 
-def _mysql_memory_row(
+def _postgres_memory_row(
     *,
     row_id: int,
     vector_id: str,
@@ -116,13 +125,12 @@ def _mysql_memory_row(
     }
 
 
-def test_mysql_milvus_search_keeps_mysql_text_fallback_when_vector_hits_are_filtered(monkeypatch):
-    store = object.__new__(MySQLMilvusLongTermMemoryStore)
+def test_pgvector_search_keeps_postgres_text_fallback_when_vector_hits_are_filtered(monkeypatch):
+    store = object.__new__(PostgreSQLPGVectorLongTermMemoryStore)
     store._engine = _FakeEngine()
     store.table_name = "long_term_memory"
-    store.milvus_similarity_metric = "COSINE"
 
-    vector_row = _mysql_memory_row(
+    vector_row = _postgres_memory_row(
         row_id=1,
         vector_id="v1",
         key="vector-only",
@@ -130,7 +138,7 @@ def test_mysql_milvus_search_keeps_mysql_text_fallback_when_vector_hits_are_filt
         memory_type="user_preference",
         importance=0.95,
     )
-    lexical_row = _mysql_memory_row(
+    lexical_row = _postgres_memory_row(
         row_id=2,
         vector_id="v2",
         key="lexical-match",
@@ -157,13 +165,9 @@ def test_mysql_milvus_search_keeps_mysql_text_fallback_when_vector_hits_are_filt
     assert any("access_count=access_count+1" in sql for sql, _ in store._engine.conn.executed)
 
 
-def test_mysql_milvus_similarity_normalizes_metric_scores():
-    store = object.__new__(MySQLMilvusLongTermMemoryStore)
+def test_pgvector_similarity_normalizes_cosine_distance():
+    store = object.__new__(PostgreSQLPGVectorLongTermMemoryStore)
 
-    store.milvus_similarity_metric = "COSINE"
-    assert store._milvus_similarity(1.2) == 1.0
-    assert store._milvus_similarity(-0.5) == 0.0
-
-    store.milvus_similarity_metric = "L2"
-    assert store._milvus_similarity(0.0) == 1.0
-    assert store._milvus_similarity(3.0) == 0.25
+    assert store._pgvector_similarity(0.0) == 1.0
+    assert store._pgvector_similarity(0.4) == 0.6
+    assert store._pgvector_similarity(1.2) == 0.0

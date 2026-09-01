@@ -1,8 +1,8 @@
-"""企业结构化数据 MySQL 仓储。
+"""企业结构化数据 PostgreSQL 仓储。
 
 生产边界：
 - 订单和库存是实时/准实时结构化业务数据，不能放进 RAG。
-- 本仓储只读写 MySQL，不再使用本地 JSON 文件。
+- 本仓储只读写 PostgreSQL，不再使用本地 JSON 文件。
 - 没有查到订单或库存时直接返回空结果，不再回退 demo 数据。
 """
 
@@ -37,23 +37,25 @@ def _json_dump(payload: Any) -> str:
 def _json_load(payload: str | bytes | None) -> Any:
     if not payload:
         return {}
+    if isinstance(payload, (dict, list)):
+        return payload
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8")
     return json.loads(payload)
 
 
 class EnterpriseDataRepository(OrderRepository, InventoryRepository):
-    """企业订单和库存的 MySQL 仓储。
+    """企业订单和库存的 PostgreSQL 仓储。
 
     这里是生产版数据入口。上层 Workflow、Agent 和 RAG query planning 都只依赖
     OrderRepository / InventoryRepository 接口，不关心数据来自 OMS、WMS 还是导入表。
     """
 
-    def __init__(self, mysql_url: str) -> None:
-        if not mysql_url:
-            raise RuntimeError("企业数据仓储必须配置 MYSQL_URL，生产模式不允许使用本地文件。")
-        self.mysql_url = mysql_url
-        self._engine = create_engine(mysql_url, pool_pre_ping=True, pool_recycle=1800, future=True)
+    def __init__(self, database_url: str) -> None:
+        if not database_url:
+            raise RuntimeError("企业数据仓储必须配置 DATABASE_URL/POSTGRES_URL，生产模式不允许使用本地文件。")
+        self.database_url = database_url
+        self._engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=1800, future=True)
         self._init_schema()
 
     @property
@@ -163,15 +165,15 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
                             :order_id, :source_id, :platform, :order_time, :order_status,
                             :region, :priority, :record_json, :updated_at
                         )
-                        ON DUPLICATE KEY UPDATE
-                            source_id=VALUES(source_id),
-                            platform=VALUES(platform),
-                            order_time=VALUES(order_time),
-                            order_status=VALUES(order_status),
-                            region=VALUES(region),
-                            priority=VALUES(priority),
-                            record_json=VALUES(record_json),
-                            updated_at=VALUES(updated_at)
+                        ON CONFLICT (order_id) DO UPDATE SET
+                            source_id=EXCLUDED.source_id,
+                            platform=EXCLUDED.platform,
+                            order_time=EXCLUDED.order_time,
+                            order_status=EXCLUDED.order_status,
+                            region=EXCLUDED.region,
+                            priority=EXCLUDED.priority,
+                            record_json=EXCLUDED.record_json,
+                            updated_at=EXCLUDED.updated_at
                         """
                     ),
                     {
@@ -215,13 +217,13 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
                             :source_id, :warehouse_id, :warehouse_name, :region, :sku_id,
                             :available_stock, :locked_stock, :record_json, :updated_at
                         )
-                        ON DUPLICATE KEY UPDATE
-                            warehouse_name=VALUES(warehouse_name),
-                            region=VALUES(region),
-                            available_stock=VALUES(available_stock),
-                            locked_stock=VALUES(locked_stock),
-                            record_json=VALUES(record_json),
-                            updated_at=VALUES(updated_at)
+                        ON CONFLICT (source_id, warehouse_id, sku_id) DO UPDATE SET
+                            warehouse_name=EXCLUDED.warehouse_name,
+                            region=EXCLUDED.region,
+                            available_stock=EXCLUDED.available_stock,
+                            locked_stock=EXCLUDED.locked_stock,
+                            record_json=EXCLUDED.record_json,
+                            updated_at=EXCLUDED.updated_at
                         """
                     ),
                     {
@@ -302,33 +304,33 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
                     name VARCHAR(255) NOT NULL,
                     source_type VARCHAR(64) NOT NULL,
                     description TEXT,
-                    config_json LONGTEXT NOT NULL,
+                    config_json JSONB NOT NULL,
                     enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                    created_at DATETIME(6) NOT NULL,
-                    updated_at DATETIME(6) NOT NULL
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                )
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS enterprise_orders (
                     order_id VARCHAR(128) PRIMARY KEY,
                     source_id VARCHAR(128) NOT NULL,
                     platform VARCHAR(128),
-                    order_time DATETIME(6),
+                    order_time TIMESTAMP,
                     order_status VARCHAR(128),
                     region VARCHAR(128),
                     priority VARCHAR(64),
-                    record_json LONGTEXT NOT NULL,
-                    updated_at DATETIME(6) NOT NULL,
-                    KEY idx_enterprise_orders_source (source_id),
-                    KEY idx_enterprise_orders_updated (updated_at),
+                    record_json JSONB NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
                     CONSTRAINT fk_enterprise_orders_source
                         FOREIGN KEY (source_id) REFERENCES enterprise_data_sources(source_id)
                         ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                )
             """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_enterprise_orders_source ON enterprise_orders (source_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_enterprise_orders_updated ON enterprise_orders (updated_at)"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS enterprise_inventory (
-                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    id BIGSERIAL PRIMARY KEY,
                     source_id VARCHAR(128) NOT NULL,
                     warehouse_id VARCHAR(128) NOT NULL,
                     warehouse_name VARCHAR(255),
@@ -336,17 +338,16 @@ class EnterpriseDataRepository(OrderRepository, InventoryRepository):
                     sku_id VARCHAR(128) NOT NULL,
                     available_stock INT NOT NULL,
                     locked_stock INT NOT NULL,
-                    record_json LONGTEXT NOT NULL,
-                    updated_at DATETIME(6) NOT NULL,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY uq_enterprise_inventory_source_warehouse_sku (source_id, warehouse_id, sku_id),
-                    KEY idx_enterprise_inventory_sku (sku_id),
-                    KEY idx_enterprise_inventory_updated (updated_at),
+                    record_json JSONB NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    CONSTRAINT uq_enterprise_inventory_source_warehouse_sku UNIQUE (source_id, warehouse_id, sku_id),
                     CONSTRAINT fk_enterprise_inventory_source
                         FOREIGN KEY (source_id) REFERENCES enterprise_data_sources(source_id)
                         ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                )
             """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_enterprise_inventory_sku ON enterprise_inventory (sku_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_enterprise_inventory_updated ON enterprise_inventory (updated_at)"))
 
     def _ensure_source_exists(self, source_id: str) -> None:
         if self._get_source_row(source_id) is not None:

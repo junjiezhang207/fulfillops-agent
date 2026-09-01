@@ -14,6 +14,7 @@ from fastapi import APIRouter
 from app.api.routes.agent import router as agent_router
 from app.api.routes.enterprise_data import router as enterprise_data_router
 from app.api.routes.health import router as health_router
+from app.api.routes.fulfillment_cases import router as fulfillment_cases_router
 from app.api.routes.hybrid import router as hybrid_router
 from app.api.routes.inventory import router as inventory_router
 from app.api.routes.knowledge import router as knowledge_router
@@ -37,6 +38,7 @@ router.include_router(inventory_router, tags=["inventory"])
 router.include_router(knowledge_router, tags=["knowledge"])
 router.include_router(knowledge_mgmt_router, tags=["knowledge-mgmt"])
 router.include_router(workflow_router, tags=["workflow"])
+router.include_router(fulfillment_cases_router, tags=["fulfillment-cases"])
 router.include_router(agent_router, tags=["agent"])
 router.include_router(hybrid_router, tags=["hybrid"])
 router.include_router(models_router, tags=["models"])

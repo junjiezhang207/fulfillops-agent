@@ -2,7 +2,7 @@
 
 Learning notes:
 - Settings loads .env values through pydantic-settings.
-- Model gateway, Milvus, Redis and memory settings are centralized here.
+- Model gateway, PostgreSQL, PGVector and memory settings are centralized here.
 - Business code should call get_settings() instead of reading environment variables directly.
 """
 
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     设计说明：
     1. 使用 pydantic-settings 统一读取环境变量。
     2. 当前阶段先把项目级配置和基础设施配置边界定义清楚。
-    3. 即使 MySQL、Redis、Milvus 还没有真正连接，本阶段也先把配置入口准备好。
+    3. 即使 PostgreSQL、PGVector 或业务系统 API 还没有真正连接，本阶段也先把配置入口准备好。
 
     这样做的好处是：
     - 后续新增数据库连接时，不需要再回头重构配置体系。
@@ -32,13 +32,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = Field(default="全域电商供应链智能履约多Agent平台")
+    app_name: str = Field(default="电商履约运营智能协同 Agent")
     app_version: str = Field(default="0.1.0")
     api_v1_prefix: str = Field(default="/api/v1")
     debug: bool = Field(default=True)
     app_env: str = Field(
         default="production",
-        description="运行环境：production 会强制依赖 Redis/MySQL/Milvus，不允许静默降级。",
+        description="运行环境：production 会强制依赖 PostgreSQL/PGVector。",
     )
     allow_infra_fallback: bool = Field(
         default=False,
@@ -48,45 +48,50 @@ class Settings(BaseSettings):
         default=False,
         description="是否允许使用内置 demo 订单和库存。生产模式必须保持 false。",
     )
-    require_redis: bool = Field(default=True, description="启动与运行时是否强制要求 Redis 可用。")
-    require_milvus: bool = Field(default=True, description="启动与运行时是否强制要求 Milvus 可用。")
-    require_mysql: bool = Field(default=True, description="启动与运行时是否强制要求 MySQL 可用。")
+    require_postgres: bool = Field(default=True, description="启动与运行时是否强制要求 PostgreSQL 可用。")
+    require_pgvector: bool = Field(default=True, description="启动与运行时是否强制要求 PGVector 扩展可用。")
     log_level: str = Field(default="INFO")
     frontend_cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",
         description="Comma-separated origins allowed to call the API from the browser.",
     )
 
-    mysql_url: str = Field(
-        default="mysql+pymysql://root:root@localhost:3306/multiship_agent"
+    database_url: str = Field(
+        default="",
+        description="主业务 PostgreSQL 连接串。",
     )
-    redis_url: str = Field(default="redis://localhost:6379/0")
+    postgres_url: str = Field(
+        default="postgresql+psycopg://fulfillops:fulfillops@localhost:5432/fulfillops_agent",
+        description="兼容部署平台命名；留空时使用 DATABASE_URL。",
+    )
     short_term_memory_ttl_seconds: int = Field(
         default=86400,
         description="短期会话记忆 TTL，默认 24 小时。",
     )
-    long_term_memory_mysql_url: str = Field(
+    short_term_memory_model_extraction_enabled: bool = Field(
+        default=False,
+        description="是否通过 Model Gateway use_case=memory_extraction 抽取短期结构化记忆。",
+    )
+    long_term_memory_database_url: str = Field(
         default="",
-        description="长期记忆 MySQL 连接串；留空时复用 MYSQL_URL。",
+        description="长期记忆 PostgreSQL 连接串；留空时复用 DATABASE_URL。",
     )
     long_term_memory_vector_dimension: int = Field(
         default=1024,
-        description="长期记忆 Milvus 向量维度，需要和模型网关 embedding 模型输出维度一致。",
+        description="长期记忆向量维度，需要和模型网关 embedding 模型输出维度一致。",
     )
     long_term_memory_ttl_days: int | None = Field(
         default=180,
         description="长期记忆默认 TTL 天数；None 表示不过期。",
     )
-    long_term_memory_milvus_collection: str = Field(
-        default="long_term_memory_vectors_1024",
-        description="长期记忆 Milvus collection；与 RAG 知识库 collection 分开，避免索引污染。",
+    long_term_memory_pgvector_table: str = Field(
+        default="long_term_memory_vectors",
+        description="长期记忆 PGVector 表名。",
     )
-    long_term_memory_milvus_alias: str = Field(
-        default="ltm_milvus",
-        description="长期记忆 Milvus 连接别名。",
+    long_term_memory_vector_store_type: str = Field(
+        default="pgvector",
+        description="长期记忆向量后端：pgvector。",
     )
-    milvus_host: str = Field(default="localhost")
-    milvus_port: int = Field(default=19530)
     knowledge_dir: str = Field(
         default=str(Path("app") / "data" / "knowledge")
     )
@@ -159,28 +164,28 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # 向量存储配置（RAG 索引后端）
     # ------------------------------------------------------------------
-    # vector_store_type 决定 RAG 向量索引存储在哪里。生产模式固定使用 Milvus/Zilliz。
-    vector_store_type: str = Field(default="milvus", description="RAG 向量存储后端：milvus | zilliz")
-    milvus_uri: str = Field(
-        default="",
-        description="Milvus URI；优先级高于 host/port，例如 http://localhost:19530 或 Milvus Cloud URI。",
-    )
-    milvus_token: str = Field(default="", description="Milvus Cloud token，本地 Milvus 可留空。")
-    milvus_database: str = Field(default="default", description="Milvus database 名称；本地单库可保持 default。")
-    milvus_alias: str = Field(default="", description="pymilvus 连接别名；留空时按 collection 自动生成。")
-    # Milvus 集合名称（vector_store_type=milvus 时生效）
-    milvus_collection: str = Field(default="knowledge_base_1024", description="Milvus 集合名称")
-    milvus_upsert_mode: bool = Field(default=True, description="写入 Milvus 时使用 upsert，避免重复 chunk。")
-    milvus_overwrite: bool = Field(default=False, description="启动时是否覆盖 Milvus 集合；生产环境应保持 false。")
-    milvus_batch_size: int = Field(default=100, description="Milvus 批量写入大小。")
-    milvus_timeout_seconds: float = Field(default=1.0, description="pymilvus 连接和 collection 检查超时时间。")
-    milvus_similarity_metric: str = Field(default="COSINE", description="Milvus 向量相似度指标。")
-    milvus_consistency_level: str = Field(default="Session", description="Milvus 一致性级别。")
+    # vector_store_type 决定 RAG 向量索引存储在哪里。默认使用 PostgreSQL PGVector。
+    vector_store_type: str = Field(default="pgvector", description="RAG 向量存储后端：pgvector | local")
+    vector_store_fallback: str = Field(default="local", description="PGVector 不可用时的 fallback：local")
+    vector_store_fallback_to_local: bool = Field(default=False, description="PGVector 不可用时是否允许降级到 local 后端。")
+    sop_collection: str = Field(default="sop_collection", description="SOP 规则库逻辑 collection 名称。")
+    case_collection: str = Field(default="case_collection", description="优秀案例库逻辑 collection 名称。")
+    pgvector_database: str = Field(default="fulfillops_agent", description="PGVector 所在数据库名。")
+    pgvector_host: str = Field(default="localhost", description="PGVector 所在 PostgreSQL 主机。")
+    pgvector_port: int = Field(default=5432, description="PGVector 所在 PostgreSQL 端口。")
+    pgvector_user: str = Field(default="fulfillops", description="PGVector 连接用户名。")
+    pgvector_password: str = Field(default="fulfillops", description="PGVector 连接密码。")
+    pgvector_table: str = Field(default="knowledge_base_vectors", description="RAG PGVector 表名。")
     # 向量维度，需与当前默认 embedding 输出维度一致：
     #   text-embedding-v4       → 1024（当前默认）
     #   BAAI/bge-small-zh-v1.5 → 512（本地候选）
     #   text-embedding-3-small  → 1536（OpenAI 候选）
-    milvus_dim: int = Field(default=1024, description="向量维度（需与当前 embedding 模型匹配）")
+    pgvector_dim: int = Field(default=1024, description="向量维度（需与当前 embedding 模型匹配）")
+
+    @property
+    def effective_database_url(self) -> str:
+        """主数据库连接串，兼容 DATABASE_URL 和 POSTGRES_URL 两种环境变量名。"""
+        return self.database_url or self.postgres_url
 
     # ------------------------------------------------------------------
     # Embedding 配置（RAG 向量检索，默认使用本地 BGE 模型）

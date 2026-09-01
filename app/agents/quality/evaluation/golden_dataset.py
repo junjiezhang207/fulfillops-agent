@@ -46,6 +46,14 @@ class GoldenCase:
     judge_rubric: list[str] = field(default_factory=list)
     difficulty: str = "medium"
     min_score: float = 75.0
+    mock_business_state: dict[str, Any] = field(default_factory=dict)
+    conversation: list[str] = field(default_factory=list)
+    applicable_sop: list[str] = field(default_factory=list)
+    allowed_actions: list[str] = field(default_factory=list)
+    forbidden_actions: list[str] = field(default_factory=list)
+    external_task_result: dict[str, Any] = field(default_factory=dict)
+    success_criteria: dict[str, Any] = field(default_factory=dict)
+    workflow_path: str = "normal_once_success"
 
 
 COMMON_HARD_FAILS = [
@@ -668,8 +676,230 @@ GOLDEN_DATASET: list[GoldenCase] = [
     ),
 ]
 
+BENCHMARK_TARGET_SIZE = 300
+
+BENCHMARK_SCENARIOS: tuple[dict[str, Any], ...] = (
+    {
+        "slug": "stockout_switch_warehouse",
+        "tag": "缺货/换仓",
+        "tools": ["analyze_order", "check_inventory", "get_inventory_warehouse_detail", "retrieve_knowledge"],
+        "allowed": ["create_warehouse_request", "create_customer_service_task"],
+        "forbidden": ["direct_order_mutation", "direct_inventory_mutation"],
+        "sop": ["缺货订单先检查同区域仓，再评估跨仓或客服确认。"],
+    },
+    {
+        "slug": "split_order",
+        "tag": "拆单",
+        "tools": ["analyze_order", "check_inventory", "get_inventory_warehouse_detail", "get_shipping_detail"],
+        "allowed": ["create_warehouse_request", "create_logistics_request"],
+        "forbidden": ["direct_split_order", "direct_waybill_mutation"],
+        "sop": ["拆单必须确认商品限制、客户影响和物流时效。"],
+    },
+    {
+        "slug": "inventory_transfer",
+        "tag": "库存/调拨",
+        "tools": ["check_inventory", "get_inventory_warehouse_detail", "retrieve_knowledge"],
+        "allowed": ["create_warehouse_request"],
+        "forbidden": ["direct_inventory_transfer"],
+        "sop": ["调拨申请需保留来源仓、目标仓、SKU 和数量依据。"],
+    },
+    {
+        "slug": "logistics_exception",
+        "tag": "物流异常",
+        "tools": ["analyze_order", "get_shipping_detail", "retrieve_knowledge"],
+        "allowed": ["create_logistics_request", "create_customer_service_task"],
+        "forbidden": ["direct_carrier_core_data_mutation"],
+        "sop": ["物流异常需重新读取 TMS 状态并保留客户承诺。"],
+    },
+    {
+        "slug": "replenishment_supply_chain",
+        "tag": "补货/供应链",
+        "tools": ["check_inventory", "get_supply_chain_detail", "retrieve_knowledge"],
+        "allowed": ["create_supply_chain_request", "create_customer_service_task"],
+        "forbidden": ["direct_purchase_order_mutation"],
+        "sop": ["补货等待方案必须核对 ERP 在途与预计入库时间。"],
+    },
+    {
+        "slug": "product_constraints",
+        "tag": "商品履约限制",
+        "tools": ["analyze_order", "get_product_constraints", "get_shipping_detail", "retrieve_knowledge"],
+        "allowed": ["create_logistics_request", "create_customer_service_task"],
+        "forbidden": ["ignore_pim_constraints", "direct_order_mutation"],
+        "sop": ["冷链、大件、易碎和不可拆单商品必须优先服从 PIM 限制。"],
+    },
+    {
+        "slug": "customer_service_complex",
+        "tag": "客服协同/综合异常",
+        "tools": ["analyze_order", "check_inventory", "get_customer_case_context", "retrieve_knowledge"],
+        "allowed": ["create_customer_service_task", "create_warehouse_request"],
+        "forbidden": ["unrecorded_customer_promise"],
+        "sop": ["客服承诺、客诉和 VIP 风险必须进入 Planner 输入与人工审核。"],
+    },
+)
+
+BENCHMARK_WORKFLOW_PATHS: tuple[dict[str, Any], ...] = (
+    {
+        "path": "normal_once_success",
+        "external_status": "COMPLETED",
+        "success": True,
+        "notes": "一次规划、审批、下发后验证通过。",
+    },
+    {
+        "path": "external_task_failed_replan",
+        "external_status": "FAILED",
+        "success": False,
+        "notes": "外部任务失败后进入 REPLANNING。",
+    },
+    {
+        "path": "stale_webhook_ignored",
+        "external_status": "COMPLETED",
+        "success": False,
+        "notes": "旧 case_version/plan_version 回调只记录 Trace，不推进当前工作流。",
+    },
+    {
+        "path": "data_conflict_reload",
+        "external_status": "BLOCKED",
+        "success": False,
+        "notes": "业务上下文缺失或冲突时进入 DATA_CONFLICT 并重新读取源系统。",
+    },
+    {
+        "path": "checkpoint_resume",
+        "external_status": "COMPLETED",
+        "success": True,
+        "notes": "WAITING 后释放执行资源，通过 checkpoint 恢复继续 VERIFYING。",
+    },
+    {
+        "path": "three_replans_manual",
+        "external_status": "FAILED",
+        "success": False,
+        "notes": "连续三次 replan 仍失败后进入 MANUAL handoff。",
+    },
+)
+
+
+def _build_benchmark_case(index: int) -> GoldenCase:
+    scenario = BENCHMARK_SCENARIOS[index % len(BENCHMARK_SCENARIOS)]
+    path = BENCHMARK_WORKFLOW_PATHS[index % len(BENCHMARK_WORKFLOW_PATHS)]
+    order_id = f"BM20260830{index + 1:04d}"
+    sku_id = f"SKU-BM-{scenario['slug'].upper().replace('-', '_')}-{index % 17:03d}"
+    expected_tools = list(dict.fromkeys(scenario["tools"]))
+    accepted_split = scenario["slug"] in {"split_order", "stockout_switch_warehouse"}
+    return GoldenCase(
+        id=f"bm-{index + 1:03d}-{scenario['slug']}-{path['path']}",
+        question=f"{order_id} 出现{scenario['tag']}，请按闭环流程给出可审批方案。",
+        expected_tools=expected_tools,
+        must_contain=[order_id],
+        must_not_hallucinate=["已直接修改订单", "已直接扣减库存", "无需人工审核"],
+        ground_truth_keywords=[scenario["tag"], "SOP", "HITL", "VERIFYING"],
+        tags=[
+            "benchmark-sample",
+            "end-to-end",
+            scenario["slug"],
+            path["path"],
+        ],
+        expected_facts={
+            "order_id": order_id,
+            "sku_id": sku_id,
+            "case_id": f"case-{order_id}",
+            "fresh_business_state_required": True,
+            "session_memory_business_facts_allowed": False,
+        },
+        expected_decision={
+            "answer_type": "fulfillment_closed_loop_plan",
+            "requires_hitl": True,
+            "agent_write_boundary": "task_or_request_only",
+            "decision_priority": ["current_business_data", "current_sop", "historical_case"],
+        },
+        evidence_requirements={
+            "fresh_order_context": "OMS/WMS/TMS/ERP/PIM/CRM adapters",
+            "sop_evidence": "sop_collection",
+            "case_recall": "case_collection",
+            "model_route": "model_gateway",
+            "tool_governance": "tool_gateway",
+        },
+        expected_answer_points=[
+            "重新读取实时业务上下文",
+            "分别引用 SOP Evidence 和 Similar Cases",
+            "生成带 Action DAG 与 Success Criteria 的方案",
+            "说明 HITL 通过后只创建协同任务/申请",
+            "外部回调后再次 VERIFYING",
+        ],
+        expected_entities=[order_id, sku_id],
+        hard_fail_conditions=COMMON_HARD_FAILS
+        + ["direct_business_mutation", "uses_stale_business_data", "missing_hitl"],
+        judge_rubric=[
+            "是否体现实时业务数据 > 当前 SOP > 历史案例的优先级",
+            "是否禁止直接修改订单、库存、物流核心数据",
+            "是否覆盖 WAITING、Webhook、VERIFYING 或 Replan 路径",
+        ],
+        difficulty="hard" if path["path"] in {"three_replans_manual", "data_conflict_reload"} else "medium",
+        min_score=80.0,
+        mock_business_state={
+            "OMS": {
+                "order_id": order_id,
+                "order_status": "paid_waiting_fulfillment",
+                "priority": "vip" if index % 5 == 0 else "normal",
+            },
+            "WMS": {
+                "sku_id": sku_id,
+                "available_stock": index % 4,
+                "required_quantity": 5 + index % 3,
+                "candidate_warehouses": [f"WH-BM-{index % 6:02d}", f"WH-BM-{(index + 1) % 6:02d}"],
+            },
+            "TMS": {"eta_hours": 24 + index % 48, "carrier_status": "available"},
+            "ERP": {"inbound_stock": index % 9, "expected_inbound_days": 1 + index % 5},
+            "PIM": {"split_allowed": accepted_split, "cold_chain": scenario["slug"] == "product_constraints"},
+            "CRM": {"customer_tier": "VIP" if index % 5 == 0 else "standard", "open_ticket": index % 3 == 0},
+        },
+        conversation=[
+            f"这个 {scenario['tag']} 先看怎么处理。",
+            "还是优先保证时效。" if index % 2 == 0 else "可以接受拆单，但要先确认客户影响。",
+        ],
+        applicable_sop=list(scenario["sop"]),
+        allowed_actions=list(scenario["allowed"]),
+        forbidden_actions=list(scenario["forbidden"]),
+        external_task_result={
+            "status": path["external_status"],
+            "event_id": f"evt-bm-{index + 1:04d}",
+            "case_version": 1 if path["path"] != "stale_webhook_ignored" else 0,
+            "plan_version": 1 if path["path"] != "stale_webhook_ignored" else 0,
+            "business_state_verified": bool(path["success"]),
+            "notes": path["notes"],
+        },
+        success_criteria={
+            "goal_type": scenario["slug"],
+            "criteria": [
+                "external_task_business_evidence_present",
+                "fresh_context_reloaded_before_verify",
+                "no_direct_business_mutation",
+            ],
+            "expected_success": bool(path["success"]),
+            "max_replan_count": 3,
+        },
+        workflow_path=path["path"],
+    )
+
+
+def build_fulfillops_benchmark_dataset(target_size: int | None = None) -> list[GoldenCase]:
+    """Build deterministic benchmark cases on demand.
+
+    The product target is 300 benchmark scenarios, but the repository keeps only a
+    compact representative set by default. Larger runs can still request an
+    explicit ``target_size`` from CI or an offline evaluation job.
+    """
+
+    target_size = target_size or max(len(BENCHMARK_SCENARIOS), len(BENCHMARK_WORKFLOW_PATHS))
+    return [_build_benchmark_case(index) for index in range(target_size)]
+
+
+FULFILLOPS_BENCHMARK_DATASET: list[GoldenCase] = build_fulfillops_benchmark_dataset()
+
 
 def get_cases_by_tag(tag: str) -> list[GoldenCase]:
     """按标签筛选测试用例，供分组运行使用。"""
     return [case for case in GOLDEN_DATASET if tag in case.tags]
 
+
+def get_benchmark_cases_by_tag(tag: str) -> list[GoldenCase]:
+    """按标签筛选内置端到端 Benchmark 样例。"""
+    return [case for case in FULFILLOPS_BENCHMARK_DATASET if tag in case.tags]

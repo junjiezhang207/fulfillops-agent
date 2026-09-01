@@ -27,6 +27,16 @@ from app.observability.trace_store import get_trace_store
 
 
 MAX_TEXT_LENGTH = 600
+FULFILLOPS_TRACE_SCHEMA_VERSION = "fulfillops.trace.v1"
+FULFILLOPS_TRACE_MODULES = (
+    "memory",
+    "context",
+    "rag",
+    "model_gateway",
+    "planner",
+    "tool_gateway",
+    "verification",
+)
 SENSITIVE_KEYS = {
     "authorization",
     "cookie",
@@ -164,6 +174,12 @@ def get_observability_metrics_snapshot() -> dict[str, Any]:
         key: value.copy() if isinstance(value, dict) else value
         for key, value in _metrics.items()
     }
+
+
+def record_prompt_injection_detected(source: str) -> None:
+    """Record a prompt-injection detection for governance metrics."""
+
+    _inc_bucket("prompt_injection_detected_total", (source or "unknown",))
 
 
 def start_trace(
@@ -315,6 +331,248 @@ def snapshot_current_trace(*, include_running_duration: bool = True) -> dict[str
     if include_running_duration and data.get("duration_ms") is None:
         data["duration_ms"] = round((time.monotonic() - trace._started_monotonic) * 1000, 3)
     return sanitize_payload(data, max_length=MAX_TEXT_LENGTH)
+
+
+def _trace_dict_from_context(trace: TraceContext | dict[str, Any] | None) -> dict[str, Any] | None:
+    if trace is None:
+        return snapshot_current_trace()
+    if isinstance(trace, TraceContext):
+        data = asdict(trace)
+        data.pop("_started_monotonic", None)
+        if data.get("duration_ms") is None:
+            data["duration_ms"] = round((time.monotonic() - trace._started_monotonic) * 1000, 3)
+        return sanitize_payload(data, max_length=MAX_TEXT_LENGTH)
+    return sanitize_payload(trace, max_length=MAX_TEXT_LENGTH)
+
+
+def _lower_text(*parts: Any) -> str:
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _step_module(step: dict[str, Any]) -> str:
+    step_type = str(step.get("type") or "").lower()
+    name = str(step.get("name") or "").lower()
+    metadata = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+    haystack = _lower_text(step_type, name, metadata)
+    if step_type in {"memory", "short_term_memory", "long_term_memory"}:
+        return "memory"
+    if step_type in {"rag", "retrieval"}:
+        return "rag"
+    if step_type in {"llm", "model", "model_gateway"}:
+        return "model_gateway"
+    if step_type in {"planner", "workflow", "workflow_node"}:
+        return "planner"
+    if step_type in {"tool", "tool_gateway", "mcp"}:
+        return "tool_gateway"
+    if step_type in {"verification", "verify"}:
+        return "verification"
+    if step_type in {"context", "business_context", "router"} or "context" in haystack:
+        return "context"
+    if "rag" in haystack or "sop_collection" in haystack:
+        return "rag"
+    if "model_gateway" in haystack or "use_case" in metadata:
+        return "model_gateway"
+    if "plan" in haystack or "replan" in haystack:
+        return "planner"
+    if "tool_gateway" in haystack:
+        return "tool_gateway"
+    if "verify" in haystack or "verifying" in haystack:
+        return "verification"
+    return "context"
+
+
+def _compact_module_step(step: dict[str, Any], module: str) -> dict[str, Any]:
+    return {
+        "step_id": step.get("id"),
+        "module": module,
+        "type": step.get("type"),
+        "name": step.get("name"),
+        "parent_id": step.get("parent_id"),
+        "status": step.get("status"),
+        "started_at": step.get("started_at"),
+        "ended_at": step.get("ended_at"),
+        "duration_ms": step.get("duration_ms"),
+        "summary": step.get("summary") or "",
+        "input_summary": step.get("input_summary"),
+        "output_summary": step.get("output_summary"),
+        "metadata": step.get("metadata") or {},
+        "evidence": step.get("evidence") or [],
+    }
+
+
+def _lifecycle_event_type(step: dict[str, Any]) -> str | None:
+    metadata = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+    explicit_event = metadata.get("event_type")
+    if explicit_event:
+        return str(explicit_event).upper()
+
+    haystack = _lower_text(step.get("type"), step.get("name"), step.get("status"), step.get("summary"), metadata)
+    if "hitl" in haystack and "approv" in haystack:
+        return "HITL_APPROVED"
+    if any(word in haystack for word in ("checkpoint", "checkpointer")):
+        return "CHECKPOINT_SAVED"
+    if any(word in haystack for word in ("waiting", "pending_human", "interrupted")):
+        return "ENTER_WAITING"
+    if "webhook" in haystack:
+        return "WEBHOOK_RECEIVED"
+    if "resume" in haystack or "resumed" in haystack:
+        return "WORKFLOW_RESUMED"
+    if "case_status" in haystack or "status_changed" in haystack:
+        return "CASE_STATUS_CHANGED"
+    if "plan_version" in haystack or "version_changed" in haystack:
+        return "PLAN_VERSION_CHANGED"
+    if "manual" in haystack or "handoff" in haystack:
+        return "MANUAL_HANDOFF"
+    return None
+
+
+def _compact_event(step: dict[str, Any], event_type: str) -> dict[str, Any]:
+    return {
+        "event_id": step.get("id"),
+        "event_type": event_type,
+        "name": step.get("name"),
+        "status": step.get("status"),
+        "timestamp": step.get("ended_at") or step.get("started_at"),
+        "summary": step.get("summary") or "",
+        "metadata": step.get("metadata") or {},
+    }
+
+
+def _number_from_metadata(metadata: dict[str, Any], keys: tuple[str, ...]) -> float:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+def build_fulfillops_trace_document(trace: TraceContext | dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Build the FulfillOps governance trace document.
+
+    The legacy trace snapshot is optimized for storage. This view is optimized for
+    audit/replay and mirrors the flow document's top-level contract:
+    trace_meta, execution_context, summary, modules, events, errors.
+    """
+
+    data = _trace_dict_from_context(trace)
+    if data is None:
+        return None
+
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    modules: dict[str, list[dict[str, Any]]] = {module: [] for module in FULFILLOPS_TRACE_MODULES}
+    events: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    model_call_count = 0
+    tool_call_count = 0
+    total_tokens = 0.0
+    total_cost = 0.0
+    retry_count = 0
+    fallback_count = 0
+
+    for raw_step in data.get("steps") or []:
+        if not isinstance(raw_step, dict):
+            continue
+        step = sanitize_payload(raw_step, max_length=MAX_TEXT_LENGTH)
+        module = _step_module(step)
+        modules[module].append(_compact_module_step(step, module))
+
+        step_metadata = step.get("metadata") if isinstance(step.get("metadata"), dict) else {}
+        if module == "model_gateway" and step_metadata.get("actual_model_call") is not False:
+            model_call_count += 1
+        if module == "tool_gateway":
+            tool_call_count += 1
+        step_total_tokens = _number_from_metadata(step_metadata, ("total_tokens", "tokens"))
+        if step_total_tokens:
+            total_tokens += step_total_tokens
+        else:
+            total_tokens += _number_from_metadata(step_metadata, ("prompt_tokens",))
+            total_tokens += _number_from_metadata(step_metadata, ("completion_tokens",))
+        total_cost += _number_from_metadata(step_metadata, ("total_cost_usd", "cost_usd", "estimated_cost_usd"))
+        retry_count += int(_number_from_metadata(step_metadata, ("retry_count", "retries")))
+        if step_metadata.get("fallback") or step_metadata.get("fallback_used") or "fallback" in _lower_text(step.get("name")):
+            fallback_count += 1
+
+        event_type = _lifecycle_event_type(step)
+        if event_type:
+            events.append(_compact_event(step, event_type))
+
+        status = str(step.get("status") or "").lower()
+        if status in {"error", "failed", "failure", "blocked"} or step.get("error_code") or step.get("error_message"):
+            errors.append(
+                {
+                    "step_id": step.get("id"),
+                    "module": module,
+                    "name": step.get("name"),
+                    "status": step.get("status"),
+                    "error_code": step.get("error_code"),
+                    "error_message": step.get("error_message"),
+                    "timestamp": step.get("ended_at") or step.get("started_at"),
+                }
+            )
+
+    if data.get("error_code") or data.get("error_message"):
+        errors.insert(
+            0,
+            {
+                "step_id": None,
+                "module": "trace",
+                "name": "trace",
+                "status": data.get("status"),
+                "error_code": data.get("error_code"),
+                "error_message": data.get("error_message"),
+                "timestamp": data.get("ended_at") or data.get("started_at"),
+            },
+        )
+
+    return sanitize_payload(
+        {
+            "trace_meta": {
+                "schema_version": FULFILLOPS_TRACE_SCHEMA_VERSION,
+                "trace_id": data.get("trace_id"),
+                "request_id": data.get("request_id"),
+                "run_id": metadata.get("run_id"),
+                "case_id": metadata.get("case_id"),
+                "order_id": data.get("order_id") or metadata.get("order_id"),
+                "tenant_id": data.get("tenant_id"),
+                "route": data.get("route"),
+                "status": data.get("status"),
+                "started_at": data.get("started_at"),
+                "ended_at": data.get("ended_at"),
+                "workflow_version": metadata.get("workflow_version"),
+                "context_version": metadata.get("context_version"),
+                "plan_version": metadata.get("plan_version"),
+            },
+            "execution_context": {
+                "session_id": data.get("session_id"),
+                "user_id": data.get("user_id"),
+                "channel": metadata.get("channel"),
+                "environment": metadata.get("environment"),
+                "agent_version": metadata.get("agent_version"),
+                "model_gateway_profile": metadata.get("model_gateway_profile"),
+                "source_systems": metadata.get("source_systems"),
+            },
+            "summary": {
+                "status": data.get("status"),
+                "duration_ms": data.get("duration_ms"),
+                "step_count": sum(len(steps) for steps in modules.values()),
+                "model_call_count": model_call_count,
+                "tool_call_count": tool_call_count,
+                "retry_count": retry_count,
+                "fallback_count": fallback_count,
+                "total_tokens": int(total_tokens),
+                "total_cost_usd": round(total_cost, 6),
+                "error_count": len(errors),
+            },
+            "modules": modules,
+            "events": events,
+            "errors": errors,
+        },
+        max_length=MAX_TEXT_LENGTH,
+    )
+
+
+def snapshot_fulfillops_trace() -> dict[str, Any] | None:
+    return build_fulfillops_trace_document()
 
 
 def finish_trace(

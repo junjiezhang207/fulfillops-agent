@@ -8,7 +8,7 @@ output_contract:
   type: text
 
 system: |
-  你是 Multiship 智能履约助手。用户正在进行日常对话或非业务问候。
+  你是电商履约运营智能协同 Agent。用户正在进行日常对话或非业务问候。
 
   回答要求：
   1. 用简短、友好的中文回复。

@@ -72,3 +72,36 @@ def test_mcp_tool_meta_reuses_registry_manifest():
     assert meta["exposed_via"] == "mcp"
     assert meta["tool_registry"]["name"] == "retrieve_knowledge"
     assert meta["tool_registry"]["required_permissions"] == ["knowledge:read"]
+    assert meta["mcp_whitelist"]["server_id"] == "fulfillops-fulfillment"
+
+
+def test_mcp_tool_whitelist_blocks_unlisted_tool(monkeypatch):
+    monkeypatch.setenv("MCP_ALLOWED_TOOLS", "check_inventory")
+    monkeypatch.setattr(
+        mcp_server,
+        "_MCP_TOOL_MAP",
+        {"retrieve_knowledge": _wrapped_test_tool("retrieve_knowledge", '{"status":"ok","data":{},"summary":"ok"}')},
+    )
+
+    raw = mcp_server._invoke_registry_tool("retrieve_knowledge", {"question": "缺货规则"})
+    data = json.loads(raw)
+
+    assert data["status"] == "error"
+    assert data["error"]["code"] == "mcp_tool_not_whitelisted"
+    assert data["error"]["details"]["tool_name"] == "retrieve_knowledge"
+
+
+def test_mcp_server_whitelist_blocks_unlisted_server(monkeypatch):
+    monkeypatch.setenv("MCP_SERVER_ID", "fulfillops-fulfillment")
+    monkeypatch.setenv("MCP_ALLOWED_SERVERS", "other-server")
+    monkeypatch.setattr(
+        mcp_server,
+        "_MCP_TOOL_MAP",
+        {"check_inventory": _wrapped_test_tool("check_inventory", '{"status":"ok","data":{},"summary":"ok"}')},
+    )
+
+    raw = mcp_server._invoke_registry_tool("check_inventory", {"order_id": "SO123"})
+    data = json.loads(raw)
+
+    assert data["status"] == "error"
+    assert data["error"]["code"] == "mcp_server_not_whitelisted"

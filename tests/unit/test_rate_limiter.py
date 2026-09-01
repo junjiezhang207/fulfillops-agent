@@ -4,92 +4,99 @@ import pytest
 from fastapi import HTTPException, status
 
 from app.core import rate_limiter
-from app.core.rate_limiter import RateLimiter, RedisRateLimiter, _WindowRecord
+from app.core.rate_limiter import PostgreSQLRateLimiter
 
 
-class FakeRedis:
+class FakeScalarResult:
+    def __init__(self, value=0, rowcount=0):
+        self.value = value
+        self.rowcount = rowcount
+
+    def scalar_one(self):
+        return self.value
+
+    def scalar(self):
+        return self.value
+
+
+class FakeConn:
     def __init__(self):
-        self.values = {}
-        self.ttls = {}
+        self.counts = {}
 
-    def incr(self, key):
-        self.values[key] = int(self.values.get(key, 0)) + 1
-        return self.values[key]
-
-    def expire(self, key, ttl):
-        self.ttls[key] = ttl
-        return True
-
-    def get(self, key):
-        return self.values.get(key)
-
-
-def test_rate_limiter_allows_until_window_quota_is_exhausted():
-    limiter = RateLimiter(max_requests=2, window_seconds=60)
-
-    assert limiter.is_allowed("merchant-A") is True
-    assert limiter.remaining("merchant-A") == 1
-    assert limiter.is_allowed("merchant-A") is True
-    assert limiter.remaining("merchant-A") == 0
-    assert limiter.is_allowed("merchant-A") is False
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        params = params or {}
+        if "INSERT INTO rate_limit_windows" in sql:
+            key = (params["namespace"], params["rate_key"], params["window_id"])
+            self.counts[key] = self.counts.get(key, 0) + 1
+            return FakeScalarResult(self.counts[key])
+        if "SELECT request_count" in sql:
+            key = (params["namespace"], params["rate_key"], params["window_id"])
+            return FakeScalarResult(self.counts.get(key, 0))
+        return FakeScalarResult(rowcount=0)
 
 
-def test_rate_limiter_resets_after_window(monkeypatch):
-    now = {"value": 100.0}
-    monkeypatch.setattr(rate_limiter.time, "monotonic", lambda: now["value"])
-    limiter = RateLimiter(max_requests=1, window_seconds=10)
+class FakeBegin:
+    def __init__(self, conn):
+        self.conn = conn
 
-    assert limiter.is_allowed("session-1") is True
-    assert limiter.is_allowed("session-1") is False
+    def __enter__(self):
+        return self.conn
 
-    now["value"] = 111.0
-
-    assert limiter.is_allowed("session-1") is True
-    assert limiter.remaining("session-1") == 0
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
-def test_rate_limiter_evicts_only_expired_records(monkeypatch):
-    now = {"value": 50.0}
-    monkeypatch.setattr(rate_limiter.time, "monotonic", lambda: now["value"])
-    limiter = RateLimiter(max_requests=3, window_seconds=10)
-    limiter._store = {
-        "old": _WindowRecord(count=1, window_start=30.0),
-        "fresh": _WindowRecord(count=1, window_start=45.0),
-    }
+class FakeEngine:
+    def __init__(self):
+        self.conn = FakeConn()
 
-    assert limiter.evict_expired() == 1
-    assert "old" not in limiter._store
-    assert "fresh" in limiter._store
+    def begin(self):
+        return FakeBegin(self.conn)
+
+    def connect(self):
+        return FakeBegin(self.conn)
 
 
-def test_redis_rate_limiter_uses_redis_fixed_window(monkeypatch):
-    fake = FakeRedis()
-    monkeypatch.setattr(RedisRateLimiter, "_create_client", staticmethod(lambda redis_url: fake))
+class FixedLimiter:
+    def __init__(self, max_requests: int):
+        self._max = max_requests
+        self._window = 60
+        self.calls: dict[str, int] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        self.calls[key] = self.calls.get(key, 0) + 1
+        return self.calls[key] <= self._max
+
+    def remaining(self, key: str) -> int:
+        return max(0, self._max - self.calls.get(key, 0))
+
+    def evict_expired(self) -> int:
+        return 0
+
+
+def test_create_rate_limiter_requires_database_url(monkeypatch):
+    monkeypatch.setattr(rate_limiter, "get_settings", lambda: SimpleNamespace(effective_database_url=""))
+
+    with pytest.raises(RuntimeError, match="必须配置 DATABASE_URL"):
+        rate_limiter.create_rate_limiter(namespace="test", max_requests=1, window_seconds=60)
+
+
+def test_postgres_rate_limiter_uses_fixed_window(monkeypatch):
+    fake_engine = FakeEngine()
+    monkeypatch.setattr(rate_limiter, "create_engine", lambda *args, **kwargs: fake_engine)
     monkeypatch.setattr(rate_limiter.time, "time", lambda: 120.0)
-    limiter = RedisRateLimiter("redis://localhost:6379/0", max_requests=2, window_seconds=60, namespace="test")
+    limiter = PostgreSQLRateLimiter("postgresql+psycopg://unit-test", max_requests=2, window_seconds=60, namespace="test")
 
     assert limiter.is_allowed("session-1") is True
     assert limiter.remaining("session-1") == 1
     assert limiter.is_allowed("session-1") is True
     assert limiter.remaining("session-1") == 0
     assert limiter.is_allowed("session-1") is False
-    assert fake.ttls["multiship:rate_limit:test:session-1:2"] == 61
-
-
-def test_redis_rate_limiter_falls_back_to_memory_when_redis_fails(monkeypatch):
-    class BrokenRedis(FakeRedis):
-        def incr(self, key):
-            raise RuntimeError("redis down")
-
-    monkeypatch.setattr(RedisRateLimiter, "_create_client", staticmethod(lambda redis_url: BrokenRedis()))
-    limiter = RedisRateLimiter("redis://localhost:6379/0", max_requests=1, window_seconds=60, namespace="test")
-
-    assert limiter.is_allowed("session-1") is True
-    assert limiter.is_allowed("session-1") is False
 
 
 def test_check_agent_rate_limit_raises_429_when_session_exceeds_quota(monkeypatch):
-    limiter = RateLimiter(max_requests=1, window_seconds=60)
+    limiter = FixedLimiter(max_requests=1)
     monkeypatch.setattr(rate_limiter, "agent_limiter", limiter)
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
@@ -103,7 +110,7 @@ def test_check_agent_rate_limit_raises_429_when_session_exceeds_quota(monkeypatc
 
 
 def test_check_workflow_rate_limit_falls_back_to_client_host(monkeypatch):
-    limiter = RateLimiter(max_requests=1, window_seconds=60)
+    limiter = FixedLimiter(max_requests=1)
     monkeypatch.setattr(rate_limiter, "workflow_limiter", limiter)
     request = SimpleNamespace(client=SimpleNamespace(host="10.0.0.8"))
 

@@ -20,9 +20,11 @@ from langchain_core.language_models import BaseChatModel
 
 from app.agents.orchestration.plan_execute import PlanExecuteState, build_plan_execute_agent
 from app.agents.runtime.checkpointer import create_checkpointer
+from app.agents.tools.read_only_gateway import ReadOnlyToolGateway
 from app.agents.tools.wrapper import wrap_all_tools
 from app.agents.tools.contracts import make_agent_tool_context, tool_runtime_context
 from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
+from app.application.routing.order_context_service import OrderContextService
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
@@ -61,6 +63,10 @@ class PlanExecuteService:
     ) -> None:
         # 实时数据工具不缓存，目录数据工具可缓存（与 AgentService 策略一致）。
         # 订单/库存/仓库/履约方案都可能随时变，所以不缓存。
+        context_service = OrderContextService(
+            order_service=order_service,
+            inventory_service=inventory_service,
+        )
         tool_services = ToolServiceBundle(
             order_service=order_service,
             inventory_service=inventory_service,
@@ -68,6 +74,7 @@ class PlanExecuteService:
             warehouse_service=warehouse_service,
             substitute_service=substitute_service,
             fulfillment_service=fulfillment_service,
+            context_service=context_service,
         )
         tool_registry = get_tool_registry()
         _realtime_tools = tool_registry.build_tools(
@@ -78,7 +85,11 @@ class PlanExecuteService:
                 "check_inventory",
                 "search_warehouse_inventory",
                 "generate_fulfillment_plan",
+                "get_context_detail",
             ),
+        )
+        _source_context_tools = ReadOnlyToolGateway(registry=tool_registry).build_tools(
+            services=tool_services,
         )
         # 知识库和替代 SKU 属于相对稳定数据，可以走工具缓存。
         _catalog_tools = tool_registry.build_tools(
@@ -90,6 +101,7 @@ class PlanExecuteService:
         # 给所有工具套上弹性层：异常处理、超时、缓存等都在 wrapper 里做。
         resilient_tools = (
             wrap_all_tools(_realtime_tools, enable_cache=False)
+            + _source_context_tools
             + wrap_all_tools(_catalog_tools, enable_cache=True)
         )
 
@@ -99,7 +111,7 @@ class PlanExecuteService:
         settings = get_settings()
         # checkpointer 是 LangGraph 的短期状态存储，用 thread_id 维持一次会话的执行状态。
         _checkpointer = create_checkpointer(
-            settings.redis_url,
+            settings.effective_database_url,
             ttl_seconds=settings.short_term_memory_ttl_seconds,
         )
         from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
@@ -108,14 +120,12 @@ class PlanExecuteService:
         # 长期记忆如果使用向量后端，需要 embedding 模型把记忆文本转向量。
         # store 是 LangGraph Store，用于跨会话长期记忆。
         _store = create_long_term_memory_store(
-            mysql_url=settings.long_term_memory_mysql_url or settings.mysql_url,
-            milvus_uri=settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}",
-            milvus_token=settings.milvus_token,
-            milvus_database=settings.milvus_database,
-            milvus_collection=settings.long_term_memory_milvus_collection,
-            milvus_alias=settings.long_term_memory_milvus_alias,
-            milvus_timeout_seconds=settings.milvus_timeout_seconds,
-            milvus_similarity_metric=settings.milvus_similarity_metric,
+            database_url=(
+                settings.long_term_memory_database_url
+                or settings.effective_database_url
+            ),
+            vector_store_type=settings.long_term_memory_vector_store_type,
+            pgvector_table=settings.long_term_memory_pgvector_table,
             embedding_model=memory_embed_model,
             vector_dimension=settings.long_term_memory_vector_dimension,
             default_ttl_days=settings.long_term_memory_ttl_days,

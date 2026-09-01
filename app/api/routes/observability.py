@@ -1,6 +1,6 @@
 """业务可观测 Trace Center API。
 
-这些接口给前端 Trace Center 使用，底层查询 MySQL trace store。
+这些接口给前端 Trace Center 使用，底层查询 PostgreSQL trace store。
 这样不接外部监控平台时，也能在数据库里保留订单决策链路、步骤和审计事件。
 """
 
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.observability.business_trace import build_fulfillops_trace_document
 from app.observability.trace_store import get_trace_store
 from app.schemas.common import ApiResponse
 
@@ -56,6 +57,15 @@ def get_trace(trace_id: str):
         raise HTTPException(status_code=404, detail="Trace not found")
     trace["audit_events"] = get_trace_store().list_audit_events(trace_id=trace_id, limit=100)
     return ApiResponse(success=True, message="Trace detail", data=trace)
+
+
+@router.get("/traces/{trace_id}/fulfillops", response_model=ApiResponse)
+def get_fulfillops_trace(trace_id: str):
+    trace = get_trace_store().get_trace(trace_id)
+    if trace is None:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    document = build_fulfillops_trace_document(trace)
+    return ApiResponse(success=True, message="FulfillOps trace detail", data=document)
 
 
 @router.get("/audit-events", response_model=ApiResponse)

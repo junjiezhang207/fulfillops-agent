@@ -16,7 +16,7 @@ class OrderRepository(Protocol):
     设计说明：
     - 当前阶段先用 Protocol 定义最小仓储能力。
     - 这样做的好处是，服务层依赖的是“能力接口”，而不是某个具体实现。
-    - 后续可以很自然地扩展出 MySQL 实现、外部 API 实现、测试替身实现。
+    - 后续可以很自然地扩展出 PostgreSQL 实现、外部 API 实现、测试替身实现。
     """
 
     def get_order_by_id(self, order_id: str) -> OrderRecord | None:

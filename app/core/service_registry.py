@@ -23,10 +23,10 @@ def get_enterprise_data_repository() -> EnterpriseDataRepository:
     """全局企业数据仓库。
 
     多个路由必须共用这一份实例，否则后台刚导入的数据，Agent/Workflow 那边
-    可能仍然查询不到。生产版使用 MySQL，初始化失败直接暴露。
+    可能仍然查询不到。生产版使用 PostgreSQL，初始化失败直接暴露。
     """
 
-    return EnterpriseDataRepository(get_settings().mysql_url)
+    return EnterpriseDataRepository(get_settings().effective_database_url)
 
 
 @lru_cache
@@ -56,8 +56,8 @@ def get_knowledge_retrieval_service() -> KnowledgeRetrievalService:
         extra_dirs=extra_dirs,
         recursive=bool(getattr(settings, "knowledge_recursive", True)),
     )
-    rewrite_model = LLMFactory.create_chat_model(settings, use_case="rag_rewrite")
-    intent_model = LLMFactory.create_chat_model(settings, use_case="structured_extract")
+    rewrite_model = LLMFactory.create_chat_model(settings, use_case="query_rewrite")
+    intent_model = LLMFactory.create_chat_model(settings, use_case="intent_classification")
     return KnowledgeRetrievalService(
         knowledge_repository=knowledge_repository,
         inventory_analysis_service=get_inventory_analysis_service(),

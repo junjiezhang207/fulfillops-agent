@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 _REWRITE_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        get_model_gateway().prompt_system(use_case="rag_rewrite"),
+        get_model_gateway().prompt_system(use_case="query_rewrite"),
     ),
     ("human", "请把原始问题改写成 {n} 个不同角度的检索查询。\n原始问题：{question}"),
 ])

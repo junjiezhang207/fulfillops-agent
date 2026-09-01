@@ -8,23 +8,20 @@ from app.memory import create_long_term_memory_store
 pytestmark = pytest.mark.slow
 
 
-def _mysql_milvus_store_or_skip():
-    mysql_url = os.getenv("LONG_TERM_MEMORY_MYSQL_URL") or os.getenv("MYSQL_URL")
-    milvus_uri = os.getenv("MILVUS_URI", "http://localhost:19530")
-    if os.getenv("RUN_MYSQL_MILVUS_PERF") != "1" or not mysql_url:
-        pytest.skip("Set RUN_MYSQL_MILVUS_PERF=1 and MySQL/Milvus env vars to run this smoke test.")
+def _postgres_pgvector_store_or_skip():
+    database_url = os.getenv("LONG_TERM_MEMORY_DATABASE_URL") or os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+    if os.getenv("RUN_POSTGRES_PGVECTOR_PERF") != "1" or not database_url:
+        pytest.skip("Set RUN_POSTGRES_PGVECTOR_PERF=1 and PostgreSQL/PGVector env vars to run this smoke test.")
     return create_long_term_memory_store(
-        mysql_url=mysql_url,
-        milvus_uri=milvus_uri,
-        milvus_collection=os.getenv("LONG_TERM_MEMORY_MILVUS_COLLECTION", "long_term_memory_vectors_1024"),
-        milvus_alias=os.getenv("LONG_TERM_MEMORY_MILVUS_ALIAS", "ltm_milvus_perf"),
+        database_url=database_url,
+        pgvector_table=os.getenv("LONG_TERM_MEMORY_PGVECTOR_TABLE", "long_term_memory_vectors"),
         vector_dimension=int(os.getenv("LONG_TERM_MEMORY_VECTOR_DIMENSION", "1024")),
         default_ttl_days=None,
     )
 
 
-def test_mysql_milvus_long_term_memory_search_smoke_under_small_business_dataset():
-    store = _mysql_milvus_store_or_skip()
+def test_postgres_pgvector_long_term_memory_search_smoke_under_small_business_dataset():
+    store = _postgres_pgvector_store_or_skip()
     for idx in range(100):
         keyword = "stockout manual review" if idx == 42 else "ordinary order sufficient inventory"
         store.put(
@@ -45,8 +42,8 @@ def test_mysql_milvus_long_term_memory_search_smoke_under_small_business_dataset
     assert elapsed < 5.0
 
 
-def test_mysql_milvus_long_term_memory_write_smoke_under_small_business_dataset():
-    store = _mysql_milvus_store_or_skip()
+def test_postgres_pgvector_long_term_memory_write_smoke_under_small_business_dataset():
+    store = _postgres_pgvector_store_or_skip()
 
     start = time.perf_counter()
     for idx in range(100):

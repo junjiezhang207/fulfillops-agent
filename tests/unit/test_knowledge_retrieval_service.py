@@ -80,6 +80,41 @@ def test_ingestion_transforms_documents_into_text_nodes_with_chunk_ids():
     assert nodes[0].metadata["document_id"] == "stockout_policy"
     assert nodes[0].metadata["category"] == "stockout_rule"
     assert nodes[0].metadata["chunk_id"] == "stockout_policy::chunk-0000"
+    assert nodes[0].metadata["parent_chunk_id"].startswith("stockout_policy::parent-")
+    assert nodes[0].metadata["parent_section_path"] == ["缺货处理"]
+    assert nodes[0].metadata["child_index_in_parent"] == 0
+    assert nodes[0].metadata["child_count_in_parent"] >= 1
+    assert nodes[0].metadata["business_unit_type"] == "procedure"
+    assert "同区域仓库" in nodes[0].metadata["parent_context_excerpt"]
+
+
+def test_markdown_section_splitter_marks_parent_child_business_units():
+    document = Document(
+        text=(
+            "---\n"
+            "document_id: stockout_sop\n"
+            "category: stockout_rule\n"
+            "---\n\n"
+            "# 缺货 SOP\n\n"
+            "## Scope 适用范围\n\n"
+            "适用于库存不足订单。\n\n"
+            "## Escalation 升级处理\n\n"
+            "VIP 客户必须人工审批。"
+        ),
+        metadata={"file_path": "stockout_sop.md"},
+    )
+
+    nodes = KnowledgeFrontMatterExtractor()([document])
+    nodes = MarkdownSectionSplitter()(nodes)
+    nodes = BusinessMetadataEnricher()(nodes)
+
+    scope = next(node for node in nodes if node.metadata["business_unit_type"] == "scope")
+    escalation = next(node for node in nodes if node.metadata["business_unit_type"] == "escalation")
+
+    assert scope.metadata["parent_section_path"] == ["缺货 SOP", "Scope 适用范围"]
+    assert escalation.metadata["parent_section_path"] == ["缺货 SOP", "Escalation 升级处理"]
+    assert scope.metadata["parent_chunk_id"] != escalation.metadata["parent_chunk_id"]
+    assert scope.metadata["parent_context_excerpt"].startswith("## Scope")
 
 
 def test_dedupe_and_filter_nodes_applies_to_all_retrieval_channels():
@@ -143,9 +178,17 @@ def test_llm_rewrite_keeps_rule_based_business_queries():
     - 基于 QueryIntent 的规则 query
     - 基于库存状态的业务 query
     """
+    captured = {}
+
+    class SafeRewriteSpy:
+        def rewrite(self, question, n):
+            captured["question"] = question
+            captured["n"] = n
+            return [question, "LLM 改写查询"]
+
     planner = RAGQueryPlanner(
         inventory_analysis_service=SimpleNamespace(),
-        query_rewriter=SimpleNamespace(rewrite=lambda question, n: [question, "LLM 改写查询"]),
+        query_rewriter=SafeRewriteSpy(),
     )
     inventory = SimpleNamespace(
         insufficient_skus=["SKU-A"],
@@ -161,13 +204,18 @@ def test_llm_rewrite_keeps_rule_based_business_queries():
             secondary_intents=[],
         ),
         retrieval_context="订单库存不足，需要查询缺货处理规则",
+        session_memory_context="短期记忆检索约束：运营偏好：{'priority': 'speed'}",
     )
 
     queries = planner.build_queries("库存不足怎么办", prepared)
 
+    assert captured == {"question": "库存不足怎么办", "n": 1}
     assert "LLM 改写查询" in queries
     assert "缺货履约规则" in queries
+    assert "缺货异常订单历史优秀案例" in queries
+    assert "相似异常订单优秀案例与执行复盘" in queries
     assert "库存不足 SKU：SKU-A，优先检索缺货处理与跨仓规则" in queries
+    assert "短期记忆检索约束：运营偏好：{'priority': 'speed'}" in queries
 
 
 def test_retrieve_without_order_skips_inventory_analysis():
@@ -222,7 +270,7 @@ def test_intent_classifier_model_can_override_keyword_fallback():
 
 
 def test_business_metadata_enricher_uses_stable_chunk_id_as_node_id():
-    """Milvus upsert 依赖稳定 node_id，避免重启后重复写入同一 chunk。"""
+    """PGVector upsert 依赖稳定 node_id，避免重启后重复写入同一 chunk。"""
     node = TextNode(text="# 缺货规则\n\n库存不足时需要人工复核", metadata={"file_path": "stockout_rules.md"})
 
     [enriched] = BusinessMetadataEnricher()([node])
@@ -254,6 +302,76 @@ def test_front_matter_metadata_overrides_filename_category():
     assert enriched.metadata["title"] == "VIP 履约规则"
     assert enriched.metadata["owner"] == "ops"
     assert "会员订单" in enriched.metadata["tags"]
+
+
+def test_excellent_case_metadata_is_indexable_and_filterable():
+    """优秀案例要进入同一套 RAG metadata、过滤和 PGVector 可解释链路。"""
+    node = TextNode(
+        text=(
+            "---\n"
+            "document_id: excellent-case-001\n"
+            "category: 优秀案例\n"
+            "title: 跨仓拆单履约优秀案例\n"
+            "business_scope: [fulfillment, abnormal_order]\n"
+            "knowledge_source: case\n"
+            "collection_name: case_collection\n"
+            "version_status: active\n"
+            "is_active: true\n"
+            "vector_backend: pgvector\n"
+            "source_case_id: case-001\n"
+            "---\n\n"
+            "# 跨仓拆单履约优秀案例\n\n"
+            "库存不足时，上海仓先发 3 件，杭州仓拆单补发 2 件。"
+        ),
+        metadata={"file_path": "excellent_cases/excellent-case-001.md"},
+    )
+    [prepared] = KnowledgeFrontMatterExtractor()([node])
+    [enriched] = BusinessMetadataEnricher()([prepared])
+    service = KnowledgeRetrievalService.__new__(KnowledgeRetrievalService)
+
+    filtered = service._dedupe_and_filter_nodes(
+        [NodeWithScore(node=enriched, score=0.8)],
+        ["优秀案例"],
+    )
+
+    assert enriched.metadata["category"] == "excellent_case"
+    assert enriched.metadata["business_scope"] == ["fulfillment", "abnormal_order"]
+    assert enriched.metadata["knowledge_source"] == "case"
+    assert enriched.metadata["collection_name"] == "case_collection"
+    assert enriched.metadata["version_status"] == "active"
+    assert enriched.metadata["is_active"] == "true"
+    assert enriched.metadata["vector_backend"] == "pgvector"
+    assert enriched.metadata["source_case_id"] == "case-001"
+    assert filtered[0].node.metadata["chunk_id"] == "excellent-case-001::chunk-0000"
+
+
+def test_dedupe_and_filter_nodes_excludes_inactive_knowledge_versions():
+    service = KnowledgeRetrievalService.__new__(KnowledgeRetrievalService)
+    active = TextNode(
+        text="当前缺货 SOP",
+        metadata={
+            "category": "stockout_rule",
+            "chunk_id": "active::chunk-0000",
+            "version_status": "active",
+            "is_active": "true",
+        },
+    )
+    archived = TextNode(
+        text="旧版缺货 SOP",
+        metadata={
+            "category": "stockout_rule",
+            "chunk_id": "archived::chunk-0000",
+            "version_status": "archived",
+            "is_active": "false",
+        },
+    )
+
+    filtered = service._dedupe_and_filter_nodes(
+        [NodeWithScore(node=active, score=0.5), NodeWithScore(node=archived, score=0.9)],
+        ["stockout_rule"],
+    )
+
+    assert [item.node.metadata["chunk_id"] for item in filtered] == ["active::chunk-0000"]
 
 
 def test_markdown_section_splitter_keeps_heading_path_metadata():
@@ -335,7 +453,7 @@ def test_document_registry_change_plan_deletes_updated_and_removed_chunks():
 
 
 def test_delete_stale_vector_chunks_calls_vector_store_delete_nodes():
-    """Milvus/LlamaIndex vector stores should receive stale node ids for cleanup."""
+    """PGVector/LlamaIndex vector stores should receive stale node ids for cleanup."""
     service = KnowledgeRetrievalService.__new__(KnowledgeRetrievalService)
 
     class FakeVectorStore:
@@ -359,7 +477,7 @@ def test_delete_stale_vector_chunks_calls_vector_store_delete_nodes():
 
 
 def test_rebuild_index_cleans_vectors_when_all_documents_deleted(tmp_path):
-    """If the knowledge directory becomes empty, old Milvus chunks still need cleanup."""
+    """If the knowledge directory becomes empty, old PGVector chunks still need cleanup."""
     service = KnowledgeRetrievalService.__new__(KnowledgeRetrievalService)
     service.knowledge_repository = SimpleNamespace(
         rebuild_index_required=lambda: True,
@@ -436,6 +554,40 @@ def test_score_detail_explains_keyword_and_business_rule_signals():
     assert hit.score_detail.business_rule_score == 0.35
     assert hit.score_detail.final_score == hit.score
     assert "keyword" in hit.retrieval_channels
+    assert "business_rule" in hit.retrieval_channels
+
+
+def test_excellent_case_receives_business_boost_and_source_metadata():
+    """相似案例命中后要可解释：能看到业务加权和来源 Case。"""
+    service = KnowledgeRetrievalService.__new__(KnowledgeRetrievalService)
+    service._cross_encoder = None
+    service._answer_builder = RAGAnswerBuilder()
+    intent = QueryIntent(
+        primary_intent=QueryIntentType.STOCKOUT_HANDLING,
+        confidence=0.9,
+        reasoning="测试",
+        secondary_intents=[],
+    )
+    case_node = _node(
+        "case",
+        "excellent_case",
+        0.2,
+        text="优秀案例：库存不足时采用跨仓拆单，执行后验证订单完成。",
+    )
+    case_node.node.metadata.update({"source_case_id": "case-001", "vector_backend": "pgvector"})
+
+    ranked = service._rank_nodes(
+        "库存不足有没有历史优秀案例？",
+        ["库存不足有没有历史优秀案例？", "相似异常订单优秀案例与执行复盘"],
+        [case_node],
+        intent,
+    )
+    [hit] = service._hits_from_nodes(ranked, ["库存不足有没有历史优秀案例？"], intent)
+
+    assert hit.category == "excellent_case"
+    assert hit.score_detail.business_rule_score == 0.18
+    assert hit.metadata.source_case_id == "case-001"
+    assert hit.metadata.vector_backend == "pgvector"
     assert "business_rule" in hit.retrieval_channels
 
 

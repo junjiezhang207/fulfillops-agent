@@ -45,7 +45,7 @@ export function SystemPage() {
         <div>
           <p className="eyebrow">系统运行状态</p>
           <h1>系统状态</h1>
-          <p>集中展示 API、Redis、Milvus、MySQL、Trace Center 和 Hybrid Routing 的运行状态，帮助运营与技术人员快速判断系统是否可用。</p>
+          <p>集中展示 API、Redis、ChromaDB、MySQL、Trace Center 和 Hybrid Routing 的运行状态，帮助运营与技术人员快速判断系统是否可用。</p>
         </div>
         <StatusPill tone={apiOk ? "ok" : health.isError ? "danger" : "warn"}>
           {apiOk ? "API 正常" : health.isError ? "API 异常" : "检查中"}
@@ -62,7 +62,7 @@ export function SystemPage() {
         <div className="service-simple-grid service-simple-grid--focused">
           <ServiceCard icon={Server} name="API 服务" value={apiOk ? "在线" : "检查中"} detail={health.data?.data.version || "FastAPI"} tone={apiOk ? "ok" : "warn"} />
           <ServiceCard icon={Radio} name="Redis" value="启用" detail="短期记忆 / 工具缓存 / 速率限制" />
-          <ServiceCard icon={Brain} name="Milvus" value="向量检索" detail="RAG 与长期记忆语义搜索" tone="info" />
+          <ServiceCard icon={Brain} name="ChromaDB" value="向量检索" detail="当前 RAG 与长期记忆语义索引，Milvus 暂不启用" tone="info" />
           <ServiceCard icon={Database} name="MySQL" value={enterpriseStats.data?.data.order_count ?? 0} detail="企业结构化数据、HITL、Trace 和长期记忆元数据" tone="info" />
           <ServiceCard icon={Eye} name="Trace Center" value="业务链路" detail="Hybrid / RAG / Tool / HITL 观测" />
         </div>
@@ -98,7 +98,7 @@ export function SystemPage() {
           </div>
           <div className="tech-note-list">
             <article><strong>Redis</strong><span>用于短期记忆、工具缓存和接口速率限制。</span></article>
-            <article><strong>Milvus</strong><span>用于 RAG 和长期记忆的向量检索。</span></article>
+            <article><strong>ChromaDB</strong><span>当前用于 RAG 和长期记忆的向量检索；Milvus 仅作为可选扩展。</span></article>
             <article><strong>MySQL</strong><span>保存企业结构化数据与长期记忆元数据。</span></article>
             <article><strong>Trace Center</strong><span>记录业务决策步骤、RAG 证据、工具调用和审计事件。</span></article>
             <article><strong>Hybrid Routing</strong><span>按问题复杂度选择 Workflow / Agent / RAG / Multi-Agent。</span></article>
@@ -136,7 +136,7 @@ export function SystemPage() {
 
       <section className="demo-bottom-notes">
         <article><Activity size={18} /><span>API、数据、路由和观测形成完整工程链路。</span></article>
-        <article><Brain size={18} /><span>Milvus + MySQL 表达长期记忆，不使用本地文件降级。</span></article>
+        <article><Brain size={18} /><span>ChromaDB + MySQL 表达长期记忆，避免本地开发启用高内存 Milvus。</span></article>
         <article><Eye size={18} /><span>Trace Center 用于查看每次履约决策链路。</span></article>
       </section>
     </div>

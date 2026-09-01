@@ -31,10 +31,12 @@ from app.core.service_registry import (
     get_order_analysis_service,
 )
 from app.infrastructure.llm.chat_adapter import LLMFactory
+from app.observability.business_trace import record_prompt_injection_detected
 from app.schemas.agent import AgentChatRequest, AgentChatResponse, PlanExecuteRequest, PlanExecuteResponse
 from app.schemas.common import ApiResponse
 from app.agents.runtime.agent_service import AgentNotAvailableError, AgentService
 from app.agents.runtime.plan_execute_service import PlanExecuteService
+from app.application.routing.order_context_service import OrderContextService
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
 from app.domain.inventory.warehouse_service import WarehouseService
@@ -61,6 +63,10 @@ _fulfillment_service = FulfillmentPlanService(
     warehouse_service=_warehouse_service,
     substitute_service=_substitute_service,
 )
+_order_context_service = OrderContextService(
+    order_service=_order_analysis_service,
+    inventory_service=_inventory_analysis_service,
+)
 
 # ---- 构建扩展工具列表 ----
 # AgentService 会把基础工具和这里的额外工具合并，再统一套上弹性包装。
@@ -71,6 +77,7 @@ _tool_services = ToolServiceBundle(
     warehouse_service=_warehouse_service,
     substitute_service=_substitute_service,
     fulfillment_service=_fulfillment_service,
+    context_service=_order_context_service,
 )
 _tool_registry = get_tool_registry()
 _extra_tools = _tool_registry.build_tools(
@@ -80,6 +87,13 @@ _extra_tools = _tool_registry.build_tools(
         "search_warehouse_inventory",
         "find_substitute_sku",
         "generate_fulfillment_plan",
+        "get_context_detail",
+        "get_order_detail",
+        "get_inventory_warehouse_detail",
+        "get_shipping_detail",
+        "get_supply_chain_detail",
+        "get_product_constraints",
+        "get_customer_case_context",
     ),
 )
 
@@ -239,6 +253,8 @@ async def agent_chat(request: AgentChatRequest, http_request: Request) -> ApiRes
     # ── 输入安全检查（Prompt Injection / 超长 / 黑名单）────────────────
     check = _input_guard.check(request.message)
     if not check.passed:
+        if "Prompt Injection" in check.reason:
+            record_prompt_injection_detected("agent_input")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"输入校验失败：{check.reason}",

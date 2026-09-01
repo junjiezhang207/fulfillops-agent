@@ -30,8 +30,10 @@ from app.agents.tools.contracts import (
     CheckInventoryArgs,
     FindSubstituteSkuArgs,
     GenerateFulfillmentPlanArgs,
+    GetContextDetailArgs,
     RetrieveKnowledgeArgs,
     SearchWarehouseInventoryArgs,
+    SourceContextDetailArgs,
     error_envelope,
     ok_envelope,
 )
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
     from app.domain.fulfillment.plan_service import FulfillmentPlanService
     from app.domain.fulfillment.substitute_sku import SubstituteSkuService
     from app.domain.inventory.warehouse_service import WarehouseService
+    from app.application.routing.order_context_service import OrderContextService
 
 
 # 工具返回 JSON 字符串，兼容 LLM 上下文，同时保留可解析的结构化字段。
@@ -55,9 +58,15 @@ def _ok(data: dict, summary: str) -> str:
     return ok_envelope(data=data, summary=summary)
 
 
-def _error(code: str, message: str, *, retryable: bool = False) -> str:
+def _error(
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+    details: dict | None = None,
+) -> str:
     """统一工具失败输出，避免 LangChain 把异常转成不可解析的自由文本。"""
-    return error_envelope(code=code, message=message, retryable=retryable)
+    return error_envelope(code=code, message=message, retryable=retryable, details=details)
 
 
 def _handle_tool_error(exc: ToolException) -> str:
@@ -367,4 +376,84 @@ def make_fulfillment_plan_tool(service: "FulfillmentPlanService") -> StructuredT
         "generate_fulfillment_plan",
         "为订单生成完整履约方案，返回包含仓库分配、替代品、时间线的结构化动作列表。",
         GenerateFulfillmentPlanArgs,
+    )
+
+
+def make_context_detail_tool(service: "OrderContextService") -> StructuredTool:
+    """创建 OrderContext 明细展开工具。
+
+    作用：Planner 已经拿到核心字段和意图字段组后，如果还缺大体量明细，
+    只能按路径展开，不把完整 OrderContext 一次性塞回模型。
+    """
+
+    def _get_context_detail(order_id: str, detail_path: str, intent: str = "fulfillment_action", question: str = "") -> str:
+        try:
+            result = service.get_context_detail(
+                order_id=order_id,
+                detail_path=detail_path,
+                intent=intent,
+                question=question or None,
+            )
+            detail = result["detail"]
+            if not detail["found"]:
+                return _error(
+                    "context_detail_not_found",
+                    f"OrderContext 路径不存在：{detail_path}",
+                    retryable=False,
+                    details={"available_paths": result["context_completeness"].get("large_details_expandable_by_path", [])},
+                )
+            return _ok(
+                data={
+                    "order_id": result["order_id"],
+                    "intent": result["intent"],
+                    "field_groups_loaded": result["field_groups_loaded"],
+                    "context_completeness": result["context_completeness"],
+                    "path": detail["path"],
+                    "value": detail["value"],
+                },
+                summary=f"已展开 OrderContext 路径 {detail_path}，字段组：{', '.join(result['field_groups_loaded'])}",
+            )
+        except Exception as exc:
+            return _error("context_detail_failed", f"上下文明细读取失败：{exc}", retryable=True)
+
+    return _as_structured_tool(
+        _get_context_detail,
+        "get_context_detail",
+        "按路径展开订单履约上下文大体量明细，例如 inventory/logistics/product_restrictions/customer_risk。",
+        GetContextDetailArgs,
+    )
+
+
+def make_source_context_tool(
+    service: "OrderContextService",
+    *,
+    name: str,
+    source_system: str,
+    description: str,
+) -> StructuredTool:
+    """创建按源系统拆分的渐进式只读上下文工具。"""
+
+    def _get_source_context(order_id: str, intent: str = "fulfillment_action", question: str = "") -> str:
+        try:
+            result = service.get_source_detail(
+                order_id=order_id,
+                source_system=source_system,
+                intent=intent,
+                question=question or None,
+            )
+            return _ok(
+                data=result,
+                summary=(
+                    f"已从 {source_system} 只读加载 {order_id} 的 "
+                    f"{', '.join(result['detail_paths'])}；不包含短期记忆中的旧业务快照。"
+                ),
+            )
+        except Exception as exc:
+            return _error(f"{source_system.lower()}_context_failed", f"{source_system} 上下文读取失败：{exc}", retryable=True)
+
+    return _as_structured_tool(
+        _get_source_context,
+        name,
+        description,
+        SourceContextDetailArgs,
     )

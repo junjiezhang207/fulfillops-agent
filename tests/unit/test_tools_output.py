@@ -18,9 +18,11 @@ from app.agents.tools.factory import (
     make_inventory_tool,
     make_knowledge_tool,
     make_order_tool,
+    make_source_context_tool,
     make_substitute_tool,
     make_warehouse_tool,
 )
+from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
 from app.agents.tools.telemetry import get_tool_telemetry
 from app.agents.tools.wrapper import wrap_tool_with_resilience
 
@@ -93,6 +95,19 @@ def _mock_fulfillment_plan():
     plan.summary = "快速路径发货"
     plan.actions = [action]
     return plan
+
+
+def _mock_source_context(source_system: str):
+    return {
+        "order_id": "SO123",
+        "intent": "fulfillment_action",
+        "source_system": source_system,
+        "read_only": True,
+        "field_groups_loaded": ["core", "inventory", "logistics"],
+        "context_completeness": {"status": "complete"},
+        "detail_paths": ["sku_warehouse_inventory"],
+        "details": {"sku_warehouse_inventory": [{"sku_id": "SKU-001", "available_stock": 5}]},
+    }
 
 
 # ── JSON Schema 验证辅助 ─────────────────────────────────────────────────────
@@ -213,6 +228,68 @@ class TestFulfillmentPlanToolOutput:
             action = data["data"]["actions"][0]
             assert "product" in action
             assert "action_type" in action
+
+
+class TestProgressiveReadOnlyContextTools:
+    def test_source_context_tool_returns_read_only_source_payload(self):
+        svc = MagicMock()
+        svc.get_source_detail.return_value = _mock_source_context("WMS")
+        tool = make_source_context_tool(
+            svc,
+            name="get_inventory_warehouse_detail",
+            source_system="WMS",
+            description="test",
+        )
+
+        raw = tool.invoke({"order_id": "SO123", "question": "查库存"})
+        data = _parse_and_validate(raw)
+
+        assert data["data"]["source_system"] == "WMS"
+        assert data["data"]["read_only"] is True
+        assert "details" in data["data"]
+        svc.get_source_detail.assert_called_once()
+
+    def test_tool_registry_exposes_six_progressive_read_only_tools(self):
+        registry = get_tool_registry()
+        names = {
+            "get_order_detail",
+            "get_inventory_warehouse_detail",
+            "get_shipping_detail",
+            "get_supply_chain_detail",
+            "get_product_constraints",
+            "get_customer_case_context",
+        }
+
+        catalog_names = {item["name"] for item in registry.catalog(use_case="agent", include_metrics=False)}
+
+        assert names <= catalog_names
+        for name in names:
+            manifest = registry.get(name).manifest
+            assert manifest.side_effects is False
+            assert manifest.data_freshness == "realtime"
+
+    def test_registered_read_only_tool_uses_gateway_permissions(self):
+        svc = MagicMock()
+        svc.get_source_detail.return_value = _mock_source_context("WMS")
+        tools = get_tool_registry().build_tools(
+            services=ToolServiceBundle(context_service=svc),
+            use_case="agent",
+            include_names=("get_inventory_warehouse_detail",),
+        )
+        wrapped = wrap_tool_with_resilience(tools[0], enable_cache=False, enable_circuit_breaker=False)
+        context = ToolRuntimeContext(
+            tenant_id="tenant-a",
+            user_id="u1",
+            roles=["agent_user"],
+            permissions=["oms:read"],
+        )
+
+        with tool_runtime_context(context):
+            result = wrapped.invoke({"order_id": "SO123"})
+
+        data = json.loads(result)
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "permission_denied"
 
 
 class TestEnterpriseToolControls:

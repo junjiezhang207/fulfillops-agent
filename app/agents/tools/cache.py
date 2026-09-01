@@ -6,7 +6,7 @@
 数据默认不缓存；知识规则、替代 SKU 这类目录数据可以短时间缓存。
 
 主要组成：
-1. ``RedisToolResultCache``：使用 Redis 的 TTL 缓存，Redis 不可用时直接失败。
+1. ``PostgreSQLToolResultCache``：使用 PostgreSQL 的 TTL 缓存，PostgreSQL 不可用时直接失败。
 3. ``GLOBAL_SCOPE``：跨会话共享稳定数据的 scope。
 4. ``TOOL_TTLS``：为不同工具设置不同过期时间。
 5. ``get`` / ``set``：按 scope、工具名、参数 hash 读写缓存。
@@ -22,9 +22,9 @@ import hashlib
 import json
 import logging
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 from app.agents.tools.contracts import TOOL_MANIFESTS
+from sqlalchemy import create_engine, text
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ TOOL_TTLS: dict[str, float] = {
     "find_substitute_sku": TOOL_MANIFESTS["find_substitute_sku"].ttl_seconds or 300,
 }
 _DEFAULT_TTL: float = 120
-_REDIS_KEY_PREFIX = "multiship:tool-cache:v1"
+_CACHE_SCHEMA_VERSION = "v1"
 
 CACHE_INVALIDATION_EVENTS: dict[str, tuple[str, ...]] = {
     "knowledge_updated": ("retrieve_knowledge",),
@@ -50,51 +50,43 @@ CACHE_INVALIDATION_EVENTS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _safe_redis_label(redis_url: str) -> str:
-    """生成适合日志展示的 Redis 地址，避免泄露密码。"""
-    try:
-        parts = urlsplit(redis_url)
-        netloc = parts.hostname or ""
-        if parts.port:
-            netloc = f"{netloc}:{parts.port}"
-        if parts.username:
-            netloc = f"{parts.username}:***@{netloc}"
-        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
-    except Exception:
-        return "<redis-url>"
+class PostgreSQLToolResultCache:
+    """PostgreSQL TTL 缓存。
 
-
-class RedisToolResultCache:
-    """Redis TTL 缓存。
-
-    这里不使用 RediSearch，只使用普通 Redis 的 GET/SETEX/SCAN/DEL。
-    因此它和 LangGraph RedisSaver 不同：工具缓存只需要普通 Redis 即可。
-    生产模式下 Redis 是强依赖，不能降级到进程内存，否则多实例缓存不一致。
+    生产模式下 PostgreSQL 是强依赖，不能降级到进程内存，否则多实例缓存不一致。
     """
 
     def __init__(
         self,
-        redis_url: str,
+        database_url: str,
         tool_ttls: dict[str, float] | None = None,
     ) -> None:
-        self._redis_url = redis_url
+        if not database_url:
+            raise RuntimeError("工具缓存必须配置 DATABASE_URL/POSTGRES_URL，生产模式不允许降级到内存缓存。")
+        self._database_url = database_url
         self._ttls = tool_ttls or TOOL_TTLS
         self._hits = 0
         self._misses = 0
-        self._client = self._create_client(redis_url)
+        self._engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=1800, future=True)
+        self._init_schema()
 
-    @staticmethod
-    def _create_client(redis_url: str):
-        import redis
-
-        client = redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_connect_timeout=0.5,
-            socket_timeout=0.5,
-        )
-        client.ping()
-        return client
+    def _init_schema(self) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS tool_result_cache (
+                    cache_key VARCHAR(192) PRIMARY KEY,
+                    schema_version VARCHAR(16) NOT NULL,
+                    scope VARCHAR(128) NOT NULL,
+                    tool_name VARCHAR(128) NOT NULL,
+                    args_hash VARCHAR(32) NOT NULL,
+                    value TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tool_cache_scope ON tool_result_cache (scope)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tool_cache_tool ON tool_result_cache (tool_name)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tool_cache_expires ON tool_result_cache (expires_at)"))
 
     @staticmethod
     def _args_hash(kwargs: dict) -> str:
@@ -102,98 +94,110 @@ class RedisToolResultCache:
         return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
     def _make_key(self, scope: str, tool_name: str, kwargs: dict) -> str:
-        return f"{_REDIS_KEY_PREFIX}:{scope}:{tool_name}:{self._args_hash(kwargs)}"
-
-    def _scope_prefix(self, scope: str) -> str:
-        return f"{_REDIS_KEY_PREFIX}:{scope}:"
-
-    def _tool_prefix(self, scope: str, tool_name: str) -> str:
-        return f"{_REDIS_KEY_PREFIX}:{scope}:{tool_name}:"
+        return f"{_CACHE_SCHEMA_VERSION}:{scope}:{tool_name}:{self._args_hash(kwargs)}"
 
     def _ttl_for(self, tool_name: str) -> int:
         return max(1, int(self._ttls.get(tool_name, _DEFAULT_TTL)))
 
-    def _try_redis(self, operation):
-        try:
-            return operation(self._client)
-        except Exception as exc:
-            raise RuntimeError(f"工具缓存 Redis 操作失败，生产模式拒绝降级：{exc}") from exc
+    def _delete_expired(self, conn) -> int:
+        from datetime import datetime, timezone
 
-    def _delete_by_prefix(self, prefix: str) -> int:
-        return self._delete_by_pattern(f"{prefix}*")
-
-    def _delete_by_pattern(self, pattern: str) -> int:
-        def _operation(client) -> int:
-            deleted = 0
-            batch: list[str] = []
-            for key in client.scan_iter(match=pattern, count=100):
-                batch.append(key)
-                if len(batch) >= 100:
-                    deleted += int(client.delete(*batch))
-                    batch.clear()
-            if batch:
-                deleted += int(client.delete(*batch))
-            return deleted
-
-        return self._try_redis(_operation) or 0
-
-    def _count_redis_entries(self) -> int | None:
-        def _operation(client) -> int:
-            return sum(1 for _ in client.scan_iter(match=f"{_REDIS_KEY_PREFIX}:*", count=100))
-
-        return self._try_redis(_operation)
+        result = conn.execute(
+            text("DELETE FROM tool_result_cache WHERE expires_at <= :now"),
+            {"now": datetime.now(tz=timezone.utc).replace(tzinfo=None)},
+        )
+        return int(result.rowcount or 0)
 
     def get(self, scope: str, tool_name: str, kwargs: dict) -> str | None:
-        """从 Redis 读取工具结果；Redis 不可用时直接失败。"""
+        """从 PostgreSQL 读取工具结果；PostgreSQL 不可用时直接失败。"""
         key = self._make_key(scope, tool_name, kwargs)
+        from datetime import datetime, timezone
 
-        sentinel = object()
-
-        def _operation(client) -> str | object:
-            value = client.get(key)
-            return value if value is not None else sentinel
-
-        redis_value = self._try_redis(_operation)
-        if redis_value is sentinel:
+        with self._engine.begin() as conn:
+            self._delete_expired(conn)
+            row = conn.execute(
+                text("""
+                    SELECT value
+                    FROM tool_result_cache
+                    WHERE cache_key=:cache_key AND expires_at > :now
+                """),
+                {"cache_key": key, "now": datetime.now(tz=timezone.utc).replace(tzinfo=None)},
+            ).mappings().first()
+        if row is None:
             self._misses += 1
             return None
         self._hits += 1
-        return str(redis_value)
+        return str(row["value"])
 
     def set(self, scope: str, tool_name: str, kwargs: dict, value: str) -> None:
-        """写入 Redis；Redis 不可用时直接失败。"""
+        """写入 PostgreSQL；PostgreSQL 不可用时直接失败。"""
         key = self._make_key(scope, tool_name, kwargs)
         ttl = self._ttl_for(tool_name)
+        from datetime import datetime, timedelta, timezone
 
-        self._try_redis(lambda client: bool(client.setex(key, ttl, value)))
+        now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+        with self._engine.begin() as conn:
+            self._delete_expired(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO tool_result_cache (
+                        cache_key, schema_version, scope, tool_name, args_hash,
+                        value, created_at, expires_at
+                    ) VALUES (
+                        :cache_key, :schema_version, :scope, :tool_name, :args_hash,
+                        :value, :created_at, :expires_at
+                    )
+                    ON CONFLICT (cache_key) DO UPDATE SET
+                        value=EXCLUDED.value,
+                        created_at=EXCLUDED.created_at,
+                        expires_at=EXCLUDED.expires_at
+                """),
+                {
+                    "cache_key": key,
+                    "schema_version": _CACHE_SCHEMA_VERSION,
+                    "scope": scope,
+                    "tool_name": tool_name,
+                    "args_hash": self._args_hash(kwargs),
+                    "value": value,
+                    "created_at": now,
+                    "expires_at": now + timedelta(seconds=ttl),
+                },
+            )
 
     def invalidate_scope(self, scope: str) -> int:
-        redis_deleted = self._delete_by_prefix(self._scope_prefix(scope))
-        return redis_deleted
+        with self._engine.begin() as conn:
+            result = conn.execute(text("DELETE FROM tool_result_cache WHERE scope=:scope"), {"scope": scope})
+        return int(result.rowcount or 0)
 
     def invalidate_tool(self, tool_name: str, scope: str | None = GLOBAL_SCOPE) -> int:
+        params: dict[str, Any] = {"tool_name": tool_name}
+        where = "tool_name=:tool_name"
         if scope is None:
-            redis_deleted = self._delete_by_pattern(f"{_REDIS_KEY_PREFIX}:*:{tool_name}:*")
+            pass
         else:
-            redis_deleted = self._delete_by_prefix(self._tool_prefix(scope, tool_name))
-        return redis_deleted
+            where += " AND scope=:scope"
+            params["scope"] = scope
+        with self._engine.begin() as conn:
+            result = conn.execute(text(f"DELETE FROM tool_result_cache WHERE {where}"), params)
+        return int(result.rowcount or 0)
 
     def invalidate_event(self, event_type: str, scope: str | None = GLOBAL_SCOPE) -> dict[str, int]:
         tools = CACHE_INVALIDATION_EVENTS.get(event_type, ())
         return {tool: self.invalidate_tool(tool, scope) for tool in tools}
 
     def evict_expired(self) -> int:
-        """Redis 依赖 key TTL 自动过期，无需本地清理。"""
-        return 0
+        with self._engine.begin() as conn:
+            return self._delete_expired(conn)
 
     @property
     def stats(self) -> dict:
-        redis_entries = self._count_redis_entries()
+        with self._engine.begin() as conn:
+            self._delete_expired(conn)
+            cached_entries = conn.execute(text("SELECT COUNT(*) FROM tool_result_cache")).scalar_one()
         total = self._hits + self._misses
         return {
-            "backend": "redis",
-            "cached_entries": redis_entries or 0,
-            "redis_entries": redis_entries or 0,
+            "backend": "postgresql",
+            "cached_entries": int(cached_entries or 0),
             "total_hits": self._hits,
             "total_misses": self._misses,
             "hit_rate": round(self._hits / total, 3) if total else 0.0,
@@ -205,16 +209,16 @@ class RedisToolResultCache:
 _cache: Any | None = None
 
 
-# 全局单例让不同工具包装器共享命中；生产模式下 Redis 不可用直接失败。
+# 全局单例让不同工具包装器共享命中；生产模式下 PostgreSQL 不可用直接失败。
 def get_tool_cache():
     """获取全局工具缓存单例。"""
     global _cache
     if _cache is None:
         from app.core.config import get_settings
 
-        redis_url = get_settings().redis_url.strip()
-        if not redis_url:
-            raise RuntimeError("工具缓存必须配置 REDIS_URL，生产模式不允许降级到内存缓存。")
-        _cache = RedisToolResultCache(redis_url)
-        logger.info("工具缓存：已启用 Redis (%s)", _safe_redis_label(redis_url))
+        database_url = get_settings().effective_database_url.strip()
+        if not database_url:
+            raise RuntimeError("工具缓存必须配置 DATABASE_URL/POSTGRES_URL，生产模式不允许降级到内存缓存。")
+        _cache = PostgreSQLToolResultCache(database_url)
+        logger.info("工具缓存：已启用 PostgreSQL。")
     return _cache

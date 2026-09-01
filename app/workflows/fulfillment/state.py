@@ -17,7 +17,7 @@ from app.workflows.fulfillment.trace import ErrorEvent, TraceEvent
 from app.schemas.inventory import InventoryAnalysisResult
 from app.schemas.knowledge import KnowledgeRetrieveResult
 from app.schemas.orders import OrderAnalysisResult
-from app.schemas.workflow import FinalAnswer
+from app.schemas.workflow import ExecutionProposal, FinalAnswer, PreflightValidation
 
 
 # Literal 类型限定分支取值，避免条件边返回非法值。
@@ -41,6 +41,8 @@ class GraphState(TypedDict, total=False):
     question: str | None
     # filter_categories 用于限制 RAG 只查某些规则类别。
     filter_categories: list[str]
+    # 短期结构化会话记忆，只包含偏好/约束/反馈/指代，不包含实时业务数据。
+    session_memory: dict
 
     # ----- 中间结果字段（由各节点填充，单次写入） -----
     # 这三个 *_result 是 workflow 的核心事实来源。
@@ -71,6 +73,10 @@ class GraphState(TypedDict, total=False):
     human_decision: dict | None
     # 中断信息，由节点在调用 interrupt() 前写入 state，也会返回给前端展示。
     interrupt_info: dict | None
+    # 可审批的履约执行提案，审批中断前写入 checkpoint。
+    execution_proposal: ExecutionProposal | None
+    # 人工批准后重新读取订单/库存/物流价格的二次校验结果。
+    preflight_validation: PreflightValidation | None
 
     # trace / errors 使用 operator.add 作为 reducer：
     # 每个节点返回的 list 会被"累加"到 state 里，而不是覆盖。

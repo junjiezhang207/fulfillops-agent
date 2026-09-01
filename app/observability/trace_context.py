@@ -1,7 +1,7 @@
 """创建业务 Trace 上下文的 FastAPI 中间件。
 
 中间件故意保持很薄：读取请求头里的身份信息，启动 ContextVar trace，让路由正常执行，
-最后把完整 trace 写入 MySQL，并在响应头回写 ``X-Trace-Id``。具体的业务步骤由
+最后把完整 trace 写入 PostgreSQL，并在响应头回写 ``X-Trace-Id``。具体的业务步骤由
 Hybrid、Workflow、Tool、RAG 等服务自己追加；中间件只负责请求边界。
 """
 

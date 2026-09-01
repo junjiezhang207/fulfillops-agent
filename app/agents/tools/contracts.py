@@ -106,6 +106,24 @@ class GenerateFulfillmentPlanArgs(BaseModel):
     order_id: str = Field(..., min_length=1, max_length=64, description="订单 ID，例如 SO202502140001")
 
 
+class GetContextDetailArgs(BaseModel):
+    order_id: str = Field(..., min_length=1, max_length=64, description="订单 ID，例如 SO202502140001")
+    detail_path: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="需要展开的上下文字段组或路径，例如 inventory / logistics / product_restrictions。",
+    )
+    intent: str = Field(default="fulfillment_action", max_length=64, description="当前规划意图。")
+    question: str = Field(default="", max_length=500, description="运营问题，可用于字段组判断。")
+
+
+class SourceContextDetailArgs(BaseModel):
+    order_id: str = Field(..., min_length=1, max_length=64, description="订单 ID，例如 SO202502140001")
+    intent: str = Field(default="fulfillment_action", max_length=64, description="当前规划意图。")
+    question: str = Field(default="", max_length=500, description="运营问题，可用于字段组判断。")
+
+
 DEFAULT_AGENT_TOOL_PERMISSIONS = [
     "orders:read",
     "inventory:read",
@@ -113,6 +131,13 @@ DEFAULT_AGENT_TOOL_PERMISSIONS = [
     "warehouse:read",
     "catalog:read",
     "fulfillment:plan",
+    "context:read",
+    "oms:read",
+    "wms:read",
+    "tms:read",
+    "erp:read",
+    "pim:read",
+    "crm:read",
 ]
 
 
@@ -160,6 +185,87 @@ TOOL_MANIFESTS: dict[str, ToolManifest] = {
         risk_level=ToolRiskLevel.MEDIUM,
         required_permissions=["fulfillment:plan"],
         data_freshness="realtime",
+    ),
+    "get_context_detail": ToolManifest(
+        name="get_context_detail",
+        description="按路径展开 OrderContext 大体量明细，不重新加载整包 JSON 给模型。",
+        risk_level=ToolRiskLevel.MEDIUM,
+        required_permissions=["context:read"],
+        data_freshness="realtime",
+    ),
+    "get_order_detail": ToolManifest(
+        name="get_order_detail",
+        description="只读获取 OMS 订单、SKU 和已发生履约状态。",
+        risk_level=ToolRiskLevel.MEDIUM,
+        required_permissions=["oms:read"],
+        data_freshness="realtime",
+    ),
+    "get_inventory_warehouse_detail": ToolManifest(
+        name="get_inventory_warehouse_detail",
+        description="只读获取 WMS 候选仓、仓库能力和 SKU×仓库存。",
+        risk_level=ToolRiskLevel.MEDIUM,
+        required_permissions=["wms:read"],
+        data_freshness="realtime",
+    ),
+    "get_shipping_detail": ToolManifest(
+        name="get_shipping_detail",
+        description="只读获取 TMS 物流渠道、可配送性、价格和时效。",
+        risk_level=ToolRiskLevel.MEDIUM,
+        required_permissions=["tms:read"],
+        data_freshness="realtime",
+    ),
+    "get_supply_chain_detail": ToolManifest(
+        name="get_supply_chain_detail",
+        description="只读获取 ERP 补货、采购和在途库存信息。",
+        risk_level=ToolRiskLevel.MEDIUM,
+        required_permissions=["erp:read"],
+        data_freshness="realtime",
+    ),
+    "get_product_constraints": ToolManifest(
+        name="get_product_constraints",
+        description="只读获取 PIM 商品履约限制，如冷链、危险品、是否允许拆单。",
+        risk_level=ToolRiskLevel.MEDIUM,
+        required_permissions=["pim:read"],
+        data_freshness="realtime",
+    ),
+    "get_customer_case_context": ToolManifest(
+        name="get_customer_case_context",
+        description="只读获取 CRM 客诉、客服承诺和客户风险上下文。",
+        risk_level=ToolRiskLevel.MEDIUM,
+        required_permissions=["crm:read"],
+        data_freshness="realtime",
+    ),
+    "create_warehouse_request": ToolManifest(
+        name="create_warehouse_request",
+        description="创建 WMS 仓储协同申请；只创建任务/申请，不直接改订单或库存。",
+        risk_level=ToolRiskLevel.HIGH,
+        side_effects=True,
+        required_permissions=["wms:write"],
+        data_freshness="write_request",
+    ),
+    "create_logistics_request": ToolManifest(
+        name="create_logistics_request",
+        description="创建 TMS 物流协同任务；只创建任务/申请，不直接改物流核心数据。",
+        risk_level=ToolRiskLevel.HIGH,
+        side_effects=True,
+        required_permissions=["tms:write"],
+        data_freshness="write_request",
+    ),
+    "create_supply_chain_request": ToolManifest(
+        name="create_supply_chain_request",
+        description="创建 ERP 供应链协同申请；只创建任务/申请，不直接改采购或在途库存。",
+        risk_level=ToolRiskLevel.HIGH,
+        side_effects=True,
+        required_permissions=["erp:write"],
+        data_freshness="write_request",
+    ),
+    "create_customer_service_task": ToolManifest(
+        name="create_customer_service_task",
+        description="创建 CRM/客服协同任务；只创建任务/申请，不直接改客户核心记录。",
+        risk_level=ToolRiskLevel.HIGH,
+        side_effects=True,
+        required_permissions=["crm:write"],
+        data_freshness="write_request",
     ),
 }
 

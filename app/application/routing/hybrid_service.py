@@ -11,10 +11,11 @@
 """
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from app.schemas.workflow import WorkflowRunRequest
 from app.agents.runtime.agent_service import AgentService
@@ -27,9 +28,9 @@ from app.application.routing.intent_classifier import (
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.agents.runtime.multi_agent_service import MultiAgentService
 from app.application.memory.session_memory_service import (
-    SessionContext,
     SessionMemoryService,
 )
+from app.application.routing.ops_case_service import OpsCaseAnalysisService
 from app.application.workflow.workflow_service import WorkflowService
 from app.infrastructure.llm.model_gateway import get_model_gateway
 from app.observability.business_trace import add_trace_step
@@ -64,9 +65,14 @@ class HybridResult:
     # HITL: 当 workflow 路径被中断时，以下字段有值
     status: str = "completed"  # "completed" | "interrupted" | "error"
     interrupt: Optional[dict] = None
+    # 前端 Action Card：可审批履约提案和执行前二次校验。
+    action_card: Optional[dict[str, Any]] = None
+    preflight_validation: Optional[dict[str, Any]] = None
     # 路由解释，给前端展示“为什么进这条链路”。
     intent_reasoning: str = ""
     intent_keywords: list[str] | None = None
+    session_memory: Optional[dict[str, Any]] = None
+    rag_context: Optional[dict[str, Any]] = None
 
     def __post_init__(self):
         # 保证 tools_called 始终是 list，避免前端处理 None。
@@ -89,6 +95,7 @@ class HybridService:
         agent_service: AgentService | None,
         knowledge_service: KnowledgeRetrievalService,
         multi_agent_service: Optional[MultiAgentService] = None,
+        ops_case_service: Optional[OpsCaseAnalysisService] = None,
         intent_model: object | None = None,
         session_cache: Optional[SessionMemoryService] = None,
         response_cache: Optional[ResponseCacheService] = None,
@@ -104,6 +111,8 @@ class HybridService:
         self.knowledge_service = knowledge_service
         # Multi-Agent 适合跨领域复杂问题，可选依赖。
         self.multi_agent_service = multi_agent_service
+        # 运营异常案件路径：整理案件材料，不执行系统动作。
+        self.ops_case_service = ops_case_service
         # 大模型意图识别模型，通常用便宜的小模型或 workflow_finalize 模型。
         self.intent_model = intent_model
         # Hybrid 演示路由自己的轻量会话缓存。
@@ -145,10 +154,25 @@ class HybridService:
             filter_categories = []
         normalized_order_id = (order_id or "").strip()
 
+        # 第一步：短期结构化记忆。只记录运营偏好/约束/反馈/指代，不保存实时业务事实。
+        conversation_turns = 0
+        session_memory_payload: dict[str, Any] | None = None
+        if thread_id and self.session_cache:
+            session = self.session_cache.get_or_create_session(thread_id, normalized_order_id)
+            conversation_turns = session.conversation_turns + 1
+            session.conversation_turns = conversation_turns
+            self.session_cache.set_session(session)
+            snapshot = self.session_cache.update_from_user_message(
+                thread_id=thread_id,
+                order_id=normalized_order_id,
+                message=question or "",
+            )
+            session_memory_payload = snapshot.model_dump(mode="json")
+
         # 第零步：检查响应缓存。这里只缓存低风险 completed 结果，不缓存 HITL/错误/高风险决策。
         cache_hit = False
         from_cache = False
-        cache_context = self._cache_context(filter_categories)
+        cache_context = self._cache_context(filter_categories, session_memory_payload)
         if self.response_cache:
             cached_entry = self.response_cache.get(normalized_order_id, question, cache_context=cache_context)
             if cached_entry:
@@ -174,22 +198,11 @@ class HybridService:
                     tools_called=cached_entry.tools_called,
                     execution_time_ms=execution_time_ms,
                     thread_id=thread_id,
+                    conversation_turns=conversation_turns,
                     cache_hit=cache_hit,
                     from_cache=from_cache,
+                    session_memory=session_memory_payload,
                 )
-
-        # 第一步：会话上下文
-        conversation_turns = 0
-        if thread_id and self.session_cache:
-            session = self.session_cache.get_session(thread_id)
-            if session:
-                # 已有会话：轮次 +1。
-                conversation_turns = session.conversation_turns + 1
-            else:
-                # 新会话：创建 SessionContext。
-                session = SessionContext(thread_id=thread_id, order_id=normalized_order_id)
-                self.session_cache.set_session(session)
-                conversation_turns = 1
 
         # 第二步：意图分类。优先大模型 JSON 路由，失败时回退规则分类器。
         classification = self._classify_intent(normalized_order_id, question or "")
@@ -215,7 +228,13 @@ class HybridService:
         )
 
         # 第三步：根据分类选择路径
-        if classification.level == IntentLevel.CASUAL:
+        if self._is_fulfillment_action_question(question or "") and normalized_order_id:
+            path_result = self._run_workflow_with_hitl(
+                normalized_order_id, question, filter_categories, thread_id, session_memory_payload
+            )
+        elif self._is_ops_case_question(question or "") and normalized_order_id and self.ops_case_service:
+            path_result = self._run_ops_case_path(normalized_order_id, question)
+        elif classification.level == IntentLevel.CASUAL:
             path_result = self._run_casual_path(question)
         elif classification.level == IntentLevel.MULTI_DOMAIN:
             # 跨领域复杂问题优先走多 Agent。
@@ -231,7 +250,7 @@ class HybridService:
         else:
             # SIMPLE → Workflow（带 HITL 支持）
             path_result = self._run_workflow_with_hitl(
-                normalized_order_id, question, filter_categories, thread_id
+                normalized_order_id, question, filter_categories, thread_id, session_memory_payload
             )
         add_trace_step(
             step_type="hybrid_path",
@@ -245,6 +264,12 @@ class HybridService:
         )
 
         execution_time_ms = (time.time() - start_time) * 1000
+        action_card = path_result.get("action_card")
+        rag_context = path_result.get("rag_context")
+        if rag_context is None and isinstance(action_card, dict):
+            decision_context = action_card.get("decision_context") or {}
+            if isinstance(decision_context, dict):
+                rag_context = decision_context.get("rag_context")
 
         # 把底层路径返回的 dict 包成统一 HybridResult。
         result = HybridResult(
@@ -262,8 +287,12 @@ class HybridService:
             from_cache=from_cache,
             status=path_result.get("status", "completed"),
             interrupt=path_result.get("interrupt"),
+            action_card=action_card,
+            preflight_validation=path_result.get("preflight_validation"),
             intent_reasoning=classification.reasoning,
             intent_keywords=classification.primary_keywords,
+            session_memory=session_memory_payload,
+            rag_context=rag_context if isinstance(rag_context, dict) else None,
         )
 
         # 第四步：写入响应缓存。缓存服务内部会继续判断风险和状态。
@@ -293,6 +322,8 @@ class HybridService:
                     "intent_reasoning": classification.reasoning,
                 }
                 self.session_cache.set_session(session)
+                self.session_cache.record_assistant_summary(thread_id, path_result.get("reply") or result.status)
+                result.session_memory = self.session_cache.snapshot(thread_id).model_dump(mode="json")
 
         add_trace_step(
             step_type="evaluation",
@@ -310,6 +341,8 @@ class HybridService:
                 "hitl_required": result.status == "interrupted",
                 "from_cache": result.from_cache,
                 "execution_time_ms": result.execution_time_ms,
+                "session_memory_updated": bool(result.session_memory),
+                "rag_context_ready": bool(result.rag_context),
             },
         )
 
@@ -378,6 +411,7 @@ class HybridService:
                 interrupt=stream_result["interrupt"].model_dump()
                 if stream_result["interrupt"]
                 else None,
+                action_card=self._action_card_from_interrupt(stream_result["interrupt"]),
             )
 
         result = stream_result.get("result")
@@ -395,8 +429,12 @@ class HybridService:
             )
             # WorkflowRunResult 中 final_answer 是结构化对象，取 conclusion 给前端。
             final_answer = result.final_answer.conclusion if result.final_answer else ""
+            action_card = self._action_card_from_result(result)
+            preflight_validation = self._preflight_from_result(result)
         else:
             final_answer = stream_result.get("error", "Unknown error")
+            action_card = None
+            preflight_validation = None
 
         return HybridResult(
             order_id=result.order_id if result else "",
@@ -409,6 +447,8 @@ class HybridService:
             execution_time_ms=execution_time_ms,
             thread_id=thread_id,
             status=stream_result["status"],
+            action_card=action_card,
+            preflight_validation=preflight_validation,
         )
 
     # =========================================================================
@@ -573,6 +613,7 @@ class HybridService:
         question: str,
         filter_categories: list,
         thread_id: Optional[str],
+        session_memory: dict[str, Any] | None = None,
     ) -> dict:
         """运行 Workflow 路径（带 HITL 支持）。
 
@@ -584,6 +625,7 @@ class HybridService:
             order_id=order_id,
             question=question,
             filter_categories=filter_categories,
+            session_memory=session_memory or {},
         )
 
         try:
@@ -624,14 +666,17 @@ class HybridService:
                 parent_id=workflow_step.id if workflow_step else None,
             )
             # HITL 中断时没有最终答案，前端需要展示 interrupt 等待人工处理。
+            action_card = self._action_card_from_interrupt(stream_result["interrupt"])
             return {
                 "path": "workflow",
                 "reply": "",
-                "tools_called": ["dispatch", "order_analysis", "inventory_analysis"],
+                "tools_called": ["dispatch", "order_analysis", "inventory_analysis", "proposal_generation", "human_approval"],
                 "status": "interrupted",
                 "interrupt": stream_result["interrupt"].model_dump()
                 if stream_result["interrupt"]
                 else None,
+                "action_card": action_card,
+                "rag_context": self._rag_context_from_action_card(action_card),
             }
 
         result = stream_result.get("result")
@@ -642,16 +687,26 @@ class HybridService:
             )
             # completed 时提取最终结论和实际工具链路。
             final_answer = result.final_answer.conclusion if result.final_answer else ""
-            tools_called = ["dispatch", "order_analysis", "inventory_analysis"]
+            tools_called = [
+                "dispatch",
+                "order_analysis",
+                "inventory_analysis",
+                "proposal_generation",
+                "human_approval",
+            ]
             if result.final_answer and result.final_answer.routing_path == "knowledge_path":
                 tools_called.append("knowledge_retrieval")
             tools_called.append("finalize")
+            action_card = self._action_card_from_result(result)
             return {
                 "path": "workflow",
                 "reply": final_answer,
                 "tools_called": tools_called,
                 "status": "completed",
                 "interrupt": None,
+                "action_card": action_card,
+                "preflight_validation": self._preflight_from_result(result),
+                "rag_context": self._rag_context_from_action_card(action_card),
             }
 
         return {
@@ -661,6 +716,42 @@ class HybridService:
             "status": "error",
             "interrupt": None,
             }
+
+    @staticmethod
+    def _action_card_from_interrupt(interrupt) -> dict[str, Any] | None:
+        if not interrupt:
+            return None
+        context = getattr(interrupt, "context", {}) or {}
+        proposal = context.get("proposal") if isinstance(context, dict) else None
+        return proposal if isinstance(proposal, dict) else None
+
+    @staticmethod
+    def _action_card_from_result(result) -> dict[str, Any] | None:
+        proposal = getattr(result, "execution_proposal", None)
+        if proposal is None and getattr(result, "final_answer", None) is not None:
+            proposal = getattr(result.final_answer, "execution_proposal", None)
+        if proposal is None:
+            return None
+        return proposal.model_dump(mode="json") if hasattr(proposal, "model_dump") else proposal
+
+    @staticmethod
+    def _preflight_from_result(result) -> dict[str, Any] | None:
+        validation = getattr(result, "preflight_validation", None)
+        if validation is None and getattr(result, "final_answer", None) is not None:
+            validation = getattr(result.final_answer, "preflight_validation", None)
+        if validation is None:
+            return None
+        return validation.model_dump(mode="json") if hasattr(validation, "model_dump") else validation
+
+    @staticmethod
+    def _rag_context_from_action_card(action_card: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(action_card, dict):
+            return None
+        decision_context = action_card.get("decision_context") or {}
+        if not isinstance(decision_context, dict):
+            return None
+        rag_context = decision_context.get("rag_context")
+        return rag_context if isinstance(rag_context, dict) else None
 
     @staticmethod
     def _record_workflow_node_trace(trace_events: list, parent_id: str | None = None) -> None:
@@ -723,7 +814,7 @@ class HybridService:
     def _run_casual_path(self, question: str) -> dict:
         """运行普通闲聊路径，不调用订单、库存、RAG 或 Agent 工具。"""
         if self.intent_model is None:
-            reply = "你好，我是 Multiship 智能履约助手。你可以问我订单库存、缺货规则、履约方案或风险评估。"
+            reply = "你好，我是电商履约运营智能协同 Agent。你可以问我订单库存、缺货规则、履约方案或风险评估。"
         else:
             prompt = (
                 f"{get_model_gateway().prompt_system(use_case='casual_chat')}\n\n"
@@ -733,7 +824,7 @@ class HybridService:
                 response = self.intent_model.invoke(prompt)
                 reply = str(getattr(response, "content", response)).strip()
             except Exception:
-                reply = "你好，我是 Multiship 智能履约助手。你可以问我订单库存、缺货规则、履约方案或风险评估。"
+                reply = "你好，我是电商履约运营智能协同 Agent。你可以问我订单库存、缺货规则、履约方案或风险评估。"
         return {
             "path": "chat",
             "reply": reply,
@@ -741,6 +832,79 @@ class HybridService:
             "status": "completed",
             "interrupt": None,
         }
+
+    @staticmethod
+    def _is_fulfillment_action_question(question: str) -> bool:
+        """识别需要生成可审批执行提案的问题。"""
+        text = question.lower()
+        action_markers = [
+            "执行提案",
+            "action card",
+            "操作卡片",
+            "批准",
+            "换仓",
+            "拆单",
+            "合单",
+            "物流渠道",
+            "渠道变更",
+            "库存调拨",
+            "跨仓调货",
+            "缺货处置",
+            "二次校验",
+            "preflight",
+        ]
+        return any(marker in text for marker in action_markers)
+
+    @staticmethod
+    def _is_ops_case_question(question: str) -> bool:
+        """识别前端运营案件 Copilot 问题。"""
+        text = question.lower()
+        markers = [
+            "运营异常案件",
+            "案件摘要",
+            "异常案件",
+            "分流",
+            "沟通草稿",
+            "客服沟通",
+            "复盘",
+            "商业影响",
+            "sop 适配",
+            "sop适配",
+            "不要替 oms",
+            "不要替 oms/wms/tms/erp",
+        ]
+        return any(marker in text for marker in markers)
+
+    def _run_ops_case_path(self, order_id: str, question: str) -> dict:
+        """运行运营异常案件路径。
+
+        这条路径只组织事实、SOP 和运营建议，不执行订单/库存/物流动作。
+        """
+        if self.ops_case_service is None:
+            return self._run_agent_path(order_id, question)
+        try:
+            result = self.ops_case_service.analyze(order_id=order_id, question=question)
+            return {
+                "path": "ops_case",
+                "order_id": result.order_id,
+                "reply": result.to_markdown(),
+                "tools_called": [
+                    "order_analysis",
+                    "inventory_analysis",
+                    "knowledge_retrieval",
+                    "ops_case_analysis",
+                ],
+                "status": "completed",
+                "interrupt": None,
+            }
+        except Exception as exc:
+            return {
+                "path": "ops_case",
+                "reply": f"Ops case error: {exc}",
+                "tools_called": ["ops_case_analysis"],
+                "status": "error",
+                "interrupt": None,
+            }
 
     def _run_agent_path(self, order_id: str, question: str) -> dict:
         """运行 Agent 路径。"""
@@ -812,16 +976,26 @@ class HybridService:
             final_answer = (
                 result.final_answer.conclusion if result.final_answer else ""
             )
-            tools_called = ["dispatch", "order_analysis", "inventory_analysis"]
+            tools_called = [
+                "dispatch",
+                "order_analysis",
+                "inventory_analysis",
+                "proposal_generation",
+                "human_approval",
+            ]
             if result.final_answer and result.final_answer.routing_path == "knowledge_path":
                 tools_called.append("knowledge_retrieval")
             tools_called.append("finalize")
+            action_card = self._action_card_from_result(result)
             return {
                 "path": "workflow",
                 "reply": final_answer,
                 "tools_called": tools_called,
                 "status": "completed",
                 "interrupt": None,
+                "action_card": action_card,
+                "preflight_validation": self._preflight_from_result(result),
+                "rag_context": self._rag_context_from_action_card(action_card),
             }
         except Exception as exc:
             return {
@@ -845,6 +1019,7 @@ class HybridService:
                 "chat",
                 "workflow",
                 "rag",
+                "ops_case",
                 "agent",
                 *(["multi_agent"] if self.multi_agent_service else []),
             ],
@@ -852,12 +1027,19 @@ class HybridService:
         }
 
     @staticmethod
-    def _cache_context(filter_categories: list | None) -> str:
+    def _cache_context(filter_categories: list | None, session_memory: dict[str, Any] | None = None) -> str:
         """构造响应缓存上下文。
 
         真实生产里这里应接订单更新时间、库存快照版本、知识库版本和模型 ID。
-        当前项目先把知识类别过滤纳入 key，避免不同过滤条件复用同一答案。
+        当前项目先把知识类别过滤和短期记忆摘要纳入 key，避免不同上下文复用同一答案。
         """
-        if not filter_categories:
-            return ""
-        return "filters:" + ",".join(sorted(str(item) for item in filter_categories))
+        parts: list[str] = []
+        if filter_categories:
+            parts.append("filters:" + ",".join(sorted(str(item) for item in filter_categories)))
+        if session_memory:
+            structured = session_memory.get("structured", {})
+            digest = hashlib.sha256(
+                json.dumps(structured, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            parts.append(f"memory:{digest}")
+        return "|".join(parts)

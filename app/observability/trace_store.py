@@ -1,7 +1,7 @@
-"""业务 Trace 与审计事件的 MySQL 持久化层。
+"""业务 Trace 与审计事件的 PostgreSQL 持久化层。
 
 生产策略：
-- Trace、Step、Audit Event 统一写 MySQL。
+- Trace、Step、Audit Event 统一写 PostgreSQL。
 - 不再使用 SQLite 本地文件，避免多实例部署时链路数据分散。
 - 这里只保存摘要、脱敏 metadata 和 evidence，不保存完整 prompt 或客户隐私原文。
 """
@@ -33,6 +33,8 @@ def _json(data: Any) -> str:
 def _decode(raw: str | bytes | None, fallback: Any) -> Any:
     if not raw:
         return fallback
+    if isinstance(raw, (dict, list)):
+        return raw
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
     try:
@@ -41,13 +43,13 @@ def _decode(raw: str | bytes | None, fallback: Any) -> Any:
         return fallback
 
 
-class MySQLTraceStore:
-    """给中间件和 Trace API 使用的 MySQL 存储。"""
+class PostgreSQLTraceStore:
+    """给中间件和 Trace API 使用的 PostgreSQL 存储。"""
 
-    def __init__(self, mysql_url: str) -> None:
-        if not mysql_url:
-            raise RuntimeError("Business Trace 必须配置 MYSQL_URL，生产模式不允许使用 SQLite。")
-        self._engine = create_engine(mysql_url, pool_pre_ping=True, pool_recycle=1800, future=True)
+    def __init__(self, database_url: str) -> None:
+        if not database_url:
+            raise RuntimeError("Business Trace 必须配置 DATABASE_URL/POSTGRES_URL，生产模式不允许使用 SQLite。")
+        self._engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=1800, future=True)
         self._initialized = False
         self.init()
 
@@ -69,14 +71,14 @@ class MySQLTraceStore:
                     error_message TEXT,
                     started_at VARCHAR(64),
                     ended_at VARCHAR(64),
-                    duration_ms DOUBLE,
-                    metadata_json LONGTEXT,
-                    KEY idx_trace_runs_order_id (order_id),
-                    KEY idx_trace_runs_route (route),
-                    KEY idx_trace_runs_started_at (started_at),
-                    KEY idx_trace_runs_status (status)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    duration_ms DOUBLE PRECISION,
+                    metadata_json JSONB
+                )
             """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_runs_order_id ON trace_runs (order_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_runs_route ON trace_runs (route)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_runs_started_at ON trace_runs (started_at)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_runs_status ON trace_runs (status)"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS trace_steps (
                     id VARCHAR(128) PRIMARY KEY,
@@ -88,24 +90,24 @@ class MySQLTraceStore:
                     status VARCHAR(64),
                     started_at VARCHAR(64),
                     ended_at VARCHAR(64),
-                    duration_ms DOUBLE,
+                    duration_ms DOUBLE PRECISION,
                     summary TEXT,
                     error_code VARCHAR(128),
                     error_message TEXT,
                     input_summary TEXT,
                     output_summary TEXT,
-                    metadata_json LONGTEXT,
-                    evidence_json LONGTEXT,
-                    KEY idx_trace_steps_trace_id (trace_id),
-                    KEY idx_trace_steps_parent_id (parent_id),
-                    KEY idx_trace_steps_type (type),
-                    KEY idx_trace_steps_name (name),
-                    KEY idx_trace_steps_status (status),
+                    metadata_json JSONB,
+                    evidence_json JSONB,
                     CONSTRAINT fk_trace_steps_trace
                         FOREIGN KEY (trace_id) REFERENCES trace_runs(trace_id)
                         ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                )
             """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_steps_trace_id ON trace_steps (trace_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_steps_parent_id ON trace_steps (parent_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_steps_type ON trace_steps (type)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_steps_name ON trace_steps (name)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trace_steps_status ON trace_steps (status)"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id VARCHAR(128) PRIMARY KEY,
@@ -120,11 +122,11 @@ class MySQLTraceStore:
                     status VARCHAR(64),
                     created_at VARCHAR(64),
                     summary TEXT,
-                    metadata_json LONGTEXT,
-                    KEY idx_audit_events_order_id (order_id),
-                    KEY idx_audit_events_trace_id (trace_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    metadata_json JSONB
+                )
             """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_order_id ON audit_events (order_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_events_trace_id ON audit_events (trace_id)"))
         self._initialized = True
 
     def save_trace(self, trace: dict[str, Any]) -> None:
@@ -142,20 +144,20 @@ class MySQLTraceStore:
                         :route, :status, :error_code, :error_message, :started_at, :ended_at,
                         :duration_ms, :metadata_json
                     )
-                    ON DUPLICATE KEY UPDATE
-                        request_id=VALUES(request_id),
-                        session_id=VALUES(session_id),
-                        tenant_id=VALUES(tenant_id),
-                        user_id=VALUES(user_id),
-                        order_id=VALUES(order_id),
-                        route=VALUES(route),
-                        status=VALUES(status),
-                        error_code=VALUES(error_code),
-                        error_message=VALUES(error_message),
-                        started_at=VALUES(started_at),
-                        ended_at=VALUES(ended_at),
-                        duration_ms=VALUES(duration_ms),
-                        metadata_json=VALUES(metadata_json)
+                    ON CONFLICT (trace_id) DO UPDATE SET
+                        request_id=EXCLUDED.request_id,
+                        session_id=EXCLUDED.session_id,
+                        tenant_id=EXCLUDED.tenant_id,
+                        user_id=EXCLUDED.user_id,
+                        order_id=EXCLUDED.order_id,
+                        route=EXCLUDED.route,
+                        status=EXCLUDED.status,
+                        error_code=EXCLUDED.error_code,
+                        error_message=EXCLUDED.error_message,
+                        started_at=EXCLUDED.started_at,
+                        ended_at=EXCLUDED.ended_at,
+                        duration_ms=EXCLUDED.duration_ms,
+                        metadata_json=EXCLUDED.metadata_json
                 """),
                 {
                     "trace_id": trace_id,
@@ -225,10 +227,10 @@ class MySQLTraceStore:
                         :event_type, :action, :actor_type, :status, :created_at, :summary,
                         :metadata_json
                     )
-                    ON DUPLICATE KEY UPDATE
-                        status=VALUES(status),
-                        summary=VALUES(summary),
-                        metadata_json=VALUES(metadata_json)
+                    ON CONFLICT (id) DO UPDATE SET
+                        status=EXCLUDED.status,
+                        summary=EXCLUDED.summary,
+                        metadata_json=EXCLUDED.metadata_json
                 """),
                 {
                     "id": event.get("id"),
@@ -311,12 +313,12 @@ class MySQLTraceStore:
             params["step_type"] = step_type
         if model_id:
             clauses.append(
-                "EXISTS (SELECT 1 FROM trace_steps s WHERE s.trace_id = r.trace_id AND s.metadata_json LIKE :model_id)"
+                "EXISTS (SELECT 1 FROM trace_steps s WHERE s.trace_id = r.trace_id AND s.metadata_json::text LIKE :model_id)"
             )
             params["model_id"] = f"%{model_id}%"
         if prompt_id:
             clauses.append(
-                "EXISTS (SELECT 1 FROM trace_steps s WHERE s.trace_id = r.trace_id AND s.metadata_json LIKE :prompt_id)"
+                "EXISTS (SELECT 1 FROM trace_steps s WHERE s.trace_id = r.trace_id AND s.metadata_json::text LIKE :prompt_id)"
             )
             params["prompt_id"] = f"%{prompt_id}%"
         if min_duration_ms is not None:
@@ -432,12 +434,12 @@ class MySQLTraceStore:
         }
 
 
-_STORE: MySQLTraceStore | None = None
+_STORE: PostgreSQLTraceStore | None = None
 
 
-def get_trace_store() -> MySQLTraceStore:
+def get_trace_store() -> PostgreSQLTraceStore:
     global _STORE
     if _STORE is None:
-        _STORE = MySQLTraceStore(get_settings().mysql_url)
+        _STORE = PostgreSQLTraceStore(get_settings().effective_database_url)
     return _STORE
 

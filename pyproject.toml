@@ -1,7 +1,7 @@
 [project]
-name = "multiship-agent"
+name = "fulfillops-agent"
 version = "0.1.0"
-description = "全域电商供应链智能履约多Agent平台学习型演示项目"
+description = "电商履约运营智能协同 Agent"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,9 +10,7 @@ dependencies = [
     "pydantic-settings>=2.9.1,<3.0.0",
     "sqlalchemy>=2.0.40,<3.0.0",
     "alembic>=1.15.2,<2.0.0",
-    "redis>=5.2.1,<6.0.0",
-    "pymysql>=1.1.1,<2.0.0",
-    "pymilvus>=2.5.6,<3.0.0",
+    "psycopg[binary]>=3.2.3,<4.0.0",
     "langchain>=1.0.0,<2.0.0",
     "langgraph>=1.0.0,<2.0.0",
     "llama-index>=0.12.33,<0.13.0",
@@ -25,7 +23,6 @@ dependencies = [
     "langchain-mcp-adapters>=0.0.1",
     "langchain-community>=0.4.1",
     "llama-index-retrievers-bm25>=0.5.2",
-    "langgraph-checkpoint-redis>=0.4.1",
     # ── Agent Evaluation ──────────────────────────────────────────────
     "ragas>=0.2.0",            # RAG 质量指标（faithfulness / answer_relevancy）
     "deepeval>=2.0.0",         # CI 回归测试框架（AnswerRelevancy / GEval）
@@ -35,9 +32,11 @@ dependencies = [
     "llama-index-embeddings-huggingface>=0.5.5",
     "pyyaml>=6.0.3",
     "prometheus-client>=0.25.0",
-    "llama-index-vector-stores-milvus>=0.8.7",
+    "pgvector>=0.3.6,<1.0.0",
+    "llama-index-vector-stores-postgres>=0.4.2,<0.5.0",
     "pdfplumber>=0.11.5",
     "python-docx>=1.1.2",
+    "python-pptx>=1.0.2",
     "charset-normalizer>=3.4.0",
 ]
 

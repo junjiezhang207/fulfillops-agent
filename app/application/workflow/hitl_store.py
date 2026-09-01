@@ -1,8 +1,8 @@
 """Workflow 生产状态存储。
 
 包含两类生产状态：
-- Workflow 幂等结果：写 Redis，保证多实例重复请求能共享状态。
-- HITL 人工审核任务：写 MySQL，保证待审、决策和审计可查询。
+- Workflow 幂等结果：写 PostgreSQL，保证多实例重复请求能共享状态。
+- HITL 人工审核任务：写 PostgreSQL，保证待审、决策和审计可查询。
 """
 
 from __future__ import annotations
@@ -27,60 +27,111 @@ def _json_dump(payload: Any) -> str:
 def _json_load(payload: str | bytes | None) -> Any:
     if not payload:
         return {}
+    if isinstance(payload, (dict, list)):
+        return payload
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8")
     return json.loads(payload)
 
 
-class RedisWorkflowIdempotencyStore:
+class PostgreSQLWorkflowIdempotencyStore:
     """Workflow 幂等存储。
 
-    Redis key 中保存完整 WorkflowRunResult JSON。结果体如果后续变大，可以改成
-    Redis 保存状态与 result_id，MySQL 保存完整结果；对外接口保持不变。
+    PostgreSQL 中保存完整 WorkflowRunResult JSON。结果体如果后续变大，可以拆为
+    状态表和结果表；对外接口保持不变。
     """
 
-    def __init__(self, redis_url: str, ttl_seconds: int = 300) -> None:
-        if not redis_url:
-            raise RuntimeError("Workflow 幂等必须配置 REDIS_URL，生产模式不允许使用内存缓存。")
-        import redis
-
+    def __init__(self, database_url: str, ttl_seconds: int = 300) -> None:
+        if not database_url:
+            raise RuntimeError("Workflow 幂等必须配置 DATABASE_URL/POSTGRES_URL，生产模式不允许使用内存缓存。")
         self.ttl_seconds = int(ttl_seconds)
-        self._client = redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
+        self._engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=1800, future=True)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_idempotency_results (
+                    idempotency_key VARCHAR(128) PRIMARY KEY,
+                    result_json JSONB NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_workflow_idempotency_expires
+                ON workflow_idempotency_results (expires_at)
+            """))
+
+    def _delete_expired(self, conn) -> None:
+        conn.execute(
+            text("DELETE FROM workflow_idempotency_results WHERE expires_at <= :now"),
+            {"now": _utc_now().replace(tzinfo=None)},
         )
-        self._client.ping()
 
     @staticmethod
     def make_key(request: WorkflowRunRequest) -> str:
         import hashlib
 
-        content = (
-            f"{request.order_id}:{request.question or ''}:"
-            f"{sorted(request.filter_categories or [])}"
+        content = _json_dump(
+            {
+                "order_id": request.order_id,
+                "question": request.question or "",
+                "filter_categories": sorted(request.filter_categories or []),
+                "session_memory": request.session_memory or {},
+            }
         )
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        return f"multiship:workflow:idempotency:{digest}"
+        return f"fulfillops:workflow:idempotency:{digest}"
 
     def get(self, key: str) -> WorkflowRunResult | None:
-        payload = self._client.get(key)
-        if not payload:
+        with self._engine.begin() as conn:
+            self._delete_expired(conn)
+            row = conn.execute(
+                text("""
+                    SELECT result_json
+                    FROM workflow_idempotency_results
+                    WHERE idempotency_key=:idempotency_key AND expires_at > :now
+                """),
+                {"idempotency_key": key, "now": _utc_now().replace(tzinfo=None)},
+            ).mappings().first()
+        if row is None:
             return None
-        return WorkflowRunResult.model_validate_json(payload)
+        return WorkflowRunResult.model_validate(_json_load(row["result_json"]))
 
     def set(self, key: str, result: WorkflowRunResult) -> None:
-        self._client.setex(key, self.ttl_seconds, result.model_dump_json())
+        now = _utc_now().replace(tzinfo=None)
+        expires_at = now + timedelta(seconds=self.ttl_seconds)
+        with self._engine.begin() as conn:
+            self._delete_expired(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_idempotency_results (
+                        idempotency_key, result_json, created_at, expires_at
+                    ) VALUES (
+                        :idempotency_key, :result_json, :created_at, :expires_at
+                    )
+                    ON CONFLICT (idempotency_key) DO UPDATE SET
+                        result_json=EXCLUDED.result_json,
+                        created_at=EXCLUDED.created_at,
+                        expires_at=EXCLUDED.expires_at
+                """),
+                {
+                    "idempotency_key": key,
+                    "result_json": result.model_dump_json(),
+                    "created_at": now,
+                    "expires_at": expires_at,
+                },
+            )
 
 
-class MySQLHitlStore:
-    """HITL 审批状态 MySQL 存储。"""
+class PostgreSQLHitlStore:
+    """HITL 审批状态 PostgreSQL 存储。"""
 
-    def __init__(self, mysql_url: str) -> None:
-        if not mysql_url:
-            raise RuntimeError("HITL 状态必须配置 MYSQL_URL，生产模式不允许使用进程内存。")
-        self._engine = create_engine(mysql_url, pool_pre_ping=True, pool_recycle=1800, future=True)
+    def __init__(self, database_url: str) -> None:
+        if not database_url:
+            raise RuntimeError("HITL 状态必须配置 DATABASE_URL/POSTGRES_URL，生产模式不允许使用进程内存。")
+        self._engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=1800, future=True)
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -92,39 +143,38 @@ class MySQLHitlStore:
                     interrupt_type VARCHAR(64) NOT NULL,
                     node VARCHAR(128) NOT NULL,
                     risk_level VARCHAR(32) NOT NULL,
-                    risk_signals_json LONGTEXT NOT NULL,
+                    risk_signals_json JSONB NOT NULL,
                     prompt TEXT NOT NULL,
-                    context_json LONGTEXT NOT NULL,
-                    options_json LONGTEXT NOT NULL,
+                    context_json JSONB NOT NULL,
+                    options_json JSONB NOT NULL,
                     status VARCHAR(32) NOT NULL,
-                    requested_at DATETIME(6) NOT NULL,
-                    expires_at DATETIME(6) NULL,
-                    decided_at DATETIME(6) NULL,
+                    requested_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NULL,
+                    decided_at TIMESTAMP NULL,
                     decision VARCHAR(32) NULL,
                     reason TEXT NULL,
-                    approver_id VARCHAR(128) NULL,
-                    KEY idx_hitl_tasks_order_id (order_id),
-                    KEY idx_hitl_tasks_status (status),
-                    KEY idx_hitl_tasks_requested_at (requested_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    approver_id VARCHAR(128) NULL
+                )
             """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hitl_tasks_order_id ON hitl_tasks (order_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hitl_tasks_status ON hitl_tasks (status)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hitl_tasks_requested_at ON hitl_tasks (requested_at)"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS hitl_decisions (
-                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    id BIGSERIAL PRIMARY KEY,
                     thread_id VARCHAR(160) NOT NULL,
                     order_id VARCHAR(128) NOT NULL,
                     decision VARCHAR(32) NOT NULL,
                     reason TEXT NOT NULL,
                     approver_id VARCHAR(128) NOT NULL,
-                    created_at DATETIME(6) NOT NULL,
-                    PRIMARY KEY (id),
-                    KEY idx_hitl_decisions_thread_id (thread_id),
-                    KEY idx_hitl_decisions_order_id (order_id),
+                    created_at TIMESTAMP NOT NULL,
                     CONSTRAINT fk_hitl_decisions_task
                         FOREIGN KEY (thread_id) REFERENCES hitl_tasks(thread_id)
                         ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                )
             """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hitl_decisions_thread_id ON hitl_decisions (thread_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hitl_decisions_order_id ON hitl_decisions (order_id)"))
 
     def upsert_task(self, *, order_id: str, interrupt: InterruptEvent) -> None:
         requested_at = _utc_now()
@@ -141,18 +191,18 @@ class MySQLHitlStore:
                         :risk_signals_json, :prompt, :context_json, :options_json,
                         'pending', :requested_at, :expires_at
                     )
-                    ON DUPLICATE KEY UPDATE
-                        order_id=VALUES(order_id),
-                        interrupt_type=VALUES(interrupt_type),
-                        node=VALUES(node),
-                        risk_level=VALUES(risk_level),
-                        risk_signals_json=VALUES(risk_signals_json),
-                        prompt=VALUES(prompt),
-                        context_json=VALUES(context_json),
-                        options_json=VALUES(options_json),
+                    ON CONFLICT (thread_id) DO UPDATE SET
+                        order_id=EXCLUDED.order_id,
+                        interrupt_type=EXCLUDED.interrupt_type,
+                        node=EXCLUDED.node,
+                        risk_level=EXCLUDED.risk_level,
+                        risk_signals_json=EXCLUDED.risk_signals_json,
+                        prompt=EXCLUDED.prompt,
+                        context_json=EXCLUDED.context_json,
+                        options_json=EXCLUDED.options_json,
                         status='pending',
-                        requested_at=VALUES(requested_at),
-                        expires_at=VALUES(expires_at),
+                        requested_at=EXCLUDED.requested_at,
+                        expires_at=EXCLUDED.expires_at,
                         decided_at=NULL,
                         decision=NULL,
                         reason=NULL,

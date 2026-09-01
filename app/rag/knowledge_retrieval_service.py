@@ -27,6 +27,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from llama_index.core import (
     Settings,
@@ -118,11 +119,19 @@ RAG_KEYWORD_TERMS = (
     "售后",
     "SOP",
     "SKU",
+    "优秀案例",
+    "历史案例",
+    "相似案例",
+    "案例",
+    "复盘",
 )
 
 # 文件名关键字 -> 业务知识分类。
 # 这里不是为了“硬编码业务”，而是给 Markdown 知识文件建立最基础的可过滤标签。
 CATEGORY_BY_FILE_KEYWORD = {
+    "excellent_case": "excellent_case",
+    "excellent-case": "excellent_case",
+    "excellent_cases": "excellent_case",
     "stockout": "stockout_rule",
     "priority": "priority_rule",
     "regional": "regional_strategy",
@@ -143,6 +152,13 @@ CATEGORY_BY_INTENT = {
 }
 
 CATEGORY_ALIASES = {
+    "excellent_case": "excellent_case",
+    "excellent-case": "excellent_case",
+    "excellent_cases": "excellent_case",
+    "优秀案例": "excellent_case",
+    "历史案例": "excellent_case",
+    "相似案例": "excellent_case",
+    "案例": "excellent_case",
     "stockout": "stockout_rule",
     "缺货": "stockout_rule",
     "缺货处理": "stockout_rule",
@@ -160,6 +176,16 @@ CATEGORY_ALIASES = {
     "通用": "general",
     "general": "general",
 }
+
+EXCELLENT_CASE_TERMS = ("优秀案例", "历史案例", "相似案例", "案例", "复盘", "best practice")
+EXCELLENT_CASE_BOOST = 0.18
+
+
+def normalize_knowledge_category(value: object) -> str:
+    """Normalize user/file/front-matter category names to stable RAG categories."""
+
+    normalized = str(value or "").strip()
+    return CATEGORY_ALIASES.get(normalized, CATEGORY_ALIASES.get(normalized.lower(), normalized or "general"))
 
 
 class KnowledgeFrontMatterExtractor(TransformComponent):
@@ -268,7 +294,13 @@ class MarkdownSectionSplitter(TransformComponent):
             sections = self._split_markdown_sections(node.get_content())
             if not sections:
                 # 没有 Markdown 标题时退回普通切片，保证纯文本/简单文档也能入库。
-                output.extend(self._split_with_metadata(splitter, text, metadata))
+                parent_metadata = {
+                    **metadata,
+                    "_parent_section_path": [],
+                    "_parent_context": self._parent_context(text),
+                    "_business_unit_type": self._infer_business_unit_type([], text),
+                }
+                output.extend(self._split_with_metadata(splitter, text, parent_metadata))
                 continue
             for section_path, section_text in sections:
                 section_metadata = dict(metadata)
@@ -277,6 +309,9 @@ class MarkdownSectionSplitter(TransformComponent):
                     # 后面 BusinessMetadataEnricher 会转换成稳定的 title/section_path。
                     section_metadata["_markdown_title"] = section_path[0]
                     section_metadata["_markdown_section_path"] = section_path
+                section_metadata["_parent_section_path"] = section_path
+                section_metadata["_parent_context"] = self._parent_context(section_text)
+                section_metadata["_business_unit_type"] = self._infer_business_unit_type(section_path, section_text)
                 output.extend(self._split_with_metadata(splitter, section_text.strip(), section_metadata))
         return output
 
@@ -294,9 +329,32 @@ class MarkdownSectionSplitter(TransformComponent):
         """
 
         chunks = list(splitter([TextNode(text=text, metadata={})]))
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
             chunk.metadata.update(metadata)
+            chunk.metadata["_child_index_in_parent"] = index
+            chunk.metadata["_child_count_in_parent"] = len(chunks)
         return chunks
+
+    @staticmethod
+    def _parent_context(text: str, max_chars: int = 4000) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        return normalized if len(normalized) <= max_chars else f"{normalized[:max_chars]}...<truncated>"
+
+    @staticmethod
+    def _infer_business_unit_type(section_path: list[str], text: str) -> str:
+        haystack = " ".join([*section_path, text[:400]]).lower()
+        patterns = (
+            ("scope", ("scope", "范围", "适用", "业务范围")),
+            ("prerequisite", ("prerequisite", "前置", "前提", "先决条件", "触发条件")),
+            ("exception", ("exception", "异常", "例外", "失败", "冲突")),
+            ("escalation", ("escalation", "升级", "人工", "主管", "审批", "转交")),
+            ("procedure", ("procedure", "流程", "步骤", "操作", "处理", "执行")),
+            ("rule", ("rule", "规则", "不得", "必须", "应当", "标准")),
+        )
+        for unit_type, markers in patterns:
+            if any(marker in haystack for marker in markers):
+                return unit_type
+        return "general"
 
     @staticmethod
     def _split_markdown_sections(text: str) -> list[tuple[list[str], str]]:
@@ -385,7 +443,7 @@ class BusinessMetadataEnricher(TransformComponent):
             source_path = str(node.metadata.get("file_path") or node.metadata.get("filename") or "unknown")
             source_file = Path(source_path).name
             # 通过文件名推断知识类别，例如 stockout_rules.md -> stockout_rule。
-            category = self._normalize_category(
+            category = normalize_knowledge_category(
                 str(node.metadata.get("category") or self._infer_category(source_file))
             )
             # document_id 用文件名去掉 .md，方便前端或日志展示。
@@ -398,7 +456,7 @@ class BusinessMetadataEnricher(TransformComponent):
             # chunk_id 必须稳定：同一个文档同一个切片顺序生成相同 id。
             # 后面向量 + BM25 融合去重时，就靠这个字段判断是不是同一段知识。
             # 注意这里必须按 document_id 独立计数，不能用整批节点的 enumerate。
-            # 否则 A 文档切片数量变化后，B 文档的 chunk 编号也会漂移，Milvus 旧数据就很难清理干净。
+            # 否则 A 文档切片数量变化后，B 文档的 chunk 编号也会漂移，PGVector 旧数据就很难清理干净。
             order = chunk_counters.get(document_id, 0)
             chunk_counters[document_id] = order + 1
             chunk_id = f"{document_id}::chunk-{order:04d}"
@@ -415,6 +473,10 @@ class BusinessMetadataEnricher(TransformComponent):
                 node.metadata.get("_markdown_section_path")
                 or self._extract_section_path(node.get_content(), title)
             )
+            parent_section_path = list(node.metadata.get("_parent_section_path") or section_path)
+            parent_basis = "::".join(parent_section_path or [title, document_id])
+            parent_hash = hashlib.sha1(parent_basis.encode("utf-8")).hexdigest()[:10]
+            parent_chunk_id = str(node.metadata.get("parent_chunk_id") or f"{document_id}::parent-{parent_hash}")
             explicit_tags = node.metadata.get("tags", [])
             if isinstance(explicit_tags, str):
                 explicit_tags = [explicit_tags]
@@ -423,12 +485,18 @@ class BusinessMetadataEnricher(TransformComponent):
                 business_scope = [business_scope]
             tags = sorted(set([category, *section_path, *explicit_tags, *business_scope]))
 
-            # metadata 会随 node 一起写入向量库。Milvus/本地索引都可以用这些字段过滤或展示。
+            # metadata 会随 node 一起写入向量库。PGVector/本地索引都可以用这些字段过滤或展示。
             node.metadata.update(
                 {
                     "category": category,
                     "document_id": document_id,
                     "chunk_id": chunk_id,
+                    "parent_chunk_id": parent_chunk_id,
+                    "parent_section_path": parent_section_path,
+                    "parent_context_excerpt": str(node.metadata.get("_parent_context", "")),
+                    "child_index_in_parent": int(node.metadata.get("_child_index_in_parent", order)),
+                    "child_count_in_parent": int(node.metadata.get("_child_count_in_parent", 1)),
+                    "business_unit_type": str(node.metadata.get("_business_unit_type", "general")),
                     "title": title,
                     "section_path": section_path,
                     "tags": tags,
@@ -442,13 +510,15 @@ class BusinessMetadataEnricher(TransformComponent):
                     "expires_at": str(node.metadata.get("expires_at", "")),
                     "region": str(node.metadata.get("region", "")),
                     "business_scope": list(business_scope),
+                    "knowledge_source": str(node.metadata.get("knowledge_source", "")),
+                    "collection_name": str(node.metadata.get("collection_name", "")),
+                    "version_status": str(node.metadata.get("version_status", "")),
+                    "is_active": str(node.metadata.get("is_active", "")),
+                    "vector_backend": str(node.metadata.get("vector_backend", "")),
+                    "source_case_id": str(node.metadata.get("source_case_id", "")),
                 }
             )
         return nodes
-
-    def _normalize_category(self, value: str) -> str:
-        normalized = value.strip()
-        return CATEGORY_ALIASES.get(normalized, CATEGORY_ALIASES.get(normalized.lower(), normalized or "general"))
 
     def _infer_category(self, source_file: str) -> str:
         """根据文件名推断业务类别。
@@ -537,6 +607,7 @@ class BusinessRulePostprocessor(BaseNodePostprocessor):
             return nodes
 
         intent = self.current_intent
+        query_text = query_bundle.query_str if query_bundle is not None else ""
         # 主意图只会有一个，比如 STOCKOUT_HANDLING。
         primary_category = CATEGORY_BY_INTENT.get(intent.primary_intent)
         # 次意图可能有多个，比如同时涉及区域策略和拆单规则。
@@ -555,6 +626,8 @@ class BusinessRulePostprocessor(BaseNodePostprocessor):
             # 次意图只做轻微加权，避免把真正高相似文本挤掉。
             elif category in secondary_categories:
                 rule_boost = SECONDARY_INTENT_BOOST
+            if category == "excellent_case" and self._should_boost_excellent_case(intent, query_text):
+                rule_boost = max(rule_boost, EXCELLENT_CASE_BOOST)
 
             # node_with_score.score 可能为 None，所以用 0.0 兜底。
             base_score = float(node_with_score.score or 0.0)
@@ -570,6 +643,19 @@ class BusinessRulePostprocessor(BaseNodePostprocessor):
             reranked.append(NodeWithScore(node=node_with_score.node, score=adjusted_score))
 
         return sorted(reranked, key=lambda n: n.score or 0.0, reverse=True)
+
+    @staticmethod
+    def _should_boost_excellent_case(intent: QueryIntent, query_text: str) -> bool:
+        normalized_query = query_text.lower()
+        if any(term.lower() in normalized_query for term in EXCELLENT_CASE_TERMS):
+            return True
+        return intent.primary_intent in {
+            QueryIntentType.STOCKOUT_HANDLING,
+            QueryIntentType.PRIORITY_FULFILLMENT,
+            QueryIntentType.REGIONAL_STRATEGY,
+            QueryIntentType.SPLIT_MERGE,
+            QueryIntentType.AFTER_SALES,
+        }
 
 
 class KnowledgeRetrievalService:
@@ -613,7 +699,7 @@ class KnowledgeRetrievalService:
         # 如果调用 warmup_index()，也可以在启动阶段主动构建，避免用户第一次提问超时。
         self._index: VectorStoreIndex | None = None
         # 当前知识库切出来的 TextNode。BM25 必须基于内存节点构建。
-        # 即使用 Milvus 做外部向量库，BM25 仍然需要这些本地文本节点。
+        # 即使用 PGVector 做外部向量库，BM25 仍然需要这些本地文本节点。
         self._nodes: list[TextNode] = []
         # BM25 关键词检索器懒加载缓存。
         self._bm25_retriever: BM25Retriever | None = None
@@ -632,12 +718,12 @@ class KnowledgeRetrievalService:
         self._answer_builder = RAGAnswerBuilder()
 
         self._settings = get_settings()
-        # Embedding/RAG 向量库可能会加载本地模型或连接 Milvus，放到第一次检索时懒初始化，
+        # Embedding/RAG 向量库可能会加载本地模型或连接 PGVector，放到第一次检索时懒初始化，
         # 避免 FastAPI 启动阶段被模型权重加载卡住。
         self._embed_model = None
         self._vector_store = None
         # 多个请求同时第一次进入 RAG 时，只允许一个线程真正构建索引。
-        # 否则本地开发会出现重复 embedding、重复写 Milvus、接口一起超时的问题。
+        # 否则本地开发会出现重复 embedding、重复写 PGVector、接口一起超时的问题。
         self._index_build_lock = threading.Lock()
         # 最近一次重建时的文档变化摘要，用于 API 返回和排查“旧文档是否已清理”。
         self._last_registry_changes: list[dict[str, object]] = []
@@ -658,6 +744,7 @@ class KnowledgeRetrievalService:
         order_id: str | None = None,
         question: str = "",
         filter_categories: list[str] | None = None,
+        session_memory: dict[str, Any] | None = None,
     ) -> KnowledgeRetrieveResult:
         """同步检索入口。
 
@@ -677,7 +764,7 @@ class KnowledgeRetrievalService:
         normalized_order_id = self._normalize_order_id(order_id)
         try:
             # 这一层会根据是否有订单号，选择“订单上下文检索”或“纯知识库检索”。
-            prepared = self._prepare_retrieval_inputs(normalized_order_id, question, filter_categories)
+            prepared = self._prepare_retrieval_inputs(normalized_order_id, question, filter_categories, session_memory)
             # retrieved 仍然是框架内部的 NodeWithScore，不急着转业务 schema。
             retrieved = self._retrieve_nodes(question, prepared)
             # 排序阶段会写入 score_detail 需要的 metadata，再统一转 KnowledgeHit。
@@ -716,6 +803,8 @@ class KnowledgeRetrievalService:
                     {
                         "source_file": hit.metadata.source_file,
                         "chunk_id": hit.metadata.chunk_id,
+                        "parent_chunk_id": getattr(hit.metadata, "parent_chunk_id", ""),
+                        "business_unit_type": getattr(hit.metadata, "business_unit_type", ""),
                         "title": hit.metadata.title,
                         "score": hit.score,
                     }
@@ -747,6 +836,7 @@ class KnowledgeRetrievalService:
         order_id: str | None = None,
         question: str = "",
         filter_categories: list[str] | None = None,
+        session_memory: dict[str, Any] | None = None,
     ) -> "KnowledgeRetrieveResult":
         """异步检索入口。
 
@@ -759,7 +849,7 @@ class KnowledgeRetrievalService:
         started_at = time.monotonic()
         normalized_order_id = self._normalize_order_id(order_id)
         try:
-            prepared = self._prepare_retrieval_inputs(normalized_order_id, question, filter_categories)
+            prepared = self._prepare_retrieval_inputs(normalized_order_id, question, filter_categories, session_memory)
             retrieved = await self._aretrieve_nodes(question, prepared)
             hits = await self._arank_and_build_hits(question, retrieved, prepared.intent)
             result = self._build_result(
@@ -795,6 +885,8 @@ class KnowledgeRetrievalService:
                     {
                         "source_file": hit.metadata.source_file,
                         "chunk_id": hit.metadata.chunk_id,
+                        "parent_chunk_id": getattr(hit.metadata, "parent_chunk_id", ""),
+                        "business_unit_type": getattr(hit.metadata, "business_unit_type", ""),
                         "title": hit.metadata.title,
                         "score": hit.score,
                     }
@@ -835,6 +927,7 @@ class KnowledgeRetrievalService:
         order_id: str,
         question: str,
         filter_categories: list[str] | None,
+        session_memory: dict[str, Any] | None = None,
     ) -> RetrievalInputs:
         """准备检索需要的上下文对象。
 
@@ -846,14 +939,32 @@ class KnowledgeRetrievalService:
         """
         if order_id:
             # 有订单号时走完整业务链路：查订单、查库存、识别风险，再扩展 query。
-            return self._query_planner.prepare(order_id, question, filter_categories)
+            return self._query_planner.prepare(
+                order_id,
+                question,
+                self._normalize_filter_categories(filter_categories),
+                session_memory=session_memory,
+            )
         # 没有订单号时，不再强行查订单，直接构造“知识库检索”上下文。
-        return self._prepare_without_order(question, filter_categories)
+        return self._prepare_without_order(
+            question,
+            self._normalize_filter_categories(filter_categories),
+            session_memory=session_memory,
+        )
+
+    @staticmethod
+    def _normalize_filter_categories(filter_categories: list[str] | None) -> list[str]:
+        return list(dict.fromkeys(
+            normalize_knowledge_category(category)
+            for category in (filter_categories or [])
+            if str(category or "").strip()
+        ))
 
     def _prepare_without_order(
         self,
         question: str,
         filter_categories: list[str] | None,
+        session_memory: dict[str, Any] | None = None,
     ) -> RetrievalInputs:
         """构造无订单知识库检索上下文。
 
@@ -891,6 +1002,7 @@ class KnowledgeRetrievalService:
             intent=intent,
             retrieval_context=retrieval_context,
             has_order_context=False,
+            session_memory_context=self._query_planner.session_memory_context(session_memory),
         )
 
     def _retrieve_nodes(self, question: str, prepared: RetrievalInputs) -> RetrievedNodes:
@@ -1261,7 +1373,7 @@ class KnowledgeRetrievalService:
             self._bm25_retriever = None
             deleted = sum(1 for change in changes if change["change_type"] == "deleted")
             return f"知识目录为空，已清理 {deleted} 个已删除文档的旧向量记录。"
-        # 重新构建向量索引；本地模式会写缓存，Milvus 模式会写外部向量库。
+        # 重新构建向量索引；本地模式会写缓存，PGVector 模式会写外部向量库。
         self._index = self._build_index(persist=True)
         # BM25 是内存索引，向量索引重建后也要同步刷新。
         self._bm25_retriever = BM25Retriever.from_defaults(
@@ -1293,7 +1405,7 @@ class KnowledgeRetrievalService:
         """优先加载缓存索引，缓存不可用时重新构建。
 
         根据向量后端不同分三种情况：
-        - Milvus 外部向量库：优先判断 collection 里是否已有向量。
+        - PGVector 外部向量库：优先判断表里是否已有向量。
         - 配置了外部向量库但连接失败并降级：不复用旧本地缓存，避免维度不一致。
         - 纯本地模式：通过文档指纹判断 ``storage/knowledge_index`` 是否还能复用。
         """
@@ -1311,7 +1423,7 @@ class KnowledgeRetrievalService:
             return self._build_index(persist=False)
 
         if self._configured_external_vector_store():
-            # 配置期望使用 Milvus/Zilliz，但连接失败后按开发策略回退到了本地存储。
+            # 配置期望使用 PGVector，但连接失败后按开发策略回退到了本地存储。
             # 这种情况下不能复用 storage/knowledge_index 里的旧缓存，因为它可能是
             # 历史低维 embedding（例如旧 BGE 512 维）生成的，容易和当前阿里云 1024 维 query 冲突。
             return self._build_index(persist=False)
@@ -1342,12 +1454,12 @@ class KnowledgeRetrievalService:
         本地开发时最容易超时的点通常不是检索本身，而是第一次请求顺便触发：
         1. 加载 embedding 模型或连接云端 embedding。
         2. 读取所有 Markdown 文档并切片。
-        3. 写入 Milvus 向量库。
+        3. 写入 PGVector 向量库。
         4. 构建 BM25 内存索引。
 
         预热把这些工作提前到启动/手动调用阶段完成，用户真正提问时只做检索和排序。
         """
-        # 先确保向量索引可用；当前配置为 Milvus，这里会完成连接或建库。
+        # 先确保向量索引可用；当前配置为 PGVector，这里会完成连接或建表。
         self._get_or_build_index()
         if self._bm25_retriever is None and self._nodes:
             # 向量索引预热后，顺手把 BM25 也建好。
@@ -1361,7 +1473,7 @@ class KnowledgeRetrievalService:
     def _load_existing_external_index(self, vector_store: object) -> VectorStoreIndex | None:
         """外部向量库已有数据时直接加载，避免每次重启都全量 embedding。
 
-        对 Milvus 这类持久化向量库来说，服务重启后 collection 里的向量还在。
+        对 PGVector 这类持久化向量库来说，服务重启后表里的向量还在。
         如果这里仍然全量构建，就会造成：
         - 启动/首次提问耗时很长。
         - 旧 chunk 没清理干净时可能重复写入。
@@ -1383,8 +1495,8 @@ class KnowledgeRetrievalService:
         """尽量用各后端公开能力判断外部向量库是否已有向量。
 
         不同 LlamaIndex VectorStore 暴露的 collection 属性名不完全一致：
-        - Milvus/LlamaIndex 适配器通常会暴露 collection 相关内部属性。
-        - Milvus/Zilliz 的实现也可能包一层内部对象。
+        - LlamaIndex 向量库适配器通常会暴露 table/collection 相关内部属性。
+        - 具体后端的实现也可能包一层内部对象。
 
         这里不强依赖具体类型，只要对象上有 count() 能力，就用它判断是否已有数据。
         判断失败时返回 False，让后续走安全的重建逻辑。
@@ -1424,7 +1536,7 @@ class KnowledgeRetrievalService:
             # 所以重建前先按旧 registry 里的 chunk_id 删除过期向量，再写入新切片。
             self._delete_stale_vector_chunks(vector_store, changes)
             self._sanitize_node_metadata_for_vector_store(self._nodes)
-            # 外部向量库模式：把 Milvus 等 vector_store 注入 LlamaIndex StorageContext。
+            # 外部向量库模式：把 PGVector vector_store 注入 LlamaIndex StorageContext。
             storage_context = StorageContext.from_defaults(
                 vector_store=vector_store
             )
@@ -1448,7 +1560,7 @@ class KnowledgeRetrievalService:
     def _sanitize_node_metadata_for_vector_store(nodes: list[TextNode]) -> None:
         """写入外部向量库前清洗 metadata。
 
-        Milvus 等向量库通常只接受 str/int/float/None 这类标量 metadata。
+        外部向量库通常只接受 str/int/float/None 这类标量 metadata。
         但项目里的 ``tags``、``section_path``、``business_scope`` 是 list，
         如果直接写入会报错。因此这里把复杂结构序列化成 JSON 字符串。
 
@@ -1585,7 +1697,7 @@ class KnowledgeRetrievalService:
         """写入知识文档注册表。
 
         registry 的核心作用是解决“旧文档污染检索”：
-        下次重建索引时，可以知道旧版本有哪些 chunk_id，从而在 Milvus 里先删旧 chunk。
+        下次重建索引时，可以知道旧版本有哪些 chunk_id，从而在 PGVector 里先删旧 chunk。
 
         last_changes 只保留摘要，不保存完整 stale_chunk_ids，
         是为了让 API 展示足够清晰，同时避免注册表越来越臃肿。
@@ -1700,7 +1812,7 @@ class KnowledgeRetrievalService:
     ) -> list[dict[str, object]]:
         """对比新旧注册表，得到本次重建需要清理的旧 chunk。
 
-        返回中的 stale_chunk_ids 会交给 Milvus delete_nodes。
+        返回中的 stale_chunk_ids 会交给 PGVector delete_nodes。
         - created：新文档，没有旧 chunk 需要删。
         - updated：同 document_id 内容或切片发生变化，先删旧 chunk 再写新 chunk。
         - deleted：文件已不存在，删除旧 chunk。
@@ -1750,14 +1862,14 @@ class KnowledgeRetrievalService:
     ) -> None:
         """在外部向量库中删除过期 chunk。
 
-        LlamaIndex 的 MilvusVectorStore 支持 delete_nodes(node_ids=[...])。
+        LlamaIndex 的 PGVectorStore 支持 delete_nodes(node_ids=[...])。
         这里按 registry 里记录的旧 chunk_id 删除，可以覆盖三类企业常见场景：
         1. 同名文档替换：删旧 chunk，再写新 chunk。
         2. 文档变短：旧版本多出来的 chunk 不会残留。
         3. 文档删除：旧文档不会继续被 RAG 命中。
 
         这是外部向量库模式最关键的治理逻辑之一。
-        没有这一步，用户删除或更新文档后，Milvus 里仍可能保留旧向量，
+        没有这一步，用户删除或更新文档后，PGVector 里仍可能保留旧向量，
         RAG 就会回答已经失效的规则。
         """
 
@@ -1821,8 +1933,8 @@ class KnowledgeRetrievalService:
     def _get_vector_store(self):
         """懒创建向量库连接。
 
-        当前项目按配置返回 Milvus/Zilliz vector store。
-        Milvus 不可用时直接抛错，不再回退到本地索引。
+        当前项目按配置返回 PGVector vector store。
+        PGVector 不可用时直接抛错，不再回退到本地索引。
         """
         if self._vector_store is None:
             self._vector_store = create_vector_store(self._settings)
@@ -1836,8 +1948,7 @@ class KnowledgeRetrievalService:
         - 这里仍保留独立判断，便于跳过历史本地缓存复用。
         """
         return str(getattr(self._settings, "vector_store_type", "local") or "local").strip().lower() in {
-            "milvus",
-            "zilliz",
+            "pgvector",
         }
 
     def _get_or_build_bm25_retriever(self) -> BM25Retriever:
@@ -1953,7 +2064,7 @@ class KnowledgeRetrievalService:
         # OR 表示 category 命中任意一个即可。
         return MetadataFilters(
             filters=[
-                ExactMatchFilter(key="category", value=category)
+                ExactMatchFilter(key="category", value=normalize_knowledge_category(category))
                 for category in categories
             ],
             condition=FilterCondition.OR,
@@ -1990,16 +2101,21 @@ class KnowledgeRetrievalService:
         MetadataFilters 只传给了向量 retriever，BM25 retriever 不一定支持同样的过滤。
         所以融合之后还要再过滤一次，保证最终 hits 一定符合 filter_categories。
         """
-        allowed = set(filter_categories or [])
+        allowed = {normalize_knowledge_category(category) for category in (filter_categories or [])}
         seen: dict[str, NodeWithScore] = {}
         for node_with_score in nodes:
             # BM25 可能没有吃到 metadata filter，所以这里再拦一次。
-            if allowed and node_with_score.node.metadata.get("category") not in allowed:
+            if allowed and normalize_knowledge_category(node_with_score.node.metadata.get("category")) not in allowed:
                 continue
             # 过期规则检测必须放在融合后的统一过滤里。
             # 原因：向量检索可以做 metadata filter，但 BM25 召回通常不支持同样的过滤表达式。
             # 如果只在向量侧过滤，过期规则仍可能通过 BM25 混进最终结果。
             if self._is_expired_knowledge(node_with_score.node.metadata.get("expires_at")):
+                continue
+            if self._is_inactive_knowledge(
+                node_with_score.node.metadata.get("is_active"),
+                node_with_score.node.metadata.get("version_status"),
+            ):
                 continue
             node_key = str(
                 node_with_score.node.metadata.get("chunk_id") or node_with_score.node.node_id
@@ -2027,6 +2143,14 @@ class KnowledgeRetrievalService:
         except ValueError:
             return False
         return expires_at < datetime.now(timezone.utc).date()
+
+    @staticmethod
+    def _is_inactive_knowledge(is_active: object, version_status: object) -> bool:
+        if is_active is not None and str(is_active).strip().lower() in {"false", "0", "no", "inactive"}:
+            return True
+        if version_status and str(version_status).strip().lower() not in {"active", "current", "published"}:
+            return True
+        return False
 
     @staticmethod
     def _keyword_overlap_score(text: str, query: str) -> float:
@@ -2108,6 +2232,12 @@ class KnowledgeRetrievalService:
         km = KnowledgeMetadata(
             document_id=str(metadata.get("document_id", "unknown")),
             chunk_id=str(metadata.get("chunk_id", node.node_id)),
+            parent_chunk_id=str(metadata.get("parent_chunk_id", "")),
+            parent_section_path=self._metadata_list(metadata.get("parent_section_path", [])),
+            parent_context_excerpt=str(metadata.get("parent_context_excerpt", "")),
+            child_index_in_parent=int(metadata.get("child_index_in_parent", 0) or 0),
+            child_count_in_parent=int(metadata.get("child_count_in_parent", 1) or 1),
+            business_unit_type=str(metadata.get("business_unit_type", "general")),
             title=str(metadata.get("title", "unknown")),
             section_path=self._metadata_list(metadata.get("section_path", [])),
             tags=self._metadata_list(metadata.get("tags", [])),
@@ -2119,6 +2249,12 @@ class KnowledgeRetrievalService:
             expires_at=str(metadata.get("expires_at", "")),
             region=str(metadata.get("region", "")),
             business_scope=self._metadata_list(metadata.get("business_scope", [])),
+            knowledge_source=str(metadata.get("knowledge_source", "")),
+            collection_name=str(metadata.get("collection_name", "")),
+            version_status=str(metadata.get("version_status", "")),
+            is_active=str(metadata.get("is_active", "")),
+            vector_backend=str(metadata.get("vector_backend", "")),
+            source_case_id=str(metadata.get("source_case_id", "")),
         )
 
         # KnowledgeHit 是最终给 API/Agent 的命中文档片段。
@@ -2139,7 +2275,7 @@ class KnowledgeRetrievalService:
 
         为什么需要这个方法：
         - 本地 LlamaIndex 节点里，``tags``/``section_path`` 可能本来就是 list。
-        - 写入 Milvus 等外部向量库前，复杂 metadata 会被转成 JSON 字符串。
+        - 写入 PGVector 等外部向量库前，复杂 metadata 会被转成 JSON 字符串。
         - 少数情况下字段可能只是普通字符串。
 
         对外返回前统一转成 list，可以让前端和 API schema 不用关心底层存储差异。

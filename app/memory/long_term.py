@@ -5,14 +5,14 @@
   - 历史决策：某个订单最终为什么走了缺货流程。
   - 会话摘要：用户前几次问过什么、系统给过什么承诺。
 
-生产架构通常是“结构化库 + 向量库”：
-  - MySQL 保存精确字段、TTL、审计信息。
-  - Milvus 保存向量索引，支持相似案例检索。
+生产架构使用同一套 PostgreSQL：
+  - 普通表保存精确字段、TTL、审计信息。
+  - PGVector 表保存向量索引，支持相似案例检索。
 
-这个项目现在固定使用 MySQL + Milvus：
-  - MySQL 是权威数据源，保存结构化 value、TTL、审计信息。
-  - Milvus 是可重建语义索引，支持相似案例检索。
-  - Milvus 或 embedding 不可用时直接失败，不允许退回文本检索。
+这个项目现在固定使用 PostgreSQL + PGVector：
+  - PostgreSQL 是权威数据源，保存结构化 value、TTL、审计信息。
+  - PGVector 是可重建的语义索引。
+  - 向量库或 embedding 不可用时直接失败，不允许退回文本检索。
 """
 
 from __future__ import annotations
@@ -102,10 +102,6 @@ def _safe_identifier(name: str) -> str:
     return name
 
 
-def _milvus_quote(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
 def _text_for_search(value: dict[str, Any]) -> str:
     """把结构化记忆压成可检索文本。
 
@@ -186,60 +182,47 @@ class MemoryPolicy:
     default_importance: float = 0.5
 
 
-class MySQLMilvusLongTermMemoryStore(BaseStore):
-    """MySQL + Milvus 长期记忆实现。
+class PostgreSQLPGVectorLongTermMemoryStore(BaseStore):
+    """PostgreSQL + PGVector 长期记忆实现。
 
     企业级拆分原则：
-    - MySQL 是权威数据源，保存结构化 value、namespace、TTL、importance、访问热度和审计。
-    - Milvus 是可重建的语义索引，只保存向量和少量检索元数据。
-    - 写入先落 MySQL，再同步 Milvus；Milvus 不可用时直接失败。
+    - PostgreSQL 是权威数据源，保存结构化 value、namespace、TTL、importance、访问热度和审计。
+    - PGVector 是可重建的语义索引，只保存向量和少量检索元数据。
+    - 写入先落 PostgreSQL 记忆表，再同步 PGVector；PGVector 不可用时直接失败。
     """
 
     def __init__(
         self,
-        mysql_url: str,
+        database_url: str,
         *,
-        milvus_uri: str = "http://localhost:19530",
-        milvus_token: str = "",
-        milvus_database: str = "default",
-        milvus_collection: str = "long_term_memory_vectors_1024",
-        milvus_alias: str = "ltm_milvus",
-        milvus_timeout_seconds: float = 10.0,
-        milvus_similarity_metric: str = "COSINE",
+        pgvector_table: str = "long_term_memory_vectors",
         embedding_model: object | None = None,
         vector_dimension: int = 1024,
         policy: MemoryPolicy | None = None,
         table_name: str = "long_term_memory",
         audit_table_name: str = "long_term_memory_audit",
     ) -> None:
-        if not mysql_url:
-            raise ValueError("使用 MySQL + Milvus 长期记忆时必须配置 MYSQL_URL 或 LONG_TERM_MEMORY_MYSQL_URL")
-        self.mysql_url = mysql_url
+        if not database_url:
+            raise ValueError("使用 PostgreSQL + PGVector 长期记忆时必须配置 DATABASE_URL 或 LONG_TERM_MEMORY_DATABASE_URL")
+        self.database_url = database_url
         self.embedding_model = embedding_model
         self.vector_dimension = int(vector_dimension)
         self.policy = policy or MemoryPolicy()
         self.table_name = _safe_identifier(table_name)
         self.audit_table_name = _safe_identifier(audit_table_name)
-        self.milvus_uri = milvus_uri
-        self.milvus_token = milvus_token
-        self.milvus_database = milvus_database or "default"
-        self.milvus_collection = milvus_collection
-        self.milvus_alias = re.sub(r"[^a-zA-Z0-9_]", "_", milvus_alias).strip("_") or "ltm_milvus"
-        self.milvus_timeout_seconds = float(milvus_timeout_seconds)
-        self.milvus_similarity_metric = (milvus_similarity_metric or "COSINE").upper()
-        self._milvus = None
+        self.pgvector_table = _safe_identifier(pgvector_table)
 
         self._engine = self._create_engine()
         self._init_schema()
-        self._init_milvus()
+        self._init_pgvector()
 
     def _create_engine(self):
         try:
             from sqlalchemy import create_engine
         except ImportError as exc:
-            raise RuntimeError("MySQL 长期记忆需要安装 sqlalchemy 和 pymysql。") from exc
+            raise RuntimeError("PostgreSQL 长期记忆需要安装 sqlalchemy 和 psycopg。") from exc
         return create_engine(
-            self.mysql_url,
+            self.database_url,
             pool_pre_ping=True,
             pool_recycle=1800,
             future=True,
@@ -251,131 +234,67 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
         with self._engine.begin() as conn:
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {self.table_name} (
-                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    id BIGSERIAL PRIMARY KEY,
                     namespace_hash CHAR(64) NOT NULL,
                     key_hash CHAR(64) NOT NULL,
                     namespace TEXT NOT NULL,
-                    namespace_path VARCHAR(1024) NOT NULL,
+                    namespace_path TEXT NOT NULL,
                     memory_key VARCHAR(512) NOT NULL,
-                    value_json JSON NOT NULL,
+                    value_json JSONB NOT NULL,
                     search_text TEXT NOT NULL,
-                    importance DOUBLE NOT NULL,
+                    importance DOUBLE PRECISION NOT NULL,
                     vector_id VARCHAR(96) NOT NULL,
-                    created_at DATETIME(6) NOT NULL,
-                    updated_at DATETIME(6) NOT NULL,
-                    expires_at DATETIME(6) NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    expires_at TIMESTAMP NULL,
                     access_count INT NOT NULL DEFAULT 0,
                     version BIGINT NOT NULL DEFAULT 1,
-                    deleted_at DATETIME(6) NULL,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY uq_ltm_namespace_key (namespace_hash, key_hash),
-                    KEY idx_ltm_namespace_path (namespace_path(255)),
-                    KEY idx_ltm_vector_id (vector_id),
-                    KEY idx_ltm_expires (expires_at),
-                    KEY idx_ltm_updated (updated_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    deleted_at TIMESTAMP NULL,
+                    CONSTRAINT uq_ltm_namespace_key UNIQUE (namespace_hash, key_hash)
+                )
             """))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_ltm_namespace_path ON {self.table_name} (namespace_path)"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_ltm_vector_id ON {self.table_name} (vector_id)"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_ltm_expires ON {self.table_name} (expires_at)"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_ltm_updated ON {self.table_name} (updated_at)"))
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {self.audit_table_name} (
-                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    id BIGSERIAL PRIMARY KEY,
                     namespace_hash CHAR(64) NOT NULL,
                     key_hash CHAR(64) NOT NULL,
                     namespace TEXT NOT NULL,
                     memory_key VARCHAR(512) NOT NULL,
                     event_type VARCHAR(32) NOT NULL,
-                    value_json JSON NULL,
-                    created_at DATETIME(6) NOT NULL,
-                    PRIMARY KEY (id),
-                    KEY idx_ltm_audit_memory (namespace_hash, key_hash),
-                    KEY idx_ltm_audit_created (created_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    value_json JSONB NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
             """))
-            try:
-                conn.execute(text(f"CREATE FULLTEXT INDEX idx_ltm_search_text ON {self.table_name} (search_text)"))
-            except Exception:
-                # MySQL 没有启用全文索引或索引已存在时，不影响主流程；search 仍有词元召回兜底。
-                pass
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_ltm_audit_memory ON {self.audit_table_name} (namespace_hash, key_hash)"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_ltm_audit_created ON {self.audit_table_name} (created_at)"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_ltm_search_text ON {self.table_name} USING GIN (to_tsvector('simple', search_text))"))
 
-    def _init_milvus(self) -> None:
-        try:
-            from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, db, utility
-        except ImportError as exc:
-            raise RuntimeError("pymilvus 未安装，长期记忆无法连接 Milvus。") from exc
+    def _init_pgvector(self) -> None:
+        from sqlalchemy import text
 
-        try:
-            connection_kwargs = {
-                "alias": self.milvus_alias,
-                "uri": self.milvus_uri,
-                "token": self.milvus_token,
-                "timeout": self.milvus_timeout_seconds,
-            }
-            if self.milvus_database != "default":
-                connections.connect(**connection_kwargs, db_name="default")
-                try:
-                    databases = db.list_database(using=self.milvus_alias, timeout=self.milvus_timeout_seconds)
-                    if self.milvus_database not in databases:
-                        db.create_database(
-                            self.milvus_database,
-                            using=self.milvus_alias,
-                            timeout=self.milvus_timeout_seconds,
-                        )
-                finally:
-                    connections.disconnect(self.milvus_alias)
-
-            connections.connect(**connection_kwargs, db_name=self.milvus_database)
-            if not utility.has_collection(
-                self.milvus_collection,
-                using=self.milvus_alias,
-                timeout=self.milvus_timeout_seconds,
-            ):
-                fields = [
-                    FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=96),
-                    FieldSchema(name="namespace_path", dtype=DataType.VARCHAR, max_length=1024),
-                    FieldSchema(name="memory_key", dtype=DataType.VARCHAR, max_length=512),
-                    FieldSchema(name="search_text", dtype=DataType.VARCHAR, max_length=8192),
-                    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.vector_dimension),
-                    FieldSchema(name="importance", dtype=DataType.FLOAT),
-                    FieldSchema(name="updated_at", dtype=DataType.INT64),
-                    FieldSchema(name="expires_at", dtype=DataType.INT64),
-                ]
-                schema = CollectionSchema(fields, description="Long-term memory semantic index")
-                self._milvus = Collection(
-                    self.milvus_collection,
-                    schema=schema,
-                    using=self.milvus_alias,
+        with self._engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {self.pgvector_table} (
+                    id VARCHAR(96) PRIMARY KEY,
+                    namespace_path TEXT NOT NULL,
+                    memory_key VARCHAR(512) NOT NULL,
+                    search_text TEXT NOT NULL,
+                    embedding vector({self.vector_dimension}) NOT NULL,
+                    importance DOUBLE PRECISION NOT NULL,
+                    updated_at BIGINT NOT NULL,
+                    expires_at BIGINT NOT NULL
                 )
-                self._milvus.create_index(
-                    "embedding",
-                    {
-                        "metric_type": self.milvus_similarity_metric,
-                        "index_type": "HNSW",
-                        "params": {"M": 16, "efConstruction": 200},
-                    },
-                    timeout=self.milvus_timeout_seconds,
-                )
-            else:
-                self._milvus = Collection(self.milvus_collection, using=self.milvus_alias)
-                existing_dim = self._milvus_vector_dim(self._milvus)
-                if existing_dim and existing_dim != self.vector_dimension:
-                    raise RuntimeError(
-                        f"Milvus collection '{self.milvus_collection}' 向量维度是 {existing_dim}，"
-                        f"当前长期记忆 embedding 维度是 {self.vector_dimension}。"
-                    )
-            self._milvus.load(timeout=self.milvus_timeout_seconds)
-        except Exception as exc:
-            self._milvus = None
-            raise RuntimeError(f"Milvus 长期记忆索引初始化失败：{exc}") from exc
-
-    @staticmethod
-    def _milvus_vector_dim(collection: object) -> int | None:
-        try:
-            for field in collection.schema.fields:
-                params = getattr(field, "params", {}) or {}
-                if "dim" in params:
-                    return int(params["dim"])
-        except Exception:
-            return None
-        return None
+            """))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{self.pgvector_table}_namespace ON {self.pgvector_table} (namespace_path)"))
+            conn.execute(text(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self.pgvector_table}_embedding
+                ON {self.pgvector_table} USING hnsw (embedding vector_cosine_ops)
+            """))
 
     def _delete_expired(self, conn) -> None:
         from sqlalchemy import text
@@ -439,38 +358,46 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
         updated_at: datetime,
         expires_at: datetime | None,
     ) -> None:
-        if self._milvus is None:
-            raise RuntimeError("长期记忆 Milvus 未初始化，拒绝写入不完整记忆。")
         if embedding is None:
             raise RuntimeError("长期记忆缺少 embedding，拒绝写入不完整记忆。")
-        try:
-            row = [
-                [vector_id],
-                [_namespace_path(namespace)],
-                [key[:512]],
-                [search_text[:8192]],
-                [embedding],
-                [float(importance)],
-                [_epoch_millis(updated_at)],
-                [_epoch_millis(expires_at)],
-            ]
-            if hasattr(self._milvus, "upsert"):
-                self._milvus.upsert(row, timeout=self.milvus_timeout_seconds)
-            else:
-                self._milvus.delete(f'id == "{_milvus_quote(vector_id)}"')
-                self._milvus.insert(row, timeout=self.milvus_timeout_seconds)
-            if hasattr(self._milvus, "flush"):
-                self._milvus.flush(timeout=self.milvus_timeout_seconds)
-        except Exception as exc:
-            raise RuntimeError(f"长期记忆 Milvus upsert 失败：{exc}") from exc
+        from sqlalchemy import text
+
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(f"""
+                    INSERT INTO {self.pgvector_table} (
+                        id, namespace_path, memory_key, search_text, embedding,
+                        importance, updated_at, expires_at
+                    ) VALUES (
+                        :id, :namespace_path, :memory_key, :search_text,
+                        CAST(:embedding AS vector), :importance, :updated_at, :expires_at
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        namespace_path=EXCLUDED.namespace_path,
+                        memory_key=EXCLUDED.memory_key,
+                        search_text=EXCLUDED.search_text,
+                        embedding=EXCLUDED.embedding,
+                        importance=EXCLUDED.importance,
+                        updated_at=EXCLUDED.updated_at,
+                        expires_at=EXCLUDED.expires_at
+                """),
+                {
+                    "id": vector_id,
+                    "namespace_path": _namespace_path(namespace),
+                    "memory_key": key[:512],
+                    "search_text": search_text,
+                    "embedding": _vector_literal(embedding),
+                    "importance": float(importance),
+                    "updated_at": _epoch_millis(updated_at),
+                    "expires_at": _epoch_millis(expires_at),
+                },
+            )
 
     def _delete_vector(self, vector_id: str) -> None:
-        if self._milvus is None:
-            raise RuntimeError("长期记忆 Milvus 未初始化，拒绝只删除 MySQL 记录。")
-        try:
-            self._milvus.delete(f'id == "{_milvus_quote(vector_id)}"', timeout=self.milvus_timeout_seconds)
-        except Exception as exc:
-            raise RuntimeError(f"长期记忆 Milvus delete 失败：{exc}") from exc
+        from sqlalchemy import text
+
+        with self._engine.begin() as conn:
+            conn.execute(text(f"DELETE FROM {self.pgvector_table} WHERE id=:id"), {"id": vector_id})
 
     def put(
         self,
@@ -523,16 +450,16 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
                         :value_json, :search_text, :importance, :vector_id,
                         :created_at, :updated_at, :expires_at, 0, 1, NULL
                     )
-                    ON DUPLICATE KEY UPDATE
-                        namespace=VALUES(namespace),
-                        namespace_path=VALUES(namespace_path),
-                        memory_key=VALUES(memory_key),
-                        value_json=VALUES(value_json),
-                        search_text=VALUES(search_text),
-                        importance=VALUES(importance),
-                        vector_id=VALUES(vector_id),
-                        updated_at=VALUES(updated_at),
-                        expires_at=VALUES(expires_at),
+                    ON CONFLICT (namespace_hash, key_hash) DO UPDATE SET
+                        namespace=EXCLUDED.namespace,
+                        namespace_path=EXCLUDED.namespace_path,
+                        memory_key=EXCLUDED.memory_key,
+                        value_json=EXCLUDED.value_json,
+                        search_text=EXCLUDED.search_text,
+                        importance=EXCLUDED.importance,
+                        vector_id=EXCLUDED.vector_id,
+                        updated_at=EXCLUDED.updated_at,
+                        expires_at=EXCLUDED.expires_at,
                         version=version+1,
                         deleted_at=NULL
                 """),
@@ -635,41 +562,44 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
         query_vector: list[float] | None,
         limit: int,
     ) -> list[tuple[str, float]]:
-        if self._milvus is None:
-            raise RuntimeError("长期记忆 Milvus 未初始化，无法执行语义检索。")
         if query_vector is None:
             raise RuntimeError("长期记忆缺少 query embedding，无法执行语义检索。")
         now_ms = _epoch_millis(_now())
-        expr = f"(expires_at == 0 or expires_at > {now_ms})"
+        clauses = ["(expires_at = 0 OR expires_at > :now_ms)"]
+        params: dict[str, Any] = {
+            "embedding": _vector_literal(query_vector),
+            "limit": max(limit * 20, 50),
+            "now_ms": now_ms,
+        }
         if namespace_prefix:
-            prefix = _milvus_quote(_namespace_path(namespace_prefix))
-            expr = f'namespace_path like "{prefix}%" and {expr}'
-        try:
-            raw = self._milvus.search(
-                data=[query_vector],
-                anns_field="embedding",
-                param={"metric_type": self.milvus_similarity_metric, "params": {"ef": 64}},
-                limit=max(limit * 20, 50),
-                expr=expr,
-                output_fields=["id"],
-                timeout=self.milvus_timeout_seconds,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"长期记忆 Milvus 搜索失败：{exc}") from exc
+            prefix = _namespace_path(namespace_prefix)
+            clauses.append("(namespace_path = :prefix OR namespace_path LIKE :prefix_like)")
+            params["prefix"] = prefix
+            params["prefix_like"] = f"{prefix}/%"
+        from sqlalchemy import text
 
-        hits = raw[0] if raw else []
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT id, embedding <=> CAST(:embedding AS vector) AS distance
+                    FROM {self.pgvector_table}
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY embedding <=> CAST(:embedding AS vector)
+                    LIMIT :limit
+                """),
+                params,
+            ).mappings().all()
         results: list[tuple[str, float]] = []
-        for hit in hits:
-            vector_id = str(getattr(hit, "id", "") or getattr(hit, "pk", "") or "")
-            distance = float(getattr(hit, "score", getattr(hit, "distance", 0.0)))
-            if vector_id:
-                results.append((vector_id, self._milvus_similarity(distance)))
+        for row in rows:
+            results.append((str(row["id"]), self._pgvector_similarity(float(row["distance"]))))
         return results
 
-    def _milvus_similarity(self, distance: float) -> float:
-        if self.milvus_similarity_metric == "L2":
-            return 1.0 / (1.0 + max(distance, 0.0))
-        return max(0.0, min(1.0, distance))
+    @staticmethod
+    def _pgvector_similarity(distance: float) -> float:
+        return max(0.0, min(1.0, 1.0 - distance))
+
+    def _legacy_similarity(self, distance: float) -> float:
+        return self._pgvector_similarity(distance)
 
     def search(
         self,
@@ -827,51 +757,42 @@ class MySQLMilvusLongTermMemoryStore(BaseStore):
 
 def create_long_term_memory_store(
     *,
-    mysql_url: str = "",
-    milvus_uri: str = "http://localhost:19530",
-    milvus_token: str = "",
-    milvus_database: str = "default",
-    milvus_collection: str = "long_term_memory_vectors_1024",
-    milvus_alias: str = "ltm_milvus",
-    milvus_timeout_seconds: float = 10.0,
-    milvus_similarity_metric: str = "COSINE",
+    database_url: str = "",
+    vector_store_type: str = "pgvector",
+    pgvector_table: str = "long_term_memory_vectors",
     embedding_model: object | None = None,
     vector_dimension: int = 1024,
     default_ttl_days: int | None = 180,
     default_importance: float = 0.5,
-) -> MySQLMilvusLongTermMemoryStore:
+) -> PostgreSQLPGVectorLongTermMemoryStore:
     """创建长期记忆 Store。
 
-    长期记忆固定使用 MySQL + Milvus：
-    MySQL 保存权威记录和审计，Milvus 保存可重建语义索引。
+    长期记忆固定使用 PostgreSQL 保存权威记录和审计。
+    向量索引固定使用同库 PGVector。
     """
-    if not mysql_url:
-        raise ValueError("使用 MySQL + Milvus 长期记忆时必须配置 MYSQL_URL 或 LONG_TERM_MEMORY_MYSQL_URL")
+    if not database_url:
+        raise ValueError("使用长期记忆时必须配置 DATABASE_URL 或 LONG_TERM_MEMORY_DATABASE_URL")
     policy = MemoryPolicy(
         default_ttl_days=default_ttl_days,
         default_importance=default_importance,
     )
+    store_type = (vector_store_type or "pgvector").strip().lower()
     try:
-        return MySQLMilvusLongTermMemoryStore(
-            mysql_url=mysql_url,
-            milvus_uri=milvus_uri,
-            milvus_token=milvus_token,
-            milvus_database=milvus_database,
-            milvus_collection=milvus_collection,
-            milvus_alias=milvus_alias,
-            milvus_timeout_seconds=milvus_timeout_seconds,
-            milvus_similarity_metric=milvus_similarity_metric,
+        if store_type != "pgvector":
+            raise ValueError(f"不支持的长期记忆向量后端：{vector_store_type!r}")
+        return PostgreSQLPGVectorLongTermMemoryStore(
+            database_url=database_url,
+            pgvector_table=pgvector_table,
             embedding_model=embedding_model,
             vector_dimension=vector_dimension,
             policy=policy,
         )
     except Exception as exc:
-        # 生产模式下长期记忆必须落到 MySQL + Milvus。
+        # 生产模式下长期记忆必须落到 PostgreSQL + PGVector。
         # 如果这里降级到 InMemoryStore，多实例会话会出现不可解释的不一致，
         # 也无法满足审计、TTL、冲突治理和语义召回要求。
-        raise RuntimeError(f"长期记忆 MySQL/Milvus 初始化失败，生产模式拒绝降级：{exc}") from exc
+        raise RuntimeError(f"长期记忆 PostgreSQL/{store_type} 初始化失败：{exc}") from exc
 
 
-# 兼容旧导入名：长期记忆现在固定由 MySQL + Milvus 实现。
-LongTermMemoryStore = MySQLMilvusLongTermMemoryStore
+LongTermMemoryStore = PostgreSQLPGVectorLongTermMemoryStore
 

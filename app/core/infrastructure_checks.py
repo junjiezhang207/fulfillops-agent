@@ -1,9 +1,8 @@
 """生产基础设施启动检查。
 
 这里不做降级，只做快速失败：
-- Redis 负责短期记忆、缓存、限流和幂等。
-- MySQL 负责企业数据、HITL、Trace、长期记忆元数据。
-- Milvus 负责 RAG 和长期记忆向量检索。
+- PostgreSQL 负责企业数据、短期记忆、缓存、限流、幂等、HITL、Trace 和长期记忆元数据。
+- PGVector 负责 RAG 与长期记忆向量索引。
 """
 
 from __future__ import annotations
@@ -20,11 +19,11 @@ class InfrastructureCheckResult:
 
 def verify_required_infrastructure(settings) -> list[InfrastructureCheckResult]:
     """检查生产必需依赖，不可用时抛出 RuntimeError。"""
-    results = [
-        _check_redis(settings.redis_url),
-        _check_mysql(settings.mysql_url),
-        _check_milvus(settings),
-    ]
+    results: list[InfrastructureCheckResult] = []
+    if bool(getattr(settings, "require_postgres", True)):
+        results.append(_check_postgres(settings.effective_database_url))
+    if bool(getattr(settings, "require_pgvector", True)) or _requires_pgvector(settings):
+        results.append(_check_pgvector(settings.effective_database_url))
     failed = [item for item in results if not item.ok]
     if failed:
         details = "；".join(f"{item.name}: {item.detail}" for item in failed)
@@ -32,49 +31,37 @@ def verify_required_infrastructure(settings) -> list[InfrastructureCheckResult]:
     return results
 
 
-def _check_redis(redis_url: str) -> InfrastructureCheckResult:
-    if not redis_url:
-        return InfrastructureCheckResult("Redis", False, "未配置 REDIS_URL")
-    try:
-        import redis
-
-        client = redis.from_url(redis_url, socket_connect_timeout=1.0, socket_timeout=1.0)
-        client.ping()
-        return InfrastructureCheckResult("Redis", True, "连接正常")
-    except Exception as exc:
-        return InfrastructureCheckResult("Redis", False, str(exc))
+def _requires_pgvector(settings) -> bool:
+    store_type = str(getattr(settings, "vector_store_type", "") or "").strip().lower()
+    memory_store_type = str(getattr(settings, "long_term_memory_vector_store_type", "") or "").strip().lower()
+    return store_type == "pgvector" or memory_store_type == "pgvector"
 
 
-def _check_mysql(mysql_url: str) -> InfrastructureCheckResult:
-    if not mysql_url:
-        return InfrastructureCheckResult("MySQL", False, "未配置 MYSQL_URL")
+def _check_postgres(database_url: str) -> InfrastructureCheckResult:
+    if not database_url:
+        return InfrastructureCheckResult("PostgreSQL", False, "未配置 DATABASE_URL/POSTGRES_URL")
     try:
         from sqlalchemy import create_engine, text
 
-        engine = create_engine(mysql_url, pool_pre_ping=True, future=True)
+        engine = create_engine(database_url, pool_pre_ping=True, future=True)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         engine.dispose()
-        return InfrastructureCheckResult("MySQL", True, "连接正常")
+        return InfrastructureCheckResult("PostgreSQL", True, "连接正常")
     except Exception as exc:
-        return InfrastructureCheckResult("MySQL", False, str(exc))
+        return InfrastructureCheckResult("PostgreSQL", False, str(exc))
 
 
-def _check_milvus(settings) -> InfrastructureCheckResult:
-    uri = settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}"
+def _check_pgvector(database_url: str) -> InfrastructureCheckResult:
+    if not database_url:
+        return InfrastructureCheckResult("PGVector", False, "未配置 DATABASE_URL/POSTGRES_URL")
     try:
-        from pymilvus import connections, utility
+        from sqlalchemy import create_engine, text
 
-        alias = "startup_check"
-        connections.connect(
-            alias=alias,
-            uri=uri,
-            token=settings.milvus_token,
-            timeout=settings.milvus_timeout_seconds,
-            db_name=settings.milvus_database or "default",
-        )
-        utility.list_collections(using=alias, timeout=settings.milvus_timeout_seconds)
-        connections.disconnect(alias)
-        return InfrastructureCheckResult("Milvus", True, "连接正常")
+        engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        engine.dispose()
+        return InfrastructureCheckResult("PGVector", True, "vector 扩展可用")
     except Exception as exc:
-        return InfrastructureCheckResult("Milvus", False, str(exc))
+        return InfrastructureCheckResult("PGVector", False, str(exc))

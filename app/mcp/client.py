@@ -226,7 +226,7 @@ class MCPToolsClient:
                     prompts = []
 
                 return {
-                    "server": "multiship-fulfillment",
+                    "server": "fulfillops-fulfillment",
                     "tools": tools,
                     "resources": resources,
                     "prompts": prompts,

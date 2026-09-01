@@ -74,7 +74,7 @@ def run_workflow(request: WorkflowRunRequest, http_request: Request) -> ApiRespo
 
 @router.get("/approvals/pending", response_model=ApiResponse)
 def list_pending_approvals(risk_level: str | None = Query(None)) -> ApiResponse:
-    """查询 MySQL 中待人工审核的 HITL 工单。"""
+    """查询 PostgreSQL 中待人工审核的 HITL 工单。"""
     rows = _workflow_service.list_pending_approvals(risk_level)
     return ApiResponse(
         success=True,

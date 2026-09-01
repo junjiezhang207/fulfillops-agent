@@ -278,27 +278,25 @@ class AgentService:
         settings = get_settings()
 
         # 短期记忆：保存“当前会话内”的完整消息历史。
-        # 生产模式固定依赖 Redis，不能降级到 MemorySaver，否则多实例会话会不一致。
+        # 生产模式固定依赖 PostgreSQL，不能降级到 MemorySaver，否则多实例会话会不一致。
         checkpointer = create_checkpointer(
-            settings.redis_url,
+            settings.effective_database_url,
             ttl_seconds=settings.short_term_memory_ttl_seconds,
         )
 
         # 长期记忆：保存跨会话仍有价值的信息，例如用户偏好、订单处理结论。
-        # 如果后端是 MySQL + Milvus，这里传入懒加载 embedding 代理，
+        # 如果后端是 PostgreSQL + PGVector，这里传入懒加载 embedding 代理，
         # 避免 FastAPI 启动时马上加载本地 embedding 权重。
         from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
 
         memory_embed_model = create_lazy_embed_model(settings)
         self._memory_store = create_long_term_memory_store(
-            mysql_url=settings.long_term_memory_mysql_url or settings.mysql_url,
-            milvus_uri=settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}",
-            milvus_token=settings.milvus_token,
-            milvus_database=settings.milvus_database,
-            milvus_collection=settings.long_term_memory_milvus_collection,
-            milvus_alias=settings.long_term_memory_milvus_alias,
-            milvus_timeout_seconds=settings.milvus_timeout_seconds,
-            milvus_similarity_metric=settings.milvus_similarity_metric,
+            database_url=(
+                settings.long_term_memory_database_url
+                or settings.effective_database_url
+            ),
+            vector_store_type=settings.long_term_memory_vector_store_type,
+            pgvector_table=settings.long_term_memory_pgvector_table,
             embedding_model=memory_embed_model,
             vector_dimension=settings.long_term_memory_vector_dimension,
             default_ttl_days=settings.long_term_memory_ttl_days,
@@ -307,7 +305,7 @@ class AgentService:
 
         # LangChain 的 checkpointer 按 thread_id 保存消息历史。
         # 所以后面每次调用只要传同一个 session_id，Agent 就能记住前几轮上下文。
-        # store 则是 LangGraph 的长期记忆接口，本项目固定使用 MySQL + Milvus 实现。
+        # store 则是 LangGraph 的长期记忆接口，本项目默认使用 PostgreSQL + PGVector。
         self._agent = build_agent(
             chat_model,
             resilient_tools,

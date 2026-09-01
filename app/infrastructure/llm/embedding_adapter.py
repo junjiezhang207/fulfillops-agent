@@ -12,13 +12,13 @@
   本地可选 profile / 旧配置 fallback，维度为 512。
 
 为什么不再保留伪向量兜底？
-  伪向量不具备真实语义检索能力，维度也容易和 Milvus collection 不一致。
+  伪向量不具备真实语义检索能力，维度也容易和 PGVector 表不一致。
   对这个项目来说，静默写入无语义向量比直接失败更危险：RAG 看起来能跑，
   但召回质量和评测结果都不可信。因此 embedding 配置失败时应显式暴露问题。
 
 这个文件同时服务两条链路：
   - RAG 文档检索：KnowledgeRetrievalService 构建 VectorStoreIndex 时使用。
-  - 长期记忆检索：MySQL + Milvus 后端需要把记忆文本转成向量。
+  - 长期记忆检索：PostgreSQL + PGVector 后端需要把记忆文本转成向量。
 """
 
 from __future__ import annotations

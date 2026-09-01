@@ -28,6 +28,7 @@ from langgraph.types import Send
 from pydantic import BaseModel, Field
 
 from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
+from app.application.routing.order_context_service import OrderContextService
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.infrastructure.llm.model_gateway import get_model_gateway
@@ -378,7 +379,7 @@ def make_specialist_agent_node(
         "checkpointer": checkpointer,
     }
     if checkpointer is None:
-        raise RuntimeError("Multi-Agent 专家 Agent 必须显式传入 Redis checkpointer。")
+        raise RuntimeError("Multi-Agent 专家 Agent 必须显式传入 PostgreSQL checkpointer。")
     if store is not None:
         specialist_kwargs["store"] = store
     specialist = create_agent(**specialist_kwargs) if llm else None
@@ -485,7 +486,7 @@ class MultiAgentOrchestrator:
         self.llm = llm
         self.max_rounds_per_agent = max_rounds_per_agent
         if checkpointer is None:
-            raise RuntimeError("Multi-Agent 编排器必须显式传入 Redis checkpointer。")
+            raise RuntimeError("Multi-Agent 编排器必须显式传入 PostgreSQL checkpointer。")
         self._checkpointer = checkpointer
         self._store = store
         self._graph = self._build_graph(
@@ -514,6 +515,10 @@ class MultiAgentOrchestrator:
         3. 专家 -> barrier -> supervisor：专家结果回流后再次判断是否需要补问。
         """
         graph = StateGraph(MultiAgentState)
+        context_service = OrderContextService(
+            order_service=order_svc,
+            inventory_service=inv_svc,
+        )
         tool_services = ToolServiceBundle(
             order_service=order_svc,
             inventory_service=inv_svc,
@@ -521,6 +526,7 @@ class MultiAgentOrchestrator:
             warehouse_service=wh_svc,
             substitute_service=sub_svc,
             fulfillment_service=ful_svc,
+            context_service=context_service,
         )
         tool_registry = get_tool_registry()
         tools_by_agent = {

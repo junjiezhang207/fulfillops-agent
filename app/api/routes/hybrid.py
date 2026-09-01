@@ -40,6 +40,8 @@ from app.workflows.fulfillment.parallel_graph import (
 )
 from app.application.cache.client_cache_service import get_response_cache
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
+from app.application.routing.ops_case_service import OpsCaseAnalysisService
+from app.application.routing.order_context_service import OrderContextService
 from app.application.routing.hybrid_service import HybridService
 from app.application.memory.session_memory_service import (
     get_session_service,
@@ -86,6 +88,10 @@ _fulfillment_service = FulfillmentPlanService(
     warehouse_service=_warehouse_service,
     substitute_service=_substitute_service,
 )
+_order_context_service = OrderContextService(
+    order_service=_order_analysis_service,
+    inventory_service=_inventory_analysis_service,
+)
 
 _tool_services = ToolServiceBundle(
     order_service=_order_analysis_service,
@@ -94,6 +100,7 @@ _tool_services = ToolServiceBundle(
     warehouse_service=_warehouse_service,
     substitute_service=_substitute_service,
     fulfillment_service=_fulfillment_service,
+    context_service=_order_context_service,
 )
 _extra_tools = get_tool_registry().build_tools(
     services=_tool_services,
@@ -102,6 +109,13 @@ _extra_tools = get_tool_registry().build_tools(
         "search_warehouse_inventory",
         "find_substitute_sku",
         "generate_fulfillment_plan",
+        "get_context_detail",
+        "get_order_detail",
+        "get_inventory_warehouse_detail",
+        "get_shipping_detail",
+        "get_supply_chain_detail",
+        "get_product_constraints",
+        "get_customer_case_context",
     ),
 )
 
@@ -134,6 +148,12 @@ _multi_agent_service = MultiAgentService(
     llm=_supervisor_model,
 )
 
+_ops_case_service = OpsCaseAnalysisService(
+    order_service=_order_analysis_service,
+    inventory_service=_inventory_analysis_service,
+    knowledge_service=_knowledge_retrieval_service,
+)
+
 # 混合服务。
 # 自动路由会优先使用小模型做意图识别，再分流到 Workflow / RAG / Agent / Multi-Agent。
 # Agent 模型不可用时，workflow/rag 仍然可用；路由到 agent 时再降级到 workflow。
@@ -142,6 +162,7 @@ _hybrid_service: HybridService | None = HybridService(
     agent_service=_agent_service,
     knowledge_service=_knowledge_retrieval_service,
     multi_agent_service=_multi_agent_service,
+    ops_case_service=_ops_case_service,
     intent_model=_workflow_finalize_model or _chat_model,
     session_cache=_session_cache,
     response_cache=_response_cache,
@@ -363,7 +384,7 @@ class ResumeRequest:
     """
 
     thread_id: str
-    decision: str  # "approved" | "rejected"
+    decision: str  # "approved" | "rejected" | "modify" | "ask_followup"
     notes: str = ""
 
 
@@ -379,7 +400,7 @@ def hybrid_resume(
 
     参数：
       - thread_id: 中断事件中返回的线程 ID（必填）
-      - decision: 人工决策，可选 "approved" 或 "rejected"
+      - decision: 人工决策，可选 "approved" / "rejected" / "modify" / "ask_followup"
       - notes: 可选备注
 
     响应：
@@ -399,10 +420,10 @@ def hybrid_resume(
         )
 
     # 人工决策必须是白名单值，避免把任意字符串传进 Workflow 状态。
-    if decision not in ("approved", "rejected"):
+    if decision not in ("approved", "rejected", "modify", "ask_followup"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="decision must be 'approved' or 'rejected'",
+            detail="decision must be 'approved', 'rejected', 'modify', or 'ask_followup'",
         )
 
     try:

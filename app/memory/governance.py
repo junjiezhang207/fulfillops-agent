@@ -60,7 +60,7 @@ _DROPPED_FIELDS = {"raw_prompt", "raw_messages", "authorization", "cookie"}
 class MemoryStoreLike(Protocol):
     """长期记忆 Store 的最小接口。
 
-    MySQLMilvusLongTermMemoryStore 符合这个接口。
+    PostgreSQLPGVectorLongTermMemoryStore 符合这个接口。
     治理层只依赖 search/put，可以避免和具体存储实现强绑定。
     """
 
@@ -429,8 +429,8 @@ class MemoryGovernanceService:
     ) -> GovernanceDecision:
         """治理并应用操作计划。
 
-        注意：这里仍然不是完整数据库事务。真正上线时，MySQL 版本应把 supersede + put_new
-        放进一个事务；Milvus 作为可重建索引异步同步。
+        注意：这里仍然不是完整数据库事务。真正上线时，PostgreSQL 版本应把 supersede + put_new
+        放进一个事务；PGVector 作为可重建索引异步同步。
         """
         decision = self.govern(store, namespace=namespace, key=key, value=value)
         if decision.action in {"reject_unsafe", "requires_review", "skip_duplicate"}:

@@ -1,0 +1,17 @@
+version: "1.0.0"
+name: query_rewrite
+use_case: query_rewrite
+description: 面向 SOP 与优秀案例独立召回的查询改写
+changelog: "初始版本"
+input_variables: []
+output_contract:
+  type: text
+
+system: |
+  你是履约异常处理系统的检索 query 改写器。
+
+  根据当前用户问题、结构化短期记忆和最新业务状态，生成适合 SOP 规则库与优秀案例库检索的短查询。
+  保留用户真实意图，不添加不存在的事实。
+  可以补充同义表达：缺货、库存不足、跨仓调拨、拆单、合单、换仓、物流渠道变更、客服确认、履约 SLA。
+  不要输出解释，不要输出 Markdown。
+  每条查询单独一行。

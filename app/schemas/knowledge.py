@@ -110,7 +110,7 @@ class KnowledgeRetrieveRequest(BaseModel):
         description=(
             "标签过滤条件。若不为空，只返回属于这些类别的知识片段。"
             "合法值：stockout_rule, priority_rule, regional_strategy, "
-            "split_merge_rule, after_sales_rule, general。"
+            "split_merge_rule, after_sales_rule, excellent_case, general。"
         ),
     )
 
@@ -166,6 +166,12 @@ class KnowledgeMetadata(BaseModel):
 
     document_id: str = Field(..., description="文档稳定 ID。")
     chunk_id: str = Field(..., description="知识切片稳定 ID。")
+    parent_chunk_id: str = Field(default="", description="父业务章节/处理单元 ID，用于 child 命中后展开父上下文。")
+    parent_section_path: list[str] = Field(default_factory=list, description="父业务章节路径。")
+    parent_context_excerpt: str = Field(default="", description="父业务处理单元摘要，用于补充适用范围/前置条件/异常规则。")
+    child_index_in_parent: int = Field(default=0, description="当前 child chunk 在父业务单元中的序号。")
+    child_count_in_parent: int = Field(default=1, description="父业务单元下 child chunk 总数。")
+    business_unit_type: str = Field(default="general", description="业务单元类型：scope/prerequisite/rule/procedure/exception/escalation/general。")
     title: str = Field(..., description="文档标题。")
     section_path: list[str] = Field(..., description="片段所在章节路径。")
     tags: list[str] = Field(..., description="知识标签。")
@@ -177,6 +183,12 @@ class KnowledgeMetadata(BaseModel):
     expires_at: str = Field(default="", description="规则过期日期，来自 front matter；过期规则不会进入最终检索结果。")
     region: str = Field(default="", description="适用区域，来自 front matter。")
     business_scope: list[str] = Field(default_factory=list, description="适用业务范围。")
+    knowledge_source: str = Field(default="", description="知识来源类型，例如 sop 或 case。")
+    collection_name: str = Field(default="", description="逻辑知识库集合名，例如 sop_collection 或 case_collection。")
+    version_status: str = Field(default="", description="知识版本状态，例如 active / archived。")
+    is_active: str = Field(default="", description="是否为当前可检索版本，来自 front matter。")
+    vector_backend: str = Field(default="", description="写入优秀案例等知识时声明的向量后端，例如 pgvector。")
+    source_case_id: str = Field(default="", description="优秀案例来源履约 Case ID；普通 SOP 规则为空。")
 
 
 # ---------------------------------------------------------------------------

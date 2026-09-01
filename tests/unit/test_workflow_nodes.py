@@ -9,7 +9,7 @@
 全部无 LLM 依赖，CI 毫秒级完成。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,6 +18,7 @@ from app.workflows.fulfillment.nodes import WorkflowNodes
 from app.workflows.fulfillment.state import GraphState
 from app.workflows.fulfillment.trace import TraceEvent, ErrorEvent
 from app.domain.orders.analysis import OrderNotFoundError
+from app.schemas.workflow import ExecutionProposal, ProposalAction
 from langgraph.types import Command
 
 
@@ -236,3 +237,136 @@ class TestFinalizeNode:
         # 没有任何中间结果时不应崩溃
         result = nodes.finalize(state)
         assert "final_answer" in result
+
+
+# ── execution proposal policy validator ─────────────────────────────────────
+
+def _policy_ready_action(**overrides) -> ProposalAction:
+    action = ProposalAction(
+        action_id="a1",
+        action_type="split_order",
+        sku_id="SKU-A",
+        quantity=2,
+        from_warehouse="WH-A",
+        carrier="FAST",
+        reason="拆单先发",
+        responsibility_domain="WMS",
+        business_evidence=["OMS订单待履约", "WMS库存可覆盖"],
+    )
+    return action.model_copy(update=overrides)
+
+
+def _policy_ready_proposal(**overrides) -> ExecutionProposal:
+    action = overrides.pop("action", _policy_ready_action())
+    actions = overrides.pop("actions", [action])
+    goal_type = overrides.pop("goal_type", "split_fulfillment")
+    action_dag = overrides.pop("action_dag", WorkflowNodes._build_action_dag(actions))
+    success_criteria = overrides.pop(
+        "success_criteria",
+        WorkflowNodes._success_criteria_template(goal_type, actions),
+    )
+    proposal = ExecutionProposal(
+        proposal_id="prop-policy",
+        order_id="SO-POLICY",
+        title="策略校验",
+        summary="策略校验",
+        actions=actions,
+        data_fingerprint="fp-policy",
+        goal_type=goal_type,
+        action_dag=action_dag,
+        success_criteria=success_criteria,
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    )
+    return proposal.model_copy(update=overrides)
+
+
+class TestExecutionProposalPolicyValidator:
+    def test_valid_proposal_passes_policy_validator(self):
+        proposal = _policy_ready_proposal()
+
+        failures = WorkflowNodes._validate_execution_proposal_policy(proposal)
+
+        assert failures == []
+
+    def test_rejects_direct_business_mutation_action(self):
+        proposal = _policy_ready_proposal(
+            action=_policy_ready_action(action_type="direct_inventory_mutation")
+        )
+
+        failures = WorkflowNodes._validate_execution_proposal_policy(proposal)
+
+        assert any(item["name"].startswith("hard_constraint.no_direct_business_mutation") for item in failures)
+
+    def test_rejects_dangling_and_cyclic_action_dag(self):
+        first = _policy_ready_action(action_id="a1", depends_on=["missing"])
+        second = _policy_ready_action(action_id="a2", depends_on=["a1"])
+        proposal = _policy_ready_proposal(
+            actions=[first, second],
+            action_dag={
+                "nodes": [
+                    {"action_id": "a1", "action_type": "split_order"},
+                    {"action_id": "a2", "action_type": "split_order"},
+                ],
+                "edges": [
+                    {"from": "missing", "to": "a1"},
+                    {"from": "a1", "to": "a2"},
+                    {"from": "a2", "to": "a1"},
+                ],
+            },
+        )
+
+        failures = WorkflowNodes._validate_execution_proposal_policy(proposal)
+
+        failure_names = {item["name"] for item in failures}
+        assert "action_dag.dependencies:a1" in failure_names
+        assert "action_dag.edge_reference" in failure_names
+        assert "action_dag.acyclic" in failure_names
+
+    def test_rejects_incomplete_success_criteria(self):
+        proposal = _policy_ready_proposal(
+            success_criteria={
+                "goal_type": "split_fulfillment",
+                "criteria": [{"name": "fresh_business_state_reloaded"}],
+                "max_replan_count": 2,
+            }
+        )
+
+        failures = WorkflowNodes._validate_execution_proposal_policy(proposal)
+
+        failure_names = {item["name"] for item in failures}
+        assert "success_criteria.max_replan_count" in failure_names
+        assert "success_criteria.required_names" in failure_names
+        assert "success_criteria.evidence_scope" in failure_names
+
+    def test_rejects_expired_proposal(self):
+        proposal = _policy_ready_proposal(
+            expires_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        )
+
+        failures = WorkflowNodes._validate_execution_proposal_policy(proposal)
+
+        assert any(item["name"] == "plan_schema.expires_at" for item in failures)
+
+    def test_preflight_short_circuits_invalidated_policy_proposal(self, nodes, mock_services):
+        order_svc, inv_svc, _ = mock_services
+        proposal = _policy_ready_proposal(status="invalidated", invalidation_reason="Action DAG 不能包含循环依赖。")
+
+        validation = nodes._preflight_validate(proposal)
+
+        assert validation.status == "invalidated"
+        assert validation.checks[0]["name"] == "policy_schema_validator"
+        order_svc.analyze_order.assert_not_called()
+        inv_svc.analyze_inventory.assert_not_called()
+
+    def test_preflight_rejects_expired_proposal_before_runtime_lookup(self, nodes, mock_services):
+        order_svc, inv_svc, _ = mock_services
+        proposal = _policy_ready_proposal(
+            expires_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        )
+
+        validation = nodes._preflight_validate(proposal)
+
+        assert validation.status == "invalidated"
+        assert validation.checks[0]["name"] == "proposal_expiry"
+        order_svc.analyze_order.assert_not_called()
+        inv_svc.analyze_inventory.assert_not_called()

@@ -2,7 +2,7 @@
 """对比演示脚本：Agent vs 固定工作流。
 
 运行方式：
-  cd e:/multiship-agent
+  cd e:/fulfillops-agent
   python -m scripts.comparison_demo
 """
 

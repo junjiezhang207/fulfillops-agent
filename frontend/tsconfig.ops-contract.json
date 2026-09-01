@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": ".ops-contract",
+    "rootDir": ".",
+    "types": ["node", "vite/client"]
+  },
+  "include": [
+    "src/lib/opsConsole.ts",
+    "src/lib/api.ts",
+    "src/lib/status.ts",
+    "scripts/ops_console_contract.test.ts"
+  ]
+}

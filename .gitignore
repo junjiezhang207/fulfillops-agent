@@ -6,9 +6,14 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache/
+.pytest_tmp/
+.pycache_test/
 .mypy_cache/
 .ruff_cache/
 .deepeval/
+.coverage
+coverage.xml
+htmlcov/
 
 # Virtual environments
 .venv
@@ -26,9 +31,30 @@ wheels/
 frontend/node_modules/
 frontend/dist/
 frontend/.env.local
+frontend/.ops-contract/
+frontend/.vite/
+frontend/.cache/
+playwright-report/
+test-results/
 
 # Runtime data generated locally
 storage/
+.run/
+pgdata/
+postgres_data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.duckdb
+
+# Local Windows launch helpers
+start_windows.cmd
+stop_windows.cmd
+
+# Legacy local bootstrap scripts
+scripts/ensure_mysql_database.py
 
 # Local server logs
 logs/

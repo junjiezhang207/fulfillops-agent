@@ -6,9 +6,9 @@
 
 主要做的事：
 1. 暴露 ``create_checkpointer`` 这个统一入口，供 ``AgentService`` 调用。
-2. 真实创建逻辑委托给 ``app.memory.short_term.create_redis_checkpointer``。
-3. 固定使用 Redis checkpointer，适合多实例和服务重启恢复。
-4. Redis 不可用时直接启动失败，避免短期记忆在多实例下分叉。
+2. 真实创建逻辑委托给 ``app.memory.postgres_short_term.create_postgres_checkpointer``。
+3. 固定使用 PostgreSQL checkpointer，适合多实例和服务重启恢复。
+4. PostgreSQL 不可用时直接启动失败，避免短期记忆在多实例下分叉。
 
 这个文件不负责长期记忆。长期记忆在 ``app/memory/long_term.py``，保存的是
 跨会话可复用的偏好、摘要和订单处理结论；这里保存的是当前会话消息历史。
@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-from app.memory.short_term import create_redis_checkpointer
+from app.memory.postgres_short_term import create_postgres_checkpointer
 
 
 # 使用 LangGraph checkpointer 保存短期记忆，避免手动维护消息列表时遗漏工具消息、
 # AIMessage、恢复逻辑或多实例一致性问题。
-def create_checkpointer(redis_url: str = "", ttl_seconds: int = 86400):
+def create_checkpointer(database_url: str = "", ttl_seconds: int = 86400):
     """创建 LangGraph checkpointer，作为会话短期记忆。"""
-    return create_redis_checkpointer(redis_url=redis_url or None, ttl_seconds=ttl_seconds)
+    return create_postgres_checkpointer(database_url=database_url or None, ttl_seconds=ttl_seconds)

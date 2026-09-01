@@ -45,7 +45,7 @@ export const useReviewStore = create<ReviewState>()(
         get().pendingReviews.find((item) => item.threadId === threadId),
     }),
     {
-      name: "multiship-review-workbench",
+      name: "fulfillops-review-workbench",
       partialize: (state) => ({
         pendingReviews: state.pendingReviews,
         activeThreadId: state.activeThreadId,

@@ -202,7 +202,7 @@ def build_parallel_workflow(nodes: ParallelWorkflowNodes) -> CompiledStateGraph:
 
     注意：
       这个函数目前用于演示并行图结构，未像 workflow.build_workflow 那样暴露
-      checkpointer/store 参数。如果要把它提升为生产主链路，应补齐 Redis
+      checkpointer/store 参数。如果要把它提升为生产主链路，应补齐 PostgreSQL
       checkpointer 和长期记忆 store 的 compile 参数，避免并行版本和串行版本
       在会话恢复能力上不一致。
     """

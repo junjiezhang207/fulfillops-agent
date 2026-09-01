@@ -31,6 +31,20 @@ _ACTION_RE = re.compile(
     r"建议|下一步|优先|需要|可以|应|处理|方案|调拨|拆单|替代|确认|审批|通知|补货|人工"
 )
 _ABSOLUTE_RE = re.compile(r"绝对|100%|百分之百|肯定没问题|无需确认")
+_HITL_RE = re.compile(r"HITL|人工审核|人工审批|人工确认|人工复核|人工介入|审批通过|运营审核", re.IGNORECASE)
+_FRESH_DATA_RE = re.compile(r"重新读取|重新拉取|最新业务|实时业务|当前业务|最新数据|实时数据|源系统")
+_STALE_DATA_RE = re.compile(r"沿用旧数据|使用旧数据|之前的数据|上次的数据|只根据记忆|仅根据记忆|历史数据即可")
+_FORBIDDEN_ACTION_PATTERNS = {
+    "direct_order_mutation": ("直接修改订单", "直接改订单", "已直接修改订单", "已直接改订单"),
+    "direct_inventory_mutation": ("直接扣减库存", "直接修改库存", "直接改库存"),
+    "direct_inventory_transfer": ("直接调拨库存", "直接完成调拨", "已直接调拨"),
+    "direct_split_order": ("直接拆单", "已直接拆单", "直接在 OMS 拆单", "直接在OMS拆单"),
+    "direct_waybill_mutation": ("直接修改运单", "直接生成运单", "已直接生成运单"),
+    "direct_carrier_core_data_mutation": ("直接修改承运商核心数据", "直接改承运商数据"),
+    "direct_purchase_order_mutation": ("直接修改采购单", "直接改采购单", "已直接创建采购单"),
+    "ignore_pim_constraints": ("忽略 PIM", "忽略PIM", "不看商品限制", "无需检查商品限制"),
+    "unrecorded_customer_promise": ("不用记录客服承诺", "无需记录客服承诺", "客服承诺不用留痕"),
+}
 
 
 @dataclass
@@ -89,7 +103,7 @@ def evaluate_agent_result(case: GoldenCase, result: dict[str, Any]) -> Evaluatio
     breakdown.actionability = _score_actionability(case, reply, warnings)
 
     _check_legacy_keywords(case, reply, warnings, hard_failures)
-    _check_hard_fail_conditions(case, reply, evidence_text, tools_called, observations, hard_failures)
+    _check_hard_fail_conditions(case, reply, evidence_text, tools_called, observations, warnings, hard_failures)
 
     total = round(
         breakdown.tool_routing
@@ -319,6 +333,7 @@ def _check_hard_fail_conditions(
     evidence_text: str,
     tools_called: list[str],
     observations: dict[str, list[str]],
+    warnings: list[str],
     hard_failures: list[str],
 ) -> None:
     conditions = set(case.hard_fail_conditions)
@@ -331,6 +346,19 @@ def _check_hard_fail_conditions(
     if "missing_rag_evidence" in conditions:
         if "retrieve_knowledge" not in tools_called or not observations.get("retrieve_knowledge"):
             hard_failures.append("missing_rag_evidence")
+    if "missing_hitl" in conditions and case.expected_decision.get("requires_hitl"):
+        if not _HITL_RE.search(reply):
+            warnings.append("需要 HITL/人工审核，但回答未说明人工审核或审批。")
+            hard_failures.append("missing_hitl")
+    if "uses_stale_business_data" in conditions and case.expected_facts.get("fresh_business_state_required"):
+        if _STALE_DATA_RE.search(reply) and not _FRESH_DATA_RE.search(reply):
+            warnings.append("回答表示沿用旧数据/记忆，未重新读取实时业务状态。")
+            hard_failures.append("uses_stale_business_data")
+    forbidden_hits = _forbidden_action_hits(case, reply)
+    if forbidden_hits:
+        warnings.append(f"回答命中禁止业务动作：{forbidden_hits}")
+        if "direct_business_mutation" in conditions:
+            hard_failures.append("direct_business_mutation")
 
 
 def _unsupported_entities(reply: str, evidence_text: str, case: GoldenCase) -> set[str]:
@@ -392,6 +420,15 @@ def _meaningful_numbers(text: str) -> set[str]:
     return numbers
 
 
+def _forbidden_action_hits(case: GoldenCase, reply: str) -> list[str]:
+    hits: list[str] = []
+    for action in case.forbidden_actions:
+        patterns = (action, *_FORBIDDEN_ACTION_PATTERNS.get(action, ()))
+        if any(re.search(re.escape(pattern), reply, re.IGNORECASE) for pattern in patterns if pattern):
+            hits.append(action)
+    return hits
+
+
 def _action_matched(action: str, reply: str) -> bool:
     action_keywords = {
         "check_warehouse_inventory": ("查仓", "仓库", "库存分布", "调拨"),
@@ -409,4 +446,3 @@ def _point_matched(point: str, reply: str) -> bool:
         if len(token) >= 2 and token not in {"说明", "给出", "明确", "覆盖", "不要", "是否"}
     ]
     return any(keyword in reply for keyword in keywords)
-

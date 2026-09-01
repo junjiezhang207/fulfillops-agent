@@ -42,6 +42,78 @@ class WorkflowRunRequest(BaseModel):
             "合法值参见 KnowledgeRetrieveRequest。"
         ),
     )
+    session_memory: dict = Field(
+        default_factory=dict,
+        description="短期结构化会话记忆快照；不包含实时库存、订单状态或物流 ETA。",
+    )
+
+
+class ProposalAction(BaseModel):
+    """可审批的单个履约动作。"""
+
+    action_id: str = Field(..., description="动作唯一编号。")
+    action_type: str = Field(
+        ...,
+        description=(
+            "动作类型：switch_warehouse / split_order / merge_order / change_carrier / "
+            "inventory_transfer / stockout_resolution / ship_from_warehouse"
+        ),
+    )
+    sku_id: str | None = Field(default=None, description="本动作关联的 SKU。")
+    quantity: int = Field(default=0, ge=0, description="动作处理数量。")
+    from_warehouse: str | None = Field(default=None, description="来源仓。")
+    to_warehouse: str | None = Field(default=None, description="目标仓或调入仓。")
+    carrier: str | None = Field(default=None, description="物流渠道。")
+    cost_delta: float = Field(default=0.0, description="相对默认履约的成本变化。")
+    eta_hours: int = Field(default=0, ge=0, description="预计完成/送达小时数。")
+    reason: str = Field(..., description="动作原因。")
+    reversible: bool = Field(default=True, description="执行后是否可回滚。")
+    depends_on: list[str] = Field(default_factory=list, description="Action DAG 中的前置动作 ID。")
+    responsibility_domain: str | None = Field(default=None, description="责任域：WMS / TMS / ERP / CRM。")
+    business_evidence: list[str] = Field(default_factory=list, description="该动作引用的关键业务依据。")
+
+
+class ExecutionProposal(BaseModel):
+    """Agent 给前端 Action Card 使用的结构化执行提案。"""
+
+    proposal_id: str = Field(..., description="提案 ID，用于审批和幂等追踪。")
+    order_id: str = Field(..., description="订单编号。")
+    title: str = Field(..., description="操作卡片标题。")
+    summary: str = Field(..., description="提案摘要。")
+    status: str = Field(default="pending_approval", description="pending_approval / ready / invalidated / rejected")
+    capabilities: list[str] = Field(default_factory=list, description="本提案覆盖的 Agent 动作能力。")
+    actions: list[ProposalAction] = Field(default_factory=list, description="可执行动作列表。")
+    decision_context: dict = Field(default_factory=dict, description="程序固定加载的订单履约决策上下文 JSON。")
+    inventory_snapshot: list[dict] = Field(default_factory=list, description="审批时库存快照。")
+    cost_breakdown: dict = Field(default_factory=dict, description="成本、价差和物流费用拆解。")
+    eta: dict = Field(default_factory=dict, description="时效估算。")
+    rule_citations: list[str] = Field(default_factory=list, description="引用规则/SOP。")
+    data_fingerprint: str = Field(..., description="订单、库存、物流报价快照指纹。")
+    freshness: dict = Field(default_factory=dict, description="订单/库存/物流数据新鲜度。")
+    approval_required: bool = Field(default=True, description="是否必须人工审批。")
+    preflight_checks: list[str] = Field(default_factory=list, description="执行前必须重新校验的项目。")
+    invalidation_reason: str | None = Field(default=None, description="旧提案失效原因。")
+    goal_type: str = Field(default="fulfillment_resolution", description="处理目标类型，用于匹配成功条件模板。")
+    action_dag: dict = Field(default_factory=dict, description="Action DAG：nodes / edges / scheduling_hint。")
+    success_criteria: dict = Field(default_factory=dict, description="执行后 VERIFYING 阶段必须满足的成功条件。")
+    plan_version: int = Field(default=1, ge=1, description="计划版本，Replan 后递增。")
+    context_version: str = Field(default="", description="生成计划时对应的业务上下文版本。")
+    expires_at: str | None = Field(default=None, description="计划过期时间，过期后禁止直接执行。")
+
+
+class PreflightValidation(BaseModel):
+    """人工批准后的执行前二次校验结果。"""
+
+    status: str = Field(..., description="valid / invalidated / rejected / skipped")
+    checked_at: str = Field(..., description="校验时间。")
+    checks: list[dict] = Field(default_factory=list, description="订单状态、库存和物流报价校验明细。")
+    old_fingerprint: str | None = Field(default=None, description="审批前提案快照指纹。")
+    new_fingerprint: str | None = Field(default=None, description="审批后实时数据快照指纹。")
+    message: str = Field(..., description="校验结论。")
+    replacement_proposal: ExecutionProposal | None = Field(
+        default=None,
+        description="旧提案失效时重新生成的新提案。",
+    )
 
 
 class FinalAnswer(BaseModel):
@@ -69,6 +141,14 @@ class FinalAnswer(BaseModel):
             "主链路实际走的路径标识，方便调用方判断。"
             "取值：fast_path（库存充足直通）/ knowledge_path（经过知识检索）。"
         ),
+    )
+    execution_proposal: ExecutionProposal | None = Field(
+        default=None,
+        description="如果本次生成了可审批执行提案，前端可用它渲染 Action Card。",
+    )
+    preflight_validation: PreflightValidation | None = Field(
+        default=None,
+        description="人工审批后的执行前二次校验结果。",
     )
 
 
@@ -138,6 +218,10 @@ class WorkflowRunResult(BaseModel):
         default_factory=list,
         description="实际生效的知识类别过滤条件。",
     )
+    session_memory: dict = Field(
+        default_factory=dict,
+        description="本轮使用的短期结构化会话记忆快照。",
+    )
     order_result: OrderAnalysisResult | None = Field(
         default=None, description="订单分析节点结果。"
     )
@@ -150,6 +234,14 @@ class WorkflowRunResult(BaseModel):
     )
     final_answer: FinalAnswer | None = Field(
         default=None, description="finalize 节点产出的最终结论。"
+    )
+    execution_proposal: ExecutionProposal | None = Field(
+        default=None,
+        description="可审批的履约执行提案。",
+    )
+    preflight_validation: PreflightValidation | None = Field(
+        default=None,
+        description="执行前二次校验结果。",
     )
     trace: list[TraceEvent] = Field(
         default_factory=list,

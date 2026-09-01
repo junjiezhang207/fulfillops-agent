@@ -22,6 +22,191 @@ export type InterruptEvent = {
   timeout_seconds: number;
 };
 
+export type ProposalAction = {
+  action_id: string;
+  action_type: string;
+  sku_id?: string | null;
+  quantity: number;
+  from_warehouse?: string | null;
+  to_warehouse?: string | null;
+  carrier?: string | null;
+  cost_delta: number;
+  eta_hours: number;
+  reason: string;
+  reversible: boolean;
+  depends_on?: string[];
+  responsibility_domain?: string | null;
+  business_evidence?: string[];
+};
+
+export type ExecutionProposal = {
+  proposal_id: string;
+  order_id: string;
+  title: string;
+  summary: string;
+  status: string;
+  capabilities: string[];
+  actions: ProposalAction[];
+  decision_context: Record<string, any>;
+  inventory_snapshot: Array<Record<string, unknown>>;
+  cost_breakdown: Record<string, unknown>;
+  eta: Record<string, unknown>;
+  rule_citations: string[];
+  data_fingerprint: string;
+  freshness: Record<string, unknown>;
+  approval_required: boolean;
+  preflight_checks: string[];
+  invalidation_reason?: string | null;
+  goal_type?: string;
+  action_dag?: Record<string, unknown>;
+  success_criteria?: Record<string, unknown>;
+  plan_version?: number;
+  context_version?: string;
+  expires_at?: string | null;
+};
+
+export type PreflightValidation = {
+  status: string;
+  checked_at: string;
+  checks: Array<Record<string, unknown>>;
+  old_fingerprint?: string | null;
+  new_fingerprint?: string | null;
+  message: string;
+  replacement_proposal?: ExecutionProposal | null;
+};
+
+export type RecentMessage = {
+  role: string;
+  content: string;
+  created_at: string;
+};
+
+export type StructuredSessionMemory = {
+  current_topic?: string;
+  user_preferences?: Record<string, unknown>;
+  confirmed_constraints?: Record<string, unknown>;
+  plan_feedback?: Record<string, unknown>;
+  references?: Record<string, unknown>;
+};
+
+export type SessionMemorySnapshot = {
+  thread_id: string;
+  order_id?: string;
+  recent_messages?: RecentMessage[];
+  structured?: StructuredSessionMemory;
+  memory_use_case?: string;
+  token_budget?: number;
+  updated_at?: string | null;
+};
+
+export type RAGEvidenceItem = {
+  source_type: string;
+  source_file?: string;
+  category?: string;
+  title?: string;
+  chunk_id?: string;
+  source_case_id?: string;
+  score?: number;
+  text_excerpt?: string;
+};
+
+export type RAGSourceSet = {
+  query?: string;
+  applied_filters?: string[];
+  key_points?: string[];
+  coverage_note?: string;
+  evidence?: RAGEvidenceItem[];
+};
+
+export type PlannerRAGContext = {
+  order_id: string;
+  question: string;
+  vector_backend?: string;
+  retrieval_strategy?: string;
+  priority_rule?: string;
+  sop_evidence?: RAGSourceSet;
+  similar_cases?: RAGSourceSet;
+  warnings?: string[];
+};
+
+export type RoutedExternalTask = {
+  task_id: string;
+  case_id: string;
+  proposal_id: string;
+  action_id: string;
+  action_type: string;
+  target_system: string;
+  domain_service: string;
+  collaborative_tool_name?: string;
+  external_task_type: string;
+  payload: Record<string, unknown>;
+  status: string;
+  case_version?: number;
+  plan_version?: number;
+  dependency_ids?: string[];
+  idempotency_key?: string;
+  created_at: string;
+  updated_at: string;
+  result: Record<string, unknown>;
+};
+
+export type FulfillmentCase = {
+  case_id: string;
+  order_id: string;
+  proposal_id: string;
+  case_status: string;
+  case_version?: number;
+  plan: ExecutionProposal;
+  plan_version?: number;
+  context_version?: string;
+  action_dag?: Record<string, unknown>;
+  success_criteria?: Record<string, unknown>;
+  replan_count?: number;
+  checkpoint: Record<string, unknown>;
+  current_state?: Record<string, unknown>;
+  tasks: RoutedExternalTask[];
+  created_at: string;
+  updated_at: string;
+  verification: Record<string, unknown>;
+};
+
+export type FulfillmentCaseVerifyResult = {
+  case_id: string;
+  order_id: string;
+  status: string;
+  message: string;
+  checks: Array<Record<string, unknown>>;
+  replan_required: boolean;
+  replacement_proposal?: ExecutionProposal | null;
+};
+
+export type ExcellentCaseRecord = {
+  excellent_case_id: string;
+  case_id: string;
+  order_id_masked: string;
+  scenario: string;
+  key_conditions: string[];
+  final_plan: Array<Record<string, unknown>>;
+  sop_evidence: string[];
+  execution_result: Record<string, unknown>;
+  vector_backend: string;
+  created_at: string;
+};
+
+export type CaseIngestionJob = {
+  job_id: string;
+  case_id: string;
+  status: "PENDING" | "PROCESSING" | "SUCCESS" | "FAILED" | string;
+  retry_count: number;
+  operator_id: string;
+  notes: string;
+  excellent_case_id?: string | null;
+  knowledge_path?: string | null;
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type BusinessTraceStep = {
   id: string;
   parent_id?: string | null;
@@ -86,6 +271,10 @@ export type HybridRunResult = {
   conversation_turns?: number;
   status: "completed" | "interrupted" | "error" | string;
   interrupt?: InterruptEvent | null;
+  action_card?: ExecutionProposal | null;
+  preflight_validation?: PreflightValidation | null;
+  session_memory?: SessionMemorySnapshot | null;
+  rag_context?: PlannerRAGContext | null;
   from_cache?: boolean;
   business_trace?: BusinessTrace | null;
 };
@@ -110,6 +299,12 @@ export type OrderItem = {
   product_name: string;
   quantity: number;
   unit_price: number;
+  allocated_quantity?: number;
+  shipped_quantity?: number;
+  sku_status?: string;
+  split_allowed?: boolean;
+  special_storage?: string | null;
+  sku_type?: string | null;
 };
 
 export type OrderRecord = {
@@ -120,6 +315,17 @@ export type OrderRecord = {
   region: string;
   priority: string;
   items: OrderItem[];
+  created_at?: string | null;
+  promise_delivery_time?: string | null;
+  current_warehouse_id?: string | null;
+  shipping_region?: string | null;
+  fulfillment_type?: string;
+  already_split?: boolean;
+  inventory_reserved?: boolean;
+  package_created?: boolean;
+  waybill_created?: boolean;
+  outbound_completed?: boolean;
+  active_fulfillment_tasks?: string[];
 };
 
 export type ApprovalAuditEntry = {
@@ -151,6 +357,16 @@ export type InventoryRecord = {
   available_stock: number;
   locked_stock: number;
   updated_at: string;
+  on_hand_stock?: number | null;
+  reserved_stock?: number;
+  inbound_stock?: number;
+  expected_inbound_time?: string | null;
+  inventory_version?: string | null;
+  warehouse_status?: string;
+  service_region?: string | null;
+  supported_sku_types?: string[];
+  cutoff_time?: string | null;
+  capacity_status?: string;
 };
 
 export type EnterpriseDataSource = {
@@ -387,7 +603,7 @@ export async function runHybrid(input: {
 
 export async function resumeHybrid(input: {
   threadId: string;
-  decision: "approved" | "rejected";
+  decision: "approved" | "rejected" | "modify" | "ask_followup";
   notes: string;
 }) {
   const params = new URLSearchParams({
@@ -396,6 +612,79 @@ export async function resumeHybrid(input: {
     notes: input.notes,
   });
   return request<HybridRunResult>(`/hybrid/resume?${params.toString()}`, { method: "POST" });
+}
+
+export function confirmFulfillmentCase(input: {
+  proposal: ExecutionProposal;
+  preflightValidation: PreflightValidation;
+  approverId?: string;
+  notes?: string;
+  checkpoint?: Record<string, unknown>;
+}) {
+  return request<{ case: FulfillmentCase }>("/fulfillment-cases/confirm", {
+    method: "POST",
+    body: JSON.stringify({
+      proposal: input.proposal,
+      preflight_validation: input.preflightValidation,
+      approver_id: input.approverId || "operator",
+      notes: input.notes || "",
+      checkpoint: input.checkpoint || {},
+    }),
+  });
+}
+
+export function listFulfillmentCases(input?: { orderId?: string; limit?: number }) {
+  const params = new URLSearchParams();
+  if (input?.orderId) params.set("order_id", input.orderId);
+  if (input?.limit) params.set("limit", String(input.limit));
+  const query = params.toString();
+  return request<{ cases: FulfillmentCase[] }>(`/fulfillment-cases${query ? `?${query}` : ""}`);
+}
+
+export function verifyFulfillmentCase(caseId: string) {
+  return request<{ verification: FulfillmentCaseVerifyResult }>(`/fulfillment-cases/${encodeURIComponent(caseId)}/verify`, {
+    method: "POST",
+  });
+}
+
+export function updateFulfillmentTask(input: {
+  taskId: string;
+  status: "RUNNING" | "COMPLETED" | "FAILED" | "REJECTED";
+  message?: string;
+  result?: Record<string, unknown>;
+  eventId?: string;
+  caseVersion?: number;
+  planVersion?: number;
+  idempotencyKey?: string;
+}) {
+  return request<{ case: FulfillmentCase }>(`/fulfillment-cases/tasks/${encodeURIComponent(input.taskId)}/webhook`, {
+    method: "POST",
+    body: JSON.stringify({
+      status: input.status,
+      event_id: input.eventId,
+      case_version: input.caseVersion,
+      plan_version: input.planVersion,
+      idempotency_key: input.idempotencyKey,
+      message: input.message || "",
+      result: input.result || {
+        simulated_from: "operations_dashboard",
+        simulated_at: new Date().toISOString(),
+      },
+    }),
+  });
+}
+
+export function persistExcellentCase(input: { caseId: string; operatorId?: string; notes?: string }) {
+  return request<{ ingestion_job: CaseIngestionJob; rebuild_scheduled: boolean }>(
+    `/fulfillment-cases/${encodeURIComponent(input.caseId)}/excellent-case`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        operator_id: input.operatorId || "operator",
+        notes: input.notes || "",
+      }),
+    },
+  );
 }
 
 export function listBusinessTraces(input?: {

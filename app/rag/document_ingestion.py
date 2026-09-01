@@ -25,10 +25,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from app.agents.tools.guardrails import get_tool_sanitizer
+from app.observability.business_trace import record_prompt_injection_detected
+
 
 # 这些后缀是当前 pipeline 真正能处理的源格式。
-# .md/.txt 是已有能力；.pdf/.docx 是本次新增能力。
-SUPPORTED_SOURCE_SUFFIXES = {".md", ".txt", ".pdf", ".docx"}
+# .md/.txt 是轻量文本；.pdf/.docx/.pptx 覆盖 SOP 常见办公文档。
+SUPPORTED_SOURCE_SUFFIXES = {".md", ".txt", ".pdf", ".docx", ".pptx"}
 
 
 @dataclass
@@ -59,6 +62,7 @@ class CleanResult:
     removed_header_footer_lines: int = 0
     removed_duplicate_blocks: int = 0
     redacted_sensitive_items: int = 0
+    prompt_injection_items: int = 0
     repaired_encoding: bool = False
     warnings: list[str] = field(default_factory=list)
 
@@ -132,6 +136,8 @@ class DocumentParser:
             return self._parse_pdf(raw)
         if suffix == ".docx":
             return self._parse_docx(raw)
+        if suffix == ".pptx":
+            return self._parse_pptx(raw)
         raise ValueError(f"不支持的知识文档类型：{suffix}")
 
     def _parse_text(self, filename: str, raw: bytes, source_type: str) -> ParsedDocument:
@@ -236,6 +242,92 @@ class DocumentParser:
             tables=table_count,
         )
 
+    def _parse_pptx(self, raw: bytes) -> ParsedDocument:
+        """解析 PowerPoint ``.pptx``。
+
+        SOP 流程经常以培训课件或流程图 deck 形式存在。这里不尝试理解图形连线，
+        但会保留每张 slide 的标题、文本框和表格，形成可审查的 Markdown。
+        """
+
+        try:
+            from pptx import Presentation
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
+        except ImportError as exc:  # pragma: no cover - 只有缺依赖时触发
+            raise RuntimeError("解析 PowerPoint 需要安装 python-pptx。") from exc
+
+        presentation = Presentation(BytesIO(raw))
+        slides: list[str] = []
+        table_count = 0
+        warnings: list[str] = []
+
+        for slide_index, slide in enumerate(presentation.slides, start=1):
+            parts: list[str] = []
+            title = ""
+            if slide.shapes.title is not None:
+                title = (getattr(slide.shapes.title, "text", "") or "").strip()
+            parts.append(f"# Slide {slide_index}: {title}" if title else f"# Slide {slide_index}")
+
+            for shape in slide.shapes:
+                if shape is slide.shapes.title:
+                    continue
+                if getattr(shape, "has_table", False):
+                    rows = [
+                        [cell.text for cell in row.cells]
+                        for row in shape.table.rows
+                    ]
+                    markdown_table = MarkdownTableCleaner.table_to_markdown(rows)
+                    if markdown_table:
+                        table_count += 1
+                        parts.append(markdown_table)
+                    continue
+                if getattr(shape, "has_text_frame", False):
+                    text = "\n".join(
+                        paragraph.text.strip()
+                        for paragraph in shape.text_frame.paragraphs
+                        if paragraph.text and paragraph.text.strip()
+                    )
+                    if text:
+                        parts.append(text)
+                    continue
+                if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+                    grouped_text = DocumentParser._group_shape_text(shape)
+                    if grouped_text:
+                        parts.append(grouped_text)
+
+            if len(parts) == 1:
+                warnings.append(f"第 {slide_index} 张幻灯片未提取到正文文本。")
+            slides.append("\n\n".join(parts))
+
+        return ParsedDocument(
+            markdown="\n\n---\n\n".join(slides),
+            source_type="pptx",
+            parser="python-pptx",
+            pages=len(slides),
+            tables=table_count,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _group_shape_text(shape: Any) -> str:
+        """提取组合形状里的文本，供 PPTX 流程图节点召回使用。"""
+
+        lines: list[str] = []
+        for child in getattr(shape, "shapes", []):
+            if getattr(child, "has_text_frame", False):
+                text = "\n".join(
+                    paragraph.text.strip()
+                    for paragraph in child.text_frame.paragraphs
+                    if paragraph.text and paragraph.text.strip()
+                )
+                if text:
+                    lines.append(text)
+            elif getattr(child, "has_table", False):
+                table = [[cell.text for cell in row.cells] for row in child.table.rows]
+                markdown_table = MarkdownTableCleaner.table_to_markdown(table)
+                if markdown_table:
+                    lines.append(markdown_table)
+        return "\n\n".join(lines)
+
 
 class MarkdownTableCleaner:
     """表格清洗工具。
@@ -339,6 +431,11 @@ class TextCleaner:
         result.removed_duplicate_blocks = duplicate_removed
         text, redacted = TextCleaner._redact_sensitive(text)
         result.redacted_sensitive_items = redacted
+        text, injection_removed = TextCleaner._sanitize_prompt_injection(text)
+        result.prompt_injection_items = injection_removed
+        if injection_removed:
+            record_prompt_injection_detected("document_ingestion")
+            result.warnings.append("检测到疑似 Prompt Injection，已在入库前净化。")
         text = TextCleaner._normalize_markdown_spacing(text)
         result.markdown = text.strip() + "\n" if text.strip() else ""
         return result
@@ -448,6 +545,16 @@ class TextCleaner:
             text, count = pattern.subn(replacement, text)
             total += count
         return text, total
+
+    @staticmethod
+    def _sanitize_prompt_injection(text: str) -> tuple[str, int]:
+        """净化知识文档中夹带的提示词注入内容。"""
+
+        sanitizer = get_tool_sanitizer()
+        if not sanitizer.has_injection(text):
+            return text, 0
+        sanitized = sanitizer.sanitize(text, source="document_ingestion")
+        return sanitized, 1 if sanitized != text else 0
 
     @staticmethod
     def _normalize_markdown_spacing(text: str) -> str:
@@ -561,7 +668,7 @@ class DocumentIngestionService:
 
         suffix = Path(filename).suffix.lower()
         if suffix not in SUPPORTED_SOURCE_SUFFIXES:
-            raise ValueError("仅支持上传 .md、.txt、.pdf 或 .docx 知识文档。")
+            raise ValueError("仅支持上传 .md、.txt、.pdf、.docx 或 .pptx 知识文档。")
 
         parsed = self.parser.parse(filename, raw)
         cleaned = TextCleaner.clean(parsed.markdown)
@@ -599,6 +706,7 @@ class DocumentIngestionService:
                 "removed_header_footer_lines": cleaned.removed_header_footer_lines,
                 "removed_duplicate_blocks": cleaned.removed_duplicate_blocks,
                 "redacted_sensitive_items": cleaned.redacted_sensitive_items,
+                "prompt_injection_items": cleaned.prompt_injection_items,
                 "repaired_encoding": parsed.repaired_encoding or cleaned.repaired_encoding,
             },
             metadata=metadata,
@@ -733,6 +841,9 @@ class DocumentIngestionService:
         normalized = {key: value for key, value in metadata.items() if value not in (None, "")}
         normalized.setdefault("title", Path(filename).stem)
         normalized.setdefault("source_filename", filename)
+        normalized.setdefault("knowledge_source", "sop")
+        normalized.setdefault("version_status", "active")
+        normalized.setdefault("is_active", "true")
         return normalized
 
     def _inject_front_matter(self, markdown: str, document_id: str, metadata: dict[str, Any]) -> str:

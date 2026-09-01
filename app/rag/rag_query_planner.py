@@ -18,6 +18,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -46,18 +47,20 @@ INTENT_KEYWORDS = {
 # 每类意图对应的补充检索 query。
 # 用户原话往往很短，例如“这个订单怎么办”，扩展后能召回到 SOP 里的正式术语。
 INTENT_QUERY_EXPANSIONS = {
-    QueryIntentType.STOCKOUT_HANDLING: ["缺货履约规则", "缺货订单 SOP"],
-    QueryIntentType.PRIORITY_FULFILLMENT: ["高优先级订单履约规范"],
-    QueryIntentType.REGIONAL_STRATEGY: ["区域仓配策略", "跨区域履约规则"],
-    QueryIntentType.SPLIT_MERGE: ["拆单与合单履约规则"],
-    QueryIntentType.AFTER_SALES: ["售后与补发履约规则"],
+    QueryIntentType.STOCKOUT_HANDLING: ["缺货履约规则", "缺货订单 SOP", "缺货异常订单历史优秀案例"],
+    QueryIntentType.PRIORITY_FULFILLMENT: ["高优先级订单履约规范", "高优先级履约优秀案例"],
+    QueryIntentType.REGIONAL_STRATEGY: ["区域仓配策略", "跨区域履约规则", "跨区域履约历史案例"],
+    QueryIntentType.SPLIT_MERGE: ["拆单与合单履约规则", "拆单合单履约优秀案例"],
+    QueryIntentType.AFTER_SALES: ["售后与补发履约规则", "售后补发历史案例"],
     QueryIntentType.GENERAL: ["通用履约规则"],
 }
+
+EXCELLENT_CASE_GENERAL_QUERY = "相似异常订单优秀案例与执行复盘"
 
 _INTENT_CLASSIFIER_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        get_model_gateway().prompt_system(use_case="rag_rewrite", prompt_id="rag_intent_classifier"),
+        get_model_gateway().prompt_system(use_case="intent_classification", prompt_id="rag_intent_classifier"),
     ),
     (
         "human",
@@ -98,6 +101,7 @@ class RetrievalInputs:
     intent: QueryIntent
     retrieval_context: str
     has_order_context: bool = True
+    session_memory_context: str = ""
 
 
 class RAGQueryPlanner:
@@ -131,6 +135,7 @@ class RAGQueryPlanner:
         order_id: str,
         question: str,
         filter_categories: list[str] | None,
+        session_memory: dict[str, Any] | None = None,
     ) -> RetrievalInputs:
         """准备一次检索所需的全部业务上下文。
 
@@ -154,7 +159,14 @@ class RAGQueryPlanner:
             intent=intent,
         )
         # active_filters 是调用方指定的知识类别过滤，没有就用空列表。
-        return RetrievalInputs(filter_categories or [], inventory_result, intent, retrieval_context, True)
+        return RetrievalInputs(
+            filter_categories or [],
+            inventory_result,
+            intent,
+            retrieval_context,
+            True,
+            self.session_memory_context(session_memory),
+        )
 
     def build_queries(self, question: str, prepared: RetrievalInputs) -> list[str]:
         """构建同步检索 query 列表。
@@ -191,7 +203,7 @@ class RAGQueryPlanner:
         """
         # 这里读取 prepare 阶段已经算好的库存结果，避免重复查库存。
         inventory_result = prepared.inventory_result
-        return self.build_expanded_queries(
+        queries = self.build_expanded_queries(
             question=question,
             retrieval_context=prepared.retrieval_context,
             insufficient_skus=inventory_result.insufficient_skus,
@@ -199,6 +211,34 @@ class RAGQueryPlanner:
             intent=prepared.intent,
             include_inventory_scenario=prepared.has_order_context,
         )
+        if prepared.session_memory_context:
+            queries.append(prepared.session_memory_context)
+        return unique_nonempty(queries)
+
+    @staticmethod
+    def session_memory_context(session_memory: dict[str, Any] | None) -> str:
+        """Build local-only retrieval hints from structured session memory."""
+
+        structured = (session_memory or {}).get("structured") or {}
+        hints: list[str] = []
+        topic = structured.get("current_topic")
+        if topic:
+            hints.append(f"当前讨论主题：{topic}")
+        preferences = structured.get("user_preferences") or {}
+        if preferences:
+            hints.append(f"运营偏好：{preferences}")
+        constraints = structured.get("confirmed_constraints") or {}
+        if constraints:
+            hints.append(f"已确认约束：{constraints}")
+        feedback = structured.get("plan_feedback") or {}
+        if feedback:
+            hints.append(f"方案反馈：{feedback}")
+        references = structured.get("references") or {}
+        if references:
+            hints.append(f"指代关系：{references}")
+        if not hints:
+            return ""
+        return "短期记忆检索约束：" + "；".join(hints)
 
     def recognize_intent(
         self, question: str, insufficient_skus: list[str], fulfillment_ready: bool
@@ -375,6 +415,8 @@ class RAGQueryPlanner:
         for secondary_intent in intent.secondary_intents:
             # 次意图也加入扩展，避免跨领域问题漏召回。
             queries.extend(INTENT_QUERY_EXPANSIONS.get(secondary_intent, []))
+        if intent.primary_intent != QueryIntentType.GENERAL:
+            queries.append(EXCELLENT_CASE_GENERAL_QUERY)
         if include_inventory_scenario and insufficient_skus:
             # 缺货场景补充具体 SKU，让检索更贴近当前订单。
             queries.append(f"库存不足 SKU：{'、'.join(insufficient_skus)}，优先检索缺货处理与跨仓规则")

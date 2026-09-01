@@ -45,7 +45,7 @@ _knowledge_svc = get_knowledge_retrieval_service()
 _ingestion_svc = DocumentIngestionService(_settings.knowledge_dir)
 
 # 重建状态目前保存在进程内存中。
-# 学习项目这样最直观；真实多实例部署时应换成 Redis / 数据库 / 任务队列状态表。
+# 学习项目这样最直观；真实多实例部署时应换成 PostgreSQL / 任务队列状态表。
 _rebuild_status: dict = {"running": False, "last_result": None, "last_error": None}
 
 

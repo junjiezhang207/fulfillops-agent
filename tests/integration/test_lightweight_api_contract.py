@@ -6,7 +6,23 @@ from app.api.routes import health as health_routes
 from app.api.routes import models as models_routes
 from app.api.routes import workflow as workflow_routes
 from app.core import rate_limiter
-from app.core.rate_limiter import RateLimiter
+
+
+class CountingLimiter:
+    def __init__(self, max_requests: int, window_seconds: float):
+        self._max = max_requests
+        self._window = window_seconds
+        self.counts: dict[str, int] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        self.counts[key] = self.counts.get(key, 0) + 1
+        return self.counts[key] <= self._max
+
+    def remaining(self, key: str) -> int:
+        return max(0, self._max - self.counts.get(key, 0))
+
+    def evict_expired(self) -> int:
+        return 0
 
 
 def _client_for_router(router, prefix: str = "/api/v1") -> TestClient:
@@ -72,7 +88,7 @@ def test_agent_chat_uses_rate_limiter_before_model_execution(monkeypatch):
 
     client = _client_for_router(agent_routes.router)
     fake_service = FakeAgentService()
-    monkeypatch.setattr(rate_limiter, "agent_limiter", RateLimiter(max_requests=1, window_seconds=60))
+    monkeypatch.setattr(rate_limiter, "agent_limiter", CountingLimiter(max_requests=1, window_seconds=60))
     monkeypatch.setattr(agent_routes, "_agent_service_for_model", lambda model_id: fake_service)
 
     body = {"session_id": "api-rate-session", "message": "订单 SO202502140001 是什么？"}
@@ -92,7 +108,7 @@ def test_agent_chat_rejects_prompt_injection_before_service_call(monkeypatch):
             raise AssertionError("Agent should not run for blocked input")
 
     client = _client_for_router(agent_routes.router)
-    monkeypatch.setattr(rate_limiter, "agent_limiter", RateLimiter(max_requests=10, window_seconds=60))
+    monkeypatch.setattr(rate_limiter, "agent_limiter", CountingLimiter(max_requests=10, window_seconds=60))
     monkeypatch.setattr(agent_routes, "_agent_service_for_model", lambda model_id: FakeAgentService())
 
     response = client.post(
@@ -121,7 +137,7 @@ def test_workflow_run_uses_rate_limiter_before_service_execution(monkeypatch):
 
     client = _client_for_router(workflow_routes.router)
     fake_service = FakeWorkflowService()
-    monkeypatch.setattr(rate_limiter, "workflow_limiter", RateLimiter(max_requests=1, window_seconds=60))
+    monkeypatch.setattr(rate_limiter, "workflow_limiter", CountingLimiter(max_requests=1, window_seconds=60))
     monkeypatch.setattr(workflow_routes, "_workflow_service", fake_service)
 
     body = {"order_id": "SO202502140001", "question": "库存不足怎么办？"}

@@ -13,10 +13,12 @@ from langchain_core.tools import BaseTool
 
 from app.agents.tools.contracts import TOOL_MANIFESTS, ToolCachePolicy, ToolManifest
 from app.agents.tools.factory import (
+    make_context_detail_tool,
     make_fulfillment_plan_tool,
     make_inventory_tool,
     make_knowledge_tool,
     make_order_tool,
+    make_source_context_tool,
     make_substitute_tool,
     make_warehouse_tool,
 )
@@ -36,6 +38,7 @@ class ToolServiceBundle:
     warehouse_service: object | None = None
     substitute_service: object | None = None
     fulfillment_service: object | None = None
+    context_service: object | None = None
 
 
 ToolBuilder = Callable[[ToolServiceBundle], BaseTool]
@@ -139,7 +142,7 @@ def _default_definitions() -> list[ToolDefinition]:
             name="analyze_order",
             builder=lambda services: make_order_tool(_require(services.order_service, "order_service", "analyze_order")),
             manifest=TOOL_MANIFESTS["analyze_order"],
-            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            use_cases=("agent", "plan_execute", "multi_agent"),
             groups=("multi_agent.risk_agent",),
         ),
         ToolDefinition(
@@ -176,6 +179,85 @@ def _default_definitions() -> list[ToolDefinition]:
             manifest=TOOL_MANIFESTS["generate_fulfillment_plan"],
             use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
             groups=("multi_agent.fulfillment_agent",),
+        ),
+        ToolDefinition(
+            name="get_context_detail",
+            builder=lambda services: make_context_detail_tool(_require(services.context_service, "context_service", "get_context_detail")),
+            manifest=TOOL_MANIFESTS["get_context_detail"],
+            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            groups=("multi_agent.fulfillment_agent",),
+        ),
+        ToolDefinition(
+            name="get_order_detail",
+            builder=lambda services: make_source_context_tool(
+                _require(services.context_service, "context_service", "get_order_detail"),
+                name="get_order_detail",
+                source_system="OMS",
+                description="只读获取 OMS 订单主信息、SKU 明细和已发生履约状态。",
+            ),
+            manifest=TOOL_MANIFESTS["get_order_detail"],
+            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            groups=("multi_agent.risk_agent", "multi_agent.fulfillment_agent"),
+        ),
+        ToolDefinition(
+            name="get_inventory_warehouse_detail",
+            builder=lambda services: make_source_context_tool(
+                _require(services.context_service, "context_service", "get_inventory_warehouse_detail"),
+                name="get_inventory_warehouse_detail",
+                source_system="WMS",
+                description="只读获取 WMS 候选仓、仓库能力和 SKU×仓库存，立即履约判断必须使用 available_stock。",
+            ),
+            manifest=TOOL_MANIFESTS["get_inventory_warehouse_detail"],
+            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            groups=("multi_agent.inventory_agent", "multi_agent.fulfillment_agent"),
+        ),
+        ToolDefinition(
+            name="get_shipping_detail",
+            builder=lambda services: make_source_context_tool(
+                _require(services.context_service, "context_service", "get_shipping_detail"),
+                name="get_shipping_detail",
+                source_system="TMS",
+                description="只读获取 TMS 物流渠道、可配送性、运费、截单时间和预计送达时间。",
+            ),
+            manifest=TOOL_MANIFESTS["get_shipping_detail"],
+            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            groups=("multi_agent.fulfillment_agent",),
+        ),
+        ToolDefinition(
+            name="get_supply_chain_detail",
+            builder=lambda services: make_source_context_tool(
+                _require(services.context_service, "context_service", "get_supply_chain_detail"),
+                name="get_supply_chain_detail",
+                source_system="ERP",
+                description="只读获取 ERP 补货、采购和在途库存信息。",
+            ),
+            manifest=TOOL_MANIFESTS["get_supply_chain_detail"],
+            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            groups=("multi_agent.fulfillment_agent",),
+        ),
+        ToolDefinition(
+            name="get_product_constraints",
+            builder=lambda services: make_source_context_tool(
+                _require(services.context_service, "context_service", "get_product_constraints"),
+                name="get_product_constraints",
+                source_system="PIM",
+                description="只读获取 PIM 商品履约限制，如冷链、危险品、拆单限制和商品类型。",
+            ),
+            manifest=TOOL_MANIFESTS["get_product_constraints"],
+            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            groups=("multi_agent.fulfillment_agent",),
+        ),
+        ToolDefinition(
+            name="get_customer_case_context",
+            builder=lambda services: make_source_context_tool(
+                _require(services.context_service, "context_service", "get_customer_case_context"),
+                name="get_customer_case_context",
+                source_system="CRM",
+                description="只读获取 CRM 客诉、客服承诺和客户风险上下文。",
+            ),
+            manifest=TOOL_MANIFESTS["get_customer_case_context"],
+            use_cases=("agent", "plan_execute", "multi_agent", "mcp"),
+            groups=("multi_agent.risk_agent", "multi_agent.fulfillment_agent"),
         ),
     ]
 

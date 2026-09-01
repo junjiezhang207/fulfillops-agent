@@ -1,4 +1,4 @@
-"""MultiShip 供应链履约 MCP Server。
+"""fulfillops-agent 电商履约 MCP Server。
 
 这是项目的核心 MCP Server，以标准 MCP 协议暴露所有业务能力。
 
@@ -65,6 +65,7 @@ from app.agents.tools.contracts import (
 )
 from app.agents.tools.registry import ToolServiceBundle, get_tool_registry
 from app.agents.tools.wrapper import wrap_tool_with_resilience
+from app.application.routing.order_context_service import OrderContextService
 from app.domain.inventory.warehouse_service import WarehouseService
 from app.domain.fulfillment.substitute_sku import SubstituteSkuService
 from app.domain.fulfillment.plan_service import FulfillmentPlanService
@@ -75,9 +76,9 @@ from app.mcp.runtime import run_mcp_server
 # ============================================================================
 
 mcp = FastMCP(
-    "multiship-fulfillment",
+    "fulfillops-fulfillment",
     instructions="""
-你正在使用 MultiShip 供应链履约 MCP Server。
+你正在使用 fulfillops-agent 电商履约 MCP Server。
 
 该 Server 提供以下能力：
   1. 订单和库存查询（analyze_order, check_inventory, search_warehouse_inventory）
@@ -107,6 +108,12 @@ _fulfillment_svc = FulfillmentPlanService(
     warehouse_service=_warehouse_svc,
     substitute_service=_substitute_svc,
 )
+_context_svc = OrderContextService(
+    order_service=_order_svc,
+    inventory_service=_inv_svc,
+)
+
+_DEFAULT_MCP_SERVER_ID = "fulfillops-fulfillment"
 
 
 def _get_knowledge_svc():
@@ -127,6 +134,36 @@ def _csv_env(name: str, default: list[str]) -> list[str]:
     raw = os.getenv(name, "")
     values = [item.strip() for item in raw.split(",") if item.strip()]
     return values or list(default)
+
+
+def _csv_env_optional(name: str) -> list[str]:
+    """读取可选白名单；未配置表示允许当前注册表里的默认能力。"""
+    raw = os.getenv(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _mcp_server_id() -> str:
+    return os.getenv("MCP_SERVER_ID", _DEFAULT_MCP_SERVER_ID)
+
+
+def _mcp_server_allowed() -> bool:
+    allowed_servers = _csv_env_optional("MCP_ALLOWED_SERVERS")
+    return not allowed_servers or _mcp_server_id() in allowed_servers
+
+
+def _mcp_tool_allowed(tool_name: str) -> bool:
+    allowed_tools = _csv_env_optional("MCP_ALLOWED_TOOLS")
+    return not allowed_tools or tool_name in allowed_tools
+
+
+def _mcp_whitelist_meta(tool_name: str) -> dict:
+    return {
+        "server_id": _mcp_server_id(),
+        "server_allowed": _mcp_server_allowed(),
+        "tool_allowed": _mcp_tool_allowed(tool_name),
+        "allowed_tools_env": _csv_env_optional("MCP_ALLOWED_TOOLS"),
+        "allowed_servers_env": _csv_env_optional("MCP_ALLOWED_SERVERS"),
+    }
 
 
 def _mcp_runtime_context() -> ToolRuntimeContext:
@@ -166,10 +203,15 @@ def _build_mcp_tool_map():
         warehouse_service=_warehouse_svc,
         substitute_service=_substitute_svc,
         fulfillment_service=_fulfillment_svc,
+        context_service=_context_svc,
     )
     registry = get_tool_registry()
     tools = {}
+    if not _mcp_server_allowed():
+        return tools
     for definition in registry.definitions(use_case="mcp"):
+        if not _mcp_tool_allowed(definition.name):
+            continue
         base_tool = definition.builder(services)
         tools[definition.name] = wrap_tool_with_resilience(
             base_tool,
@@ -214,6 +256,7 @@ def _tool_meta(tool_name: str) -> dict:
     return {
         "tool_registry": definition.metadata(),
         "exposed_via": "mcp",
+        "mcp_whitelist": _mcp_whitelist_meta(tool_name),
     }
 
 
@@ -224,6 +267,20 @@ def _invoke_registry_tool(tool_name: str, arguments: dict) -> str:
     ``wrapper.py`` 已经保证结果是 ``ToolEnvelope`` JSON 字符串。MCP 只需要
     在找不到工具这种适配层错误时返回同样的 error envelope。
     """
+    if not _mcp_server_allowed():
+        return error_envelope(
+            "mcp_server_not_whitelisted",
+            f"MCP server {_mcp_server_id()} is not allowed by MCP_ALLOWED_SERVERS.",
+            retryable=False,
+            details={"server_id": _mcp_server_id(), "tool_name": tool_name},
+        )
+    if not _mcp_tool_allowed(tool_name):
+        return error_envelope(
+            "mcp_tool_not_whitelisted",
+            f"MCP tool {tool_name} is not allowed by MCP_ALLOWED_TOOLS.",
+            retryable=False,
+            details={"server_id": _mcp_server_id(), "tool_name": tool_name},
+        )
     tool = _MCP_TOOL_MAP.get(tool_name)
     if tool is None:
         return error_envelope(

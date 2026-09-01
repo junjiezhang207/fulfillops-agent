@@ -59,14 +59,14 @@ def build_agent(
     Args:
         chat_model:   LLM 模型
         tools:        工具列表
-        checkpointer: Redis Checkpointer（生产模式必传）
+        checkpointer: PostgreSQL Checkpointer（生产模式必传）
         store:        长期记忆 Store（预留接口）
     """
     from app.infrastructure.llm.model_gateway import get_model_gateway
     system_prompt = get_model_gateway().prompt_system(use_case="agent")
 
     if checkpointer is None:
-        raise RuntimeError("ReAct Agent 必须显式传入 Redis checkpointer，生产模式不允许使用 MemorySaver。")
+        raise RuntimeError("ReAct Agent 必须显式传入 PostgreSQL checkpointer，生产模式不允许使用 MemorySaver。")
 
     # create_agent 返回的是一个可 invoke/ainvoke/stream/astream 的 LangGraph 编译图。
     # 之后 AgentService 调用它时，只需要传 {"messages": [...]} 和 config。
@@ -598,7 +598,7 @@ def build_reflective_agent(
     Args:
         chat_model: LLM 模型
         tools:      Agent 可用工具列表
-        checkpointer: Redis Checkpointer（生产模式必传）
+        checkpointer: PostgreSQL Checkpointer（生产模式必传）
         store:      长期记忆 Store
         max_retries: 最大重试次数（默认 2）
         threshold:   质量门阈值 0-1（默认 0.6）

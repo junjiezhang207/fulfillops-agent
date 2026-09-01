@@ -574,6 +574,41 @@ models: []
     assert "测试 Agent" in prompt.system
 
 
+def test_model_gateway_prompt_profile_use_case_overrides_reused_yaml(tmp_path):
+    prompt_file = tmp_path / "replan_prompt.yaml"
+    prompt_file.write_text(
+        """
+version: "test-v1"
+name: shared_replan_prompt
+use_case: replan
+system: |
+  你是重新规划 Agent。
+""",
+        encoding="utf-8",
+    )
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        f"""
+default_prompts:
+  replanner: replanner_prompt
+prompt_profiles:
+  replanner_prompt:
+    use_case: replanner
+    path: {prompt_file.name}
+    version: test-v1
+    fallback_builtin: true
+models: []
+""",
+        encoding="utf-8",
+    )
+
+    gateway = ModelGateway(SimpleNamespace(model_gateway_config_path=str(config), default_llm_model_id=""))
+    prompt = gateway.load_prompt(use_case="replanner")
+
+    assert prompt.source == "yaml"
+    assert prompt.use_case == "replanner"
+
+
 def test_model_gateway_prompt_falls_back_to_builtin_when_file_missing(tmp_path):
     config = tmp_path / "models.yaml"
     config.write_text(

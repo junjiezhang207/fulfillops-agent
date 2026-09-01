@@ -262,10 +262,10 @@ def build_plan_execute_agent(
         llm:            LLM 模型（用于 Planner / Replanner / Synthesizer）
         tools:          工具列表（Executor 子 Agent 使用）
         max_iterations: 最大执行轮次（防死循环，默认 5）
-        checkpointer:   Redis 状态持久化（生产模式必传）
+        checkpointer:   PostgreSQL 状态持久化（生产模式必传）
     """
     if checkpointer is None:
-        raise RuntimeError("Plan-and-Execute 必须显式传入 Redis checkpointer。")
+        raise RuntimeError("Plan-and-Execute 必须显式传入 PostgreSQL checkpointer。")
 
     # Executor 使用的子 Agent（mini ReAct，执行单个步骤）
     sub_agent_kwargs = {

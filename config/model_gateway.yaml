@@ -23,6 +23,13 @@ default_models:
   judge: deepseek-v4-pro
   workflow_finalize: deepseek-v4-flash
   structured_extract: deepseek-v4-flash
+  memory_extraction: deepseek-v4-flash
+  intent_classification: deepseek-v4-flash
+  query_rewrite: deepseek-v4-flash
+  planner: deepseek-v4-pro
+  replan: deepseek-v4-pro
+  replanner: deepseek-v4-pro
+  case_extraction: deepseek-v4-flash
   rag_rewrite: deepseek-v4-flash
   rag_compress: deepseek-v4-flash
   embedding: aliyun-text-embedding-v4
@@ -38,6 +45,13 @@ default_prompts:
   workflow_finalize: workflow_finalize
   structured_extract: structured_extract
   memory_extract: memory_extract
+  memory_extraction: memory_extraction
+  intent_classification: intent_classification
+  query_rewrite: query_rewrite
+  planner: planner
+  replan: replan
+  replanner: replanner
+  case_extraction: case_extraction
   rag_rewrite: rag_rewrite
   rag_compress: rag_compress
   input_guardrail: input_guardrail
@@ -135,7 +149,7 @@ prompt_profiles:
       type: text
 
   rag_intent_classifier:
-    use_case: rag_rewrite
+    use_case: intent_classification
     path: ../prompts/rag/rag_intent_classifier_v1.yaml
     version: "1.0.0"
     fallback_builtin: true
@@ -162,6 +176,74 @@ prompt_profiles:
     output_contract:
       type: structured
       schema: ExtractedMemoryBatch
+
+  memory_extraction:
+    use_case: memory_extraction
+    path: ../prompts/extraction/session_memory_extraction_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: SessionMemoryPatch
+
+  intent_classification:
+    use_case: intent_classification
+    path: ../prompts/router/intent_classification_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: json
+
+  query_rewrite:
+    use_case: query_rewrite
+    path: ../prompts/rag/query_rewrite_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: text
+
+  planner:
+    use_case: planner
+    path: ../prompts/workflow/planner_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: ExecutionProposal
+
+  replan:
+    use_case: replan
+    path: ../prompts/workflow/replan_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: ExecutionProposal
+
+  replanner:
+    use_case: replanner
+    path: ../prompts/workflow/replan_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: ExecutionProposal
+
+  case_extraction:
+    use_case: case_extraction
+    path: ../prompts/extraction/case_extraction_v1.yaml
+    version: "1.0.0"
+    fallback_builtin: true
+    input_variables: []
+    output_contract:
+      type: structured
+      schema: ExcellentCaseRecord
 
   workflow_finalize:
     use_case: workflow_finalize
@@ -246,6 +328,13 @@ fallback_models:
   workflow_finalize: [qwen-flash, local-qwen-small, deepseek-chat]
   structured_extract: [qwen-flash, local-qwen-small, deepseek-chat]
   rag_rewrite: [qwen-flash, local-qwen-small, deepseek-chat]
+  memory_extraction: [qwen-flash, local-qwen-small, deepseek-chat]
+  intent_classification: [qwen-flash, local-qwen-small, deepseek-chat]
+  query_rewrite: [qwen-flash, local-qwen-small, deepseek-chat]
+  planner: [qwen3.7-max, kimi-chat, deepseek-chat]
+  replan: [qwen3.7-max, kimi-chat, deepseek-chat]
+  replanner: [qwen3.7-max, kimi-chat, deepseek-chat]
+  case_extraction: [qwen-flash, local-qwen-small, deepseek-chat]
   rag_compress: [qwen-flash, local-qwen-small, deepseek-chat]
 
 models:
@@ -271,7 +360,7 @@ models:
     priority: 5
     tier: strong
     deployment: cloud
-    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "judge"]
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "judge", "planner", "replan", "replanner"]
 
   - id: deepseek-v4-flash
     display_name: DeepSeek V4 Flash
@@ -292,7 +381,7 @@ models:
     priority: 6
     tier: small
     deployment: cloud
-    use_cases: ["mcp", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress"]
+    use_cases: ["mcp", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress", "memory_extraction", "intent_classification", "query_rewrite", "case_extraction"]
 
   - id: deepseek-chat
     display_name: DeepSeek Chat
@@ -309,7 +398,7 @@ models:
     priority: 10
     tier: strong
     deployment: cloud
-    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "mcp", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress", "judge"]
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "mcp", "workflow_finalize", "structured_extract", "rag_rewrite", "rag_compress", "judge", "memory_extraction", "intent_classification", "query_rewrite", "planner", "replan", "replanner", "case_extraction"]
 
   # 轻量云模型：适合 RAG query 改写、片段压缩、结构化抽取。
   - id: qwen-flash
@@ -323,7 +412,7 @@ models:
     priority: 5
     tier: small
     deployment: cloud
-    use_cases: ["mcp", "rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
+    use_cases: ["mcp", "rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize", "memory_extraction", "intent_classification", "query_rewrite", "case_extraction"]
 
   # 本地开源小模型示例：vLLM / Ollama / LM Studio 都可以提供 OpenAI-compatible 接口。
   # 例如本地启动 http://localhost:8003/v1 后，将 enabled 改成 true，
@@ -340,7 +429,7 @@ models:
     priority: 1
     tier: small
     deployment: local
-    use_cases: ["mcp", "rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize"]
+    use_cases: ["mcp", "rag_rewrite", "rag_compress", "structured_extract", "workflow_finalize", "memory_extraction", "intent_classification", "query_rewrite", "case_extraction"]
 
   - id: qwen3.7-max
     display_name: Qwen3.7 Max
@@ -353,7 +442,7 @@ models:
     priority: 20
     tier: strong
     deployment: cloud
-    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "workflow_finalize"]
+    use_cases: ["agent", "workflow", "plan_execute", "supervisor", "multi_agent", "workflow_finalize", "planner", "replan", "replanner"]
 
   - id: kimi-chat
     display_name: Moonshot Kimi
@@ -366,7 +455,7 @@ models:
     priority: 30
     tier: standard
     deployment: cloud
-    use_cases: ["agent", "workflow", "plan_execute", "workflow_finalize"]
+    use_cases: ["agent", "workflow", "plan_execute", "workflow_finalize", "planner", "replan", "replanner"]
 
   - id: claude-sonnet
     display_name: Claude Sonnet

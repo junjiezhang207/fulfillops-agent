@@ -12,7 +12,7 @@
 使用方式：
   Prometheus 抓取配置：
     scrape_configs:
-      - job_name: multiship_agent
+      - job_name: fulfillops_agent
         static_configs:
           - targets: ['localhost:8000']
         metrics_path: /metrics
@@ -196,7 +196,7 @@ def metrics_endpoint() -> Response:
 
     Prometheus 配置示例：
         scrape_configs:
-          - job_name: multiship_agent
+          - job_name: fulfillops_agent
             static_configs:
               - targets: ['localhost:8000']
             metrics_path: /metrics
@@ -246,6 +246,8 @@ def metrics_endpoint() -> Response:
             hitl_trigger_total.labels(status=status)._value.set(value)
         for (rule,), value in snapshot.get("guardrail_block_total", {}).items():
             guardrail_block_total.labels(rule=rule)._value.set(value)
+        for (source,), value in snapshot.get("prompt_injection_detected_total", {}).items():
+            prompt_injection_detected_total.labels(source=source)._value.set(value)
     except Exception:
         pass
 

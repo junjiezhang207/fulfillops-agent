@@ -44,20 +44,20 @@ def build_workflow(
 
     Args:
         nodes:        已注入 service 依赖的节点集合。
-        checkpointer: 短期记忆 Checkpointer。生产模式必须由服务层传入 Redis checkpointer。
+        checkpointer: 短期记忆 Checkpointer。生产模式必须由服务层传入 PostgreSQL checkpointer。
         store:        长期记忆 Store（默认 None）。
-                      可由 create_long_term_memory_store() 创建，当前固定使用 MySQL + Milvus。
+                      可由 create_long_term_memory_store() 创建；当前默认 PostgreSQL + PGVector。
 
     接入示例：
-        from app.memory import create_redis_checkpointer, create_long_term_memory_store
+        from app.memory import create_postgres_checkpointer, create_long_term_memory_store
         graph = build_workflow(
             nodes,
-            checkpointer=create_redis_checkpointer("redis://localhost:6379"),
-            store=create_long_term_memory_store(mysql_url="mysql+pymysql://root:root@localhost:3306/multiship_agent"),
+            checkpointer=create_postgres_checkpointer("postgresql+psycopg://..."),
+            store=create_long_term_memory_store(database_url="postgresql+psycopg://..."),
         )
     """
     if checkpointer is None:
-        raise RuntimeError("Workflow 必须显式传入 Redis checkpointer，生产模式不允许使用 MemorySaver。")
+        raise RuntimeError("Workflow 必须显式传入 PostgreSQL checkpointer，生产模式不允许使用 MemorySaver。")
 
     # GraphState 是 TypedDict。LangGraph 不要求节点返回完整 state，
     # 每个节点只返回自己新增/更新的字段，框架会自动合并到共享 state。
@@ -68,6 +68,8 @@ def build_workflow(
     graph.add_node("dispatch", nodes.dispatch)
     graph.add_node("order_analysis", nodes.order_analysis)
     graph.add_node("inventory_analysis", nodes.inventory_analysis)
+    graph.add_node("proposal_generation", nodes.proposal_generation)
+    graph.add_node("human_approval", nodes.human_approval)
     graph.add_node("knowledge_retrieval", nodes.knowledge_retrieval)
     graph.add_node("finalize", nodes.finalize)
 
@@ -75,11 +77,13 @@ def build_workflow(
     graph.add_edge(START, "dispatch")
     graph.add_edge("dispatch", "order_analysis")
     graph.add_edge("order_analysis", "inventory_analysis")
+    graph.add_edge("inventory_analysis", "proposal_generation")
+    graph.add_edge("proposal_generation", "human_approval")
 
-    # 条件边：库存节点会写 fulfillment_branch。
+    # 条件边：审批/二次校验后会写 fulfillment_branch。
     # route_after_inventory 读取这个字段并返回 "fulfillable" 或 "stockout"。
     graph.add_conditional_edges(
-        "inventory_analysis",
+        "human_approval",
         route_after_inventory,
         {
             "fulfillable": "finalize",

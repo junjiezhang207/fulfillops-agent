@@ -69,11 +69,15 @@ class OrderAnalysisService:
         summary = (
             f"订单 {order.order_id} 来自 {order.platform}，"
             f"当前状态为 {order.order_status}，"
-            f"收货区域为 {order.region}，"
+            f"收货区域为 {order.shipping_region or order.region}，"
             f"优先级为 {order.priority}。"
             f"本单共包含 {item_count} 行商品，"
             f"总购买件数为 {total_quantity}。"
         )
+        if order.current_warehouse_id:
+            summary += f"当前履约仓为 {order.current_warehouse_id}。"
+        if order.promise_delivery_time:
+            summary += f"承诺送达时间为 {order.promise_delivery_time.isoformat()}。"
 
         # 返回 Pydantic schema，而不是直接返回 ORM/字典。
         # 这样 API、Workflow、Agent 都拿到稳定的字段结构。
@@ -83,6 +87,19 @@ class OrderAnalysisService:
             order_status=order.order_status,
             region=order.region,
             priority=order.priority,
+            created_at=order.created_at,
+            promise_delivery_time=order.promise_delivery_time,
+            current_warehouse_id=order.current_warehouse_id,
+            shipping_region=order.shipping_region,
+            fulfillment_type=order.fulfillment_type,
+            fulfillment_status_flags={
+                "already_split": order.already_split,
+                "inventory_reserved": order.inventory_reserved,
+                "package_created": order.package_created,
+                "waybill_created": order.waybill_created,
+                "outbound_completed": order.outbound_completed,
+                "active_fulfillment_tasks": order.active_fulfillment_tasks,
+            },
             item_count=item_count,
             total_quantity=total_quantity,
             sku_list=sku_list,

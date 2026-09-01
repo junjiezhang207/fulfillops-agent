@@ -33,7 +33,7 @@ from app.schemas.workflow import (
 from app.domain.inventory.analysis import InventoryAnalysisService
 from app.rag.knowledge_retrieval_service import KnowledgeRetrievalService
 from app.domain.orders.analysis import OrderAnalysisService
-from app.application.workflow.hitl_store import MySQLHitlStore, RedisWorkflowIdempotencyStore
+from app.application.workflow.hitl_store import PostgreSQLHitlStore, PostgreSQLWorkflowIdempotencyStore
 
 
 class WorkflowTimeoutError(Exception):
@@ -103,10 +103,12 @@ class WorkflowService:
         order_id = final_state.get("order_id", "")
         question = final_state.get("question")
         filter_categories = final_state.get("filter_categories", [])
+        session_memory = final_state.get("session_memory", {})
         if request is not None:
             order_id = request.order_id
             question = request.question
             filter_categories = request.filter_categories
+            session_memory = request.session_memory
 
         return {
             "status": "completed",
@@ -114,10 +116,13 @@ class WorkflowService:
                 order_id=order_id,
                 question=question,
                 filter_categories=filter_categories,
+                session_memory=session_memory,
                 order_result=final_state.get("order_result"),
                 inventory_result=final_state.get("inventory_result"),
                 knowledge_result=final_state.get("knowledge_result"),
                 final_answer=final_state.get("final_answer"),
+                execution_proposal=final_state.get("execution_proposal"),
+                preflight_validation=final_state.get("preflight_validation"),
                 trace=final_state.get("trace") or [],
                 errors=final_state.get("errors") or [],
             ),
@@ -141,8 +146,8 @@ class WorkflowService:
         from app.memory import create_long_term_memory_store
 
         settings = get_settings()
-        self._idempotency = RedisWorkflowIdempotencyStore(settings.redis_url, ttl_seconds=300)
-        self._hitl_store = MySQLHitlStore(settings.mysql_url)
+        self._idempotency = PostgreSQLWorkflowIdempotencyStore(settings.effective_database_url, ttl_seconds=300)
+        self._hitl_store = PostgreSQLHitlStore(settings.effective_database_url)
         # 如果没有显式传 chat_model，就从模型网关/配置创建 workflow_finalize 用模型。
         effective_chat_model = (
             chat_model if chat_model is not None
@@ -159,27 +164,26 @@ class WorkflowService:
         from app.infrastructure.llm.embedding_adapter import create_lazy_embed_model
 
         memory_embed_model = create_lazy_embed_model(settings)
+        long_term_store = create_long_term_memory_store(
+            database_url=(
+                settings.long_term_memory_database_url
+                or settings.effective_database_url
+            ),
+            vector_store_type=settings.long_term_memory_vector_store_type,
+            pgvector_table=settings.long_term_memory_pgvector_table,
+            embedding_model=memory_embed_model,
+            vector_dimension=settings.long_term_memory_vector_dimension,
+            default_ttl_days=settings.long_term_memory_ttl_days,
+        )
         # 长期记忆使用向量后端时，需要 embedding 模型；这里懒加载，减少启动压力。
         # build_workflow 会把节点、短期 checkpointer、长期 store 编译成 LangGraph。
         self._graph = build_workflow(
             self._nodes,
             checkpointer=create_checkpointer(
-                settings.redis_url,
+                settings.effective_database_url,
                 ttl_seconds=settings.short_term_memory_ttl_seconds,
             ),
-            store=create_long_term_memory_store(
-                mysql_url=settings.long_term_memory_mysql_url or settings.mysql_url,
-                milvus_uri=settings.milvus_uri or f"http://{settings.milvus_host}:{settings.milvus_port}",
-                milvus_token=settings.milvus_token,
-                milvus_database=settings.milvus_database,
-                milvus_collection=settings.long_term_memory_milvus_collection,
-                milvus_alias=settings.long_term_memory_milvus_alias,
-                milvus_timeout_seconds=settings.milvus_timeout_seconds,
-                milvus_similarity_metric=settings.milvus_similarity_metric,
-                embedding_model=memory_embed_model,
-                vector_dimension=settings.long_term_memory_vector_dimension,
-                default_ttl_days=settings.long_term_memory_ttl_days,
-            ),
+            store=long_term_store,
         )
 
     # =========================================================================
@@ -187,12 +191,12 @@ class WorkflowService:
     # =========================================================================
 
     def run(self, request: WorkflowRunRequest) -> WorkflowRunResult:
-        """驱动一次完整工作流执行（含 Redis 幂等性检查）。
+        """驱动一次完整工作流执行（含 PostgreSQL 幂等性检查）。
 
         幂等性：相同 (order_id + question + categories) 在 5 分钟内直接返回缓存，
                 不重复触发 LLM 调用，防止网络重试、重复点击导致重复执行。
 
-        生产模式不再自动批准 HITL。遇到人工审核中断时会写入 MySQL 待审表，
+        生产模式不再自动批准 HITL。遇到人工审核中断时会写入 PostgreSQL 待审表，
         然后要求调用方使用 run_stream/resume 或 Hybrid resume 完成人工决策。
         """
         idem_key = self._idempotency.make_key(request)
@@ -208,6 +212,7 @@ class WorkflowService:
             "order_id": request.order_id,
             "question": request.question,
             "filter_categories": request.filter_categories,
+            "session_memory": request.session_memory,
             "trace": [],
             "errors": [],
         }
@@ -240,10 +245,13 @@ class WorkflowService:
             order_id=request.order_id,
             question=request.question,
             filter_categories=request.filter_categories,
+            session_memory=request.session_memory,
             order_result=final_state.get("order_result"),
             inventory_result=final_state.get("inventory_result"),
             knowledge_result=final_state.get("knowledge_result"),
             final_answer=final_state.get("final_answer"),
+            execution_proposal=final_state.get("execution_proposal"),
+            preflight_validation=final_state.get("preflight_validation"),
             trace=final_state.get("trace") or [],
             errors=final_state.get("errors") or [],
         )
@@ -283,6 +291,7 @@ class WorkflowService:
             "order_id": request.order_id,
             "question": request.question,
             "filter_categories": request.filter_categories or [],
+            "session_memory": request.session_memory,
             "trace": [],
             "errors": [],
         }
@@ -360,6 +369,7 @@ class WorkflowService:
             "order_id": request.order_id,
             "question": request.question,
             "filter_categories": request.filter_categories or [],
+            "session_memory": request.session_memory,
             "trace": [],
             "errors": [],
         }
@@ -380,10 +390,13 @@ class WorkflowService:
             order_id=request.order_id,
             question=request.question,
             filter_categories=request.filter_categories or [],
+            session_memory=request.session_memory,
             order_result=final_state.get("order_result"),
             inventory_result=final_state.get("inventory_result"),
             knowledge_result=final_state.get("knowledge_result"),
             final_answer=final_state.get("final_answer"),
+            execution_proposal=final_state.get("execution_proposal"),
+            preflight_validation=final_state.get("preflight_validation"),
             trace=final_state.get("trace") or [],
             errors=final_state.get("errors") or [],
         )
@@ -408,6 +421,7 @@ class WorkflowService:
             "order_id": request.order_id,
             "question": request.question,
             "filter_categories": request.filter_categories,
+            "session_memory": request.session_memory,
             "trace": [],
             "errors": [],
         }
@@ -500,17 +514,17 @@ class WorkflowService:
         return self._build_completed_result(None, final_state)
 
     # =========================================================================
-    # 审批查询接口（预留，接入 MySQL 后实现）
+    # 审批查询接口（预留，接入 PostgreSQL 后实现）
     # =========================================================================
 
     def list_pending_approvals(self, risk_level: str | None = None) -> list[ApprovalAuditEntry]:
-        """查询当前待审批工单列表。生产版从 MySQL 查询。"""
+        """查询当前待审批工单列表。生产版从 PostgreSQL 查询。"""
         return self._hitl_store.list_pending(risk_level)
 
     def get_approval_history(self, order_id: str) -> list[ApprovalAuditEntry]:
-        """查询订单审批历史。生产版从 MySQL 查询。"""
+        """查询订单审批历史。生产版从 PostgreSQL 查询。"""
         return self._hitl_store.history(order_id)
 
     def get_hitl_stats(self) -> dict:
-        """HITL 统计。生产版从 MySQL 聚合。"""
+        """HITL 统计。生产版从 PostgreSQL 聚合。"""
         return self._hitl_store.stats()

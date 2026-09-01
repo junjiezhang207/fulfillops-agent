@@ -6,9 +6,12 @@
 
 from app.observability.business_trace import (
     add_trace_step,
+    build_fulfillops_trace_document,
     finish_trace,
     get_current_trace,
+    record_prompt_injection_detected,
     snapshot_current_trace,
+    snapshot_fulfillops_trace,
     start_trace,
     trace_step,
     update_current_trace,
@@ -17,10 +20,13 @@ from app.observability.audit_log import record_audit_event
 
 __all__ = [
     "add_trace_step",
+    "build_fulfillops_trace_document",
     "finish_trace",
     "get_current_trace",
+    "record_prompt_injection_detected",
     "record_audit_event",
     "snapshot_current_trace",
+    "snapshot_fulfillops_trace",
     "start_trace",
     "trace_step",
     "update_current_trace",
